@@ -1,0 +1,135 @@
+{
+  "name": "go-interface-lens",
+  "displayName": "Go Interface Lens",
+  "description": "Fast bidirectional CodeLens navigation between Go interfaces and their implementations",
+  "version": "1.0.0",
+  "publisher": "xiaoyao",
+  "author": {
+    "name": "xiaoyao"
+  },
+  "license": "MIT",
+  "icon": "icon.png",
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Other"
+  ],
+  "keywords": [
+    "go",
+    "golang",
+    "interface",
+    "implementation",
+    "codelens",
+    "navigation",
+    "go to implementation"
+  ],
+  "activationEvents": [
+    "onLanguage:go"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "go-interface-lens.showImplementations",
+        "title": "Go: Show Implementations",
+        "category": "Go"
+      },
+      {
+        "command": "go-interface-lens.showMethodImplementations",
+        "title": "Go: Show Method Implementations",
+        "category": "Go"
+      },
+      {
+        "command": "go-interface-lens.gotoInterface",
+        "title": "Go: Goto Interface",
+        "category": "Go"
+      },
+      {
+        "command": "go-interface-lens.clearCache",
+        "title": "Go: Clear Implementation Lens Cache",
+        "category": "Go"
+      }
+    ],
+    "configuration": {
+      "title": "Go Interface Lens",
+      "properties": {
+        "goInterfaceLens.excludedFolders": {
+          "type": "array",
+          "default": [
+            "mocks",
+            "mock",
+            "testdata",
+            "vendor"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "List of folder names to exclude when searching for implementations. These folders will be ignored during the search process."
+        },
+        "goInterfaceLens.excludedFilePatterns": {
+          "type": "array",
+          "default": [
+            "_mock.go",
+            "mock_",
+            ".pb.go",
+            "_test.go"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "List of file name patterns to exclude when searching for implementations. Use these patterns to filter out generated files, mocks, or test files."
+        },
+        "goInterfaceLens.excludedTypePatterns": {
+          "type": "array",
+          "default": [
+            "Mock",
+            "mock",
+            "Stub",
+            "Fake"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "List of type name patterns to exclude from results. Types containing these strings will be filtered out."
+        },
+        "goInterfaceLens.searchDependencies": {
+          "type": "boolean",
+          "default": true,
+          "description": "When 'goto interface' finds no interface in the workspace, additionally search the Go module cache so interfaces declared in dependency packages (implemented in your project) can still be found. The module cache is never fully indexed; only files declaring the relevant method are scanned on demand."
+        },
+        "goInterfaceLens.goModCache": {
+          "type": "string",
+          "default": "",
+          "description": "Optional absolute path to the Go module cache. Leave empty to auto-detect via $GOMODCACHE, $GOPATH/pkg/mod, then ~/go/pkg/mod."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "node test/parser.test.js && node test/indexer.test.js && node test/search.test.js && node test/multiroot.test.js && node test/deps.test.js && node test/gomod.test.js && node test/deps-version.test.js && node test/deps-crosspkg.test.js && node test/progress.test.js && node test/gotolens.test.js",
+    "package": "vsce package",
+    "publish": "vsce publish"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xiaoyao/go-interface-lens.git"
+  },
+  "bugs": {
+    "url": "https://github.com/xiaoyao/go-interface-lens/issues"
+  },
+  "homepage": "https://github.com/xiaoyao/go-interface-lens#readme",
+  "qna": "marketplace",
+  "badges": [
+    {
+      "url": "https://img.shields.io/badge/go-supported-blue.svg",
+      "href": "https://golang.org/",
+      "description": "Go Language Support"
+    }
+  ],
+  "galleryBanner": {
+    "color": "#00ADD8",
+    "theme": "dark"
+  }
+}

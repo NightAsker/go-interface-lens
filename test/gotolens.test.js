@@ -1,0 +1,159 @@
+'use strict';
+
+// Verifies that the "← goto interface" CodeLens is only emitted for methods
+// that actually have a matching interface, and suppressed otherwise.
+
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+
+// Extend the shared headless `vscode` stub with the few APIs the CodeLens
+// provider and extension activation touch. We install our own resolver so the
+// additions live only in this test process.
+const Module = require('module');
+const origResolve = Module._resolveFilename;
+const realStub = require(path.join(__dirname, 'vscode-stub.js'));
+
+class Range {
+    constructor(sl, sc, el, ec) {
+        this.start = { line: sl, character: sc };
+        this.end = { line: el, character: ec };
+    }
+}
+class CodeLens {
+    constructor(range, command) {
+        this.range = range;
+        this.command = command;
+    }
+}
+class EventEmitter {
+    constructor() {
+        this.event = () => ({ dispose() {} });
+    }
+    fire() {}
+}
+
+const vscodeStub = Object.assign({}, realStub, {
+    Range,
+    CodeLens,
+    EventEmitter,
+    Position: class {
+        constructor(l, c) {
+            this.line = l;
+            this.character = c;
+        }
+    },
+    Selection: class {
+        constructor(a, b) {
+            this.anchor = a;
+            this.active = b;
+        }
+    },
+    languages: { registerCodeLensProvider: () => ({ dispose() {} }) },
+    commands: { registerCommand: () => ({ dispose() {} }) },
+});
+// getConfiguration is read by extension.js; provide a permissive config.
+vscodeStub.workspace = Object.assign({}, realStub.workspace, {
+    getConfiguration: () => ({
+        get: (key, def) => {
+            if (key === 'excludedFolders') return ['vendor'];
+            if (key === 'excludedFilePatterns') return [];
+            if (key === 'excludedTypePatterns') return [];
+            if (key === 'searchDependencies') return false;
+            if (key === 'goModCache') return '';
+            return def;
+        },
+    }),
+    getWorkspaceFolder: () => undefined,
+});
+
+const origLoad = Module._load;
+Module._load = function (request, ...rest) {
+    if (request === 'vscode') return vscodeStub;
+    return origLoad.call(this, request, ...rest);
+};
+// Keep origResolve referenced (satisfies lint) though _load short-circuits vscode.
+void origResolve;
+
+const { WorkspaceIndex } = require(path.join(__dirname, '..', 'src', 'indexer'));
+const extension = require(path.join(__dirname, '..', 'extension.js'));
+const { assert, done } = require(path.join(__dirname, 'harness'));
+
+// A fake document over a real on-disk Go file.
+function fakeDocument(filePath) {
+    const text = fs.readFileSync(filePath, 'utf8');
+    const lines = text.split('\n');
+    return {
+        uri: { fsPath: filePath, scheme: 'file' },
+        fileName: filePath,
+        getText: () => text,
+        lineAt: (i) => ({ text: lines[i] || '' }),
+    };
+}
+
+async function main() {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gotolens-'));
+    const root = path.join(tmp, 'proj');
+    fs.mkdirSync(path.join(root, 'penalty'), { recursive: true });
+
+    fs.writeFileSync(
+        path.join(root, 'iface.go'),
+        ['package processengine', 'type FlowContext struct{}', 'type Action interface { ExecuteAction(context *FlowContext) }'].join('\n')
+    );
+    const implPath = path.join(root, 'penalty', 'p.go');
+    fs.writeFileSync(
+        implPath,
+        [
+            'package penalty',
+            'import "x/processengine"',
+            'type PenaltyPushBackboneActionV2 struct{}',
+            // Has a matching interface (Action) -> lens SHOULD appear.
+            'func (action *PenaltyPushBackboneActionV2) ExecuteAction(context *processengine.FlowContext) {}',
+            'type Lonely struct{}',
+            // No interface declares this method -> lens should NOT appear.
+            'func (l *Lonely) NoSuchInterfaceMethod(x int) string { return "" }',
+        ].join('\n')
+    );
+
+    const cfg = () => ({
+        excludedFolders: ['vendor'],
+        excludedFilePatterns: [],
+        excludedTypePatterns: [],
+        searchDependencies: false,
+        goModCache: '',
+    });
+    const idx = new WorkspaceIndex(cfg, () => {});
+    await idx.ensureBuilt(root);
+    // Inject our prebuilt index and make resolveSearchRoots resolve to exactly
+    // `root` (so areRootsBuilt matches the root we built). getWorkspaceFolder
+    // must return the owning folder, otherwise resolveSearchRoots also appends
+    // the file's own directory as a separate (unbuilt) root.
+    extension._test.setWorkspaceIndex(idx);
+    const folder = { uri: { fsPath: root } };
+    vscodeStub.workspace.workspaceFolders = [folder];
+    vscodeStub.workspace.getWorkspaceFolder = () => folder;
+
+    const provider = new extension._test.GoGotoInterfaceLensProvider();
+    const lenses = await provider.provideCodeLenses(fakeDocument(implPath), { isCancellationRequested: false });
+    const titles = lenses.map((l) => `${l.command.arguments[0]}.${l.command.arguments[1]}`);
+
+    console.log('== goto-interface lens suppression ==');
+    console.log('  lenses for:', titles);
+    assert(
+        'lens shown for method WITH a matching interface',
+        titles.includes('PenaltyPushBackboneActionV2.ExecuteAction')
+    );
+    assert(
+        'lens HIDDEN for method with NO matching interface',
+        !titles.includes('Lonely.NoSuchInterfaceMethod')
+    );
+
+    idx.dispose();
+    fs.rmSync(tmp, { recursive: true, force: true });
+    done();
+}
+
+main().catch((e) => {
+    console.error(e);
+    process.exitCode = 1;
+});

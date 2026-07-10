@@ -1,0 +1,246 @@
+'use strict';
+
+const path = require('path');
+
+// Redirect `require('vscode')` to the headless stub.
+const Module = require('module');
+const origResolve = Module._resolveFilename;
+const stubPath = path.join(__dirname, 'vscode-stub.js');
+Module._resolveFilename = function (request, ...rest) {
+    if (request === 'vscode') return stubPath;
+    return origResolve.call(this, request, ...rest);
+};
+
+const { WorkspaceIndex } = require(path.join(__dirname, '..', 'src', 'indexer'));
+const { parseFile } = require(path.join(__dirname, '..', 'src', 'parser'));
+const { assert, done } = require(path.join(__dirname, 'harness'));
+
+const cfg = () => ({
+    excludedFolders: ['mocks', 'mock', 'testdata', 'vendor'],
+    excludedFilePatterns: ['_mock.go', 'mock_', '.pb.go', '_test.go'],
+    excludedTypePatterns: ['Mock', 'mock', 'Stub', 'Fake'],
+    // Disable dependency search so this test never touches the real module cache.
+    searchDependencies: false,
+});
+
+async function main() {
+    const idx = new WorkspaceIndex(cfg, () => {});
+    const root = path.join(__dirname, 'fixtures');
+    await idx.ensureBuilt(root);
+
+    console.log('== findImplementations(Store) ==');
+    const impls = idx.findImplementations('Store').map((r) => r.name).sort();
+    console.log('  got:', impls);
+    assert('includes PostgresStore', impls.includes('PostgresStore'));
+    assert('includes MemStore (cross-dir)', impls.includes('MemStore'));
+    assert('excludes PartialStore (missing Put)', !impls.includes('PartialStore'));
+    assert('excludes WrongSigStore (wrong signatures)', !impls.includes('WrongSigStore'));
+
+    console.log('\n== findMethodImplementations(Store, Put) ==');
+    const puts = idx.findMethodImplementations('Store', 'Put').map((r) => r.name).sort();
+    console.log('  got:', puts);
+    assert('Put impls include PostgresStore', puts.includes('PostgresStore'));
+    assert('Put impls exclude PartialStore', !puts.includes('PartialStore'));
+    assert('Put impls exclude WrongSigStore', !puts.includes('WrongSigStore'));
+
+    console.log('\n== findInterfaces(PostgresStore, Get) ==');
+    const ifaces = (await idx.findInterfaces('PostgresStore', 'Get')).map((r) => r.name).sort();
+    console.log('  got:', ifaces);
+    assert('finds Store interface', ifaces.includes('Store'));
+
+    console.log('\n== embedded stdlib interface: full impl found, partial rejected ==');
+    const customImpls = idx.findImplementations('Custom').map((r) => r.name).sort();
+    console.log('  got:', customImpls);
+    assert('PartialCustom NOT reported as implementing Custom', !customImpls.includes('PartialCustom'));
+    assert('FullCustom (Read+Extra) reported as implementing Custom', customImpls.includes('FullCustom'));
+
+    console.log('\n== interface method inverted index ==');
+    const readCandidates = idx._interfacesByMethod.get('Read') || [];
+    assert('embedded io.Reader method indexes Custom', readCandidates.includes('Custom'));
+    assert('goto-interface lookup finds inherited Read method', idx.hasLocalInterface('FullCustom', 'Read'));
+
+    console.log('\n== method location resolution ==');
+    const one = idx.findMethodImplementations('Store', 'Get').find((r) => r.name === 'PostgresStore');
+    assert('PostgresStore.Get has a valid line', one && one.line >= 0);
+    assert('PostgresStore.Get points at store.go', one && one.file.endsWith('store.go'));
+
+    idx.dispose();
+
+    await chunkedIndexBuildYields();
+    await invertedIndexStopsAfterFirstMatch();
+    await sameNameDifferentPackages();
+    await gotoInterfaceCrossPackage();
+    done();
+}
+
+async function chunkedIndexBuildYields() {
+    const idx = new WorkspaceIndex(cfg, () => {});
+    const fixtureDir = path.join(__dirname, 'fixtures', 'pkg');
+    const files = [path.join(fixtureDir, 'store.go'), path.join(fixtureDir, 'embed.go')];
+    const previousSlice = WorkspaceIndex.INDEX_TIME_SLICE_MS;
+    let yields = 0;
+
+    WorkspaceIndex.INDEX_TIME_SLICE_MS = 0;
+    idx._yieldToEventLoop = async () => {
+        yields += 1;
+    };
+    try {
+        await idx._indexFilesInChunks(files);
+    } finally {
+        WorkspaceIndex.INDEX_TIME_SLICE_MS = previousSlice;
+    }
+
+    console.log('\n== chunked index build yields ==');
+    assert('indexes every file through async batches', idx.files.size === files.length);
+    assert('yields between synchronous parse slices', yields === files.length);
+    idx.dispose();
+}
+
+async function invertedIndexStopsAfterFirstMatch() {
+    const idx = new WorkspaceIndex(cfg, () => {});
+    idx.files.set(
+        '/synthetic/interfaces.go',
+        parseFile(
+            [
+                'package synthetic',
+                'type First interface { Run() }',
+                'type Second interface { Run() }',
+                'type Unrelated interface { Other() }',
+                'type Runner struct{}',
+                'func (r *Runner) Run() {}',
+            ].join('\n')
+        )
+    );
+    idx._merged();
+
+    const runCandidates = idx._interfacesByMethod.get('Run') || [];
+    let resolvedCandidates = 0;
+    const resolve = idx._resolveInterfaceMethodsCached.bind(idx);
+    idx._resolveInterfaceMethodsCached = (...args) => {
+        resolvedCandidates += 1;
+        return resolve(...args);
+    };
+
+    console.log('\n== inverted lookup stops after first match ==');
+    assert('Run index excludes interfaces with other methods', runCandidates.length === 2);
+    assert('existence lookup finds a matching interface', idx.hasLocalInterface('Runner', 'Run'));
+    assert('existence lookup stops after the first match', resolvedCandidates === 1);
+
+    const all = (await idx.findInterfaces('Runner', 'Run')).map((r) => r.name).sort();
+    assert('full goto-interface query still returns every match', all.join(',') === 'First,Second');
+    idx.dispose();
+}
+
+// Regression: "goto interface" from an implementation must find an interface
+// that lives in ANOTHER workspace package, even though the implementation
+// qualifies the interface's type (`processengine.FlowContext`) while the
+// interface declares it bare (`FlowContext`). Previously in-workspace interfaces
+// were compared strictly only, so this cross-package pair was never linked.
+async function gotoInterfaceCrossPackage() {
+    const fs = require('fs');
+    const os = require('os');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'goto-xpkg-'));
+    const root = path.join(tmp, 'proj');
+    fs.mkdirSync(path.join(root, 'penalty'), { recursive: true });
+
+    fs.writeFileSync(
+        path.join(root, 'iface.go'),
+        ['package processengine', 'type FlowContext struct{}', 'type Action interface { ExecuteAction(context *FlowContext) }'].join('\n')
+    );
+    fs.writeFileSync(
+        path.join(root, 'penalty', 'p.go'),
+        [
+            'package penalty',
+            'import "x/processengine"',
+            'type PenaltyPushBackboneActionV2 struct{}',
+            'func (action *PenaltyPushBackboneActionV2) ExecuteAction(context *processengine.FlowContext) {}',
+        ].join('\n')
+    );
+    // A different-package interface whose type is a DIFFERENT package's same-named
+    // type must NOT be linked (guards against a false positive).
+    fs.writeFileSync(
+        path.join(root, 'other.go'),
+        ['package other', 'type Doer interface { ExecuteAction(context *unrelated.FlowContext) }'].join('\n')
+    );
+
+    const localCfg = () => ({
+        excludedFolders: ['vendor'],
+        excludedFilePatterns: [],
+        excludedTypePatterns: [],
+        searchDependencies: false,
+    });
+    const idx = new WorkspaceIndex(localCfg, () => {});
+    await idx.ensureBuilt(root);
+
+    console.log('\n== goto interface finds a cross-package (in-workspace) interface ==');
+    const ifaces = (await idx.findInterfaces('PenaltyPushBackboneActionV2', 'ExecuteAction')).map((r) => r.name).sort();
+    console.log('  got:', ifaces);
+    assert('finds Action in another package (bare vs qualified type)', ifaces.includes('Action'));
+    assert('does NOT link Doer (different-package type in same slot)', !ifaces.includes('Doer'));
+
+    idx.dispose();
+    fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+// Regression: types that share a bare name but live in different packages must
+// each be reported. The index keys types by bare name, so a naive "first
+// location only" lookup collapsed them into a single implementation and
+// undercounted versus gopls.
+async function sameNameDifferentPackages() {
+    const fs = require('fs');
+    const os = require('os');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'samename-'));
+    const root = path.join(tmp, 'proj');
+    fs.mkdirSync(path.join(root, 'a'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'b'), { recursive: true });
+
+    fs.writeFileSync(
+        path.join(root, 'iface.go'),
+        ['package engine', 'type FlowContext struct{}', 'type Action interface { ExecuteAction(ctx *FlowContext) }'].join('\n')
+    );
+    fs.writeFileSync(
+        path.join(root, 'a', 'h.go'),
+        [
+            'package a',
+            'import "x/engine"',
+            'type Handler struct{}',
+            'func (h *Handler) ExecuteAction(ctx *engine.FlowContext) {}',
+        ].join('\n')
+    );
+    fs.writeFileSync(
+        path.join(root, 'b', 'h.go'),
+        [
+            'package b',
+            'import "x/engine"',
+            'type Handler struct{}',
+            'func (h *Handler) ExecuteAction(ctx *engine.FlowContext) {}',
+        ].join('\n')
+    );
+
+    const localCfg = () => ({
+        excludedFolders: ['vendor'],
+        excludedFilePatterns: [],
+        excludedTypePatterns: [],
+        searchDependencies: false,
+    });
+    const idx = new WorkspaceIndex(localCfg, () => {});
+    await idx.ensureBuilt(root);
+
+    console.log('\n== same-named types in different packages are each counted ==');
+    const impls = idx.findImplementations('Action');
+    const files = impls.map((r) => r.file).sort();
+    console.log('  got:', impls.length, 'impls');
+    assert('two Handler implementations reported (one per package)', impls.length === 2);
+    assert('both distinct files present', files.some((f) => f.endsWith(path.join('a', 'h.go'))) && files.some((f) => f.endsWith(path.join('b', 'h.go'))));
+
+    const methodImpls = idx.findMethodImplementations('Action', 'ExecuteAction');
+    assert('method search also reports both', methodImpls.length === 2);
+
+    idx.dispose();
+    fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+main().catch((e) => {
+    console.error(e);
+    process.exitCode = 1;
+});
