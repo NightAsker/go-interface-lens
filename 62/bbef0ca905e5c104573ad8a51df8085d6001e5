@@ -1,0 +1,25 @@
+PUBLISH_GUIDE.md
+  s_3838a526070e6e::t_63cde26b3e5ebf 7
+README.md
+  s_3838a526070e6e::t_2f540a8b9698a9 3,246,254,266,294-295,314
+package.json
+  s_3838a526070e6e::t_fee37164fffe0d 117,120,122
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "62bbef0ca905e5c104573ad8a51df8085d6001e5",
+  "prompts": {},
+  "sessions": {
+    "s_3838a526070e6e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f4b4e-c6d4-70d1-9cfc-e7932ff648ea",
+        "model": "unknown"
+      },
+      "human_author": "xiaoyao.777 <xiaoyao.777@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
