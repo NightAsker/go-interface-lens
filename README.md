@@ -1,6 +1,6 @@
 # Go Interface Lens
 
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/xiaoyao/go-interface-lens)
+[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/NightAsker/go-interface-lens)
 [![VSCode](https://img.shields.io/badge/VSCode-1.60+-green.svg)](https://code.visualstudio.com/)
 
 > Show implementation count above Go interfaces with one-click navigation to interface and method implementations.
@@ -243,7 +243,7 @@ The extension checks each potential implementation against your configuration:
 3. Click "Install"
 
 ### Manual Installation
-1. Download `.vsix` file from [releases](https://github.com/xiaoyao/go-interface-lens/releases)
+1. Download `.vsix` file from [releases](https://github.com/NightAsker/go-interface-lens/releases)
 2. Open Extensions: `Cmd+Shift+X`
 3. Click `...` → "Install from VSIX..."
 4. Select downloaded file
@@ -251,7 +251,7 @@ The extension checks each potential implementation against your configuration:
 ### From Source
 ```bash
 cd ~/.cursor/extensions/
-git clone https://github.com/xiaoyao/go-interface-lens.git
+git clone https://github.com/NightAsker/go-interface-lens.git
 cd go-interface-lens
 npm install
 ```
@@ -263,7 +263,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ### Development Setup
 ```bash
 # Clone the repository
-git clone https://github.com/xiaoyao/go-interface-lens.git
+git clone https://github.com/NightAsker/go-interface-lens.git
 cd go-interface-lens
 
 # Install dependencies (if any)
@@ -291,8 +291,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🔗 Links
 
-- [GitHub Repository](https://github.com/xiaoyao/go-interface-lens)
-- [Issue Tracker](https://github.com/xiaoyao/go-interface-lens/issues)
+- [GitHub Repository](https://github.com/NightAsker/go-interface-lens)
+- [Issue Tracker](https://github.com/NightAsker/go-interface-lens/issues)
 - [VSCode Marketplace](https://marketplace.visualstudio.com/items?itemName=xiaoyao.go-interface-lens)
 
 ## 💡 Tips & Tricks
@@ -311,7 +311,7 @@ The extension understands Go's implicit interface implementation, so you don't n
 
 ## 🌟 Star History
 
-If you find this extension useful, please consider giving it a ⭐ on [GitHub](https://github.com/xiaoyao/go-interface-lens)!
+If you find this extension useful, please consider giving it a ⭐ on [GitHub](https://github.com/NightAsker/go-interface-lens)!
 
 ---
 

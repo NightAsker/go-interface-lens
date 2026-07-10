@@ -4,7 +4,7 @@
 
 - Marketplace Publisher ID：`xiaoyao`
 - 扩展 ID：`xiaoyao.go-interface-lens`
-- 仓库：`https://github.com/xiaoyao/go-interface-lens`
+- 仓库：`https://github.com/NightAsker/go-interface-lens`
 
 Publisher ID 必须与 Visual Studio Marketplace 中创建的 ID 完全一致。如果
 `xiaoyao` 不可用，需要同步修改 `package.json` 中的 `publisher` 和本文档。

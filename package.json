@@ -114,12 +114,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/xiaoyao/go-interface-lens.git"
+    "url": "https://github.com/NightAsker/go-interface-lens.git"
   },
   "bugs": {
-    "url": "https://github.com/xiaoyao/go-interface-lens/issues"
+    "url": "https://github.com/NightAsker/go-interface-lens/issues"
   },
-  "homepage": "https://github.com/xiaoyao/go-interface-lens#readme",
+  "homepage": "https://github.com/NightAsker/go-interface-lens#readme",
   "qna": "marketplace",
   "badges": [
     {
