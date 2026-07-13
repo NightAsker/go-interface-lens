@@ -1,0 +1,14 @@
+.git/**
+.github/**
+.agents/**
+.codex/**
+.vscode/**
+.gitignore
+.DS_Store
+node_modules/**
+test/**
+outputs/**
+*.vsix
+publish.sh
+publish.fish
+PUBLISH_GUIDE.md

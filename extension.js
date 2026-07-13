@@ -184,7 +184,7 @@ class GoGotoInterfaceLensProvider {
 
         const codeLenses = [];
         for (const c of candidates) {
-            if (!workspaceIndex.hasLocalInterface(c.receiverType, c.methodName)) continue;
+            if (!workspaceIndex.hasLocalInterface(c.receiverType, c.methodName, document.fileName)) continue;
             const range = new vscode.Range(c.index, 0, c.index, document.lineAt(c.index).text.length);
             codeLenses.push(
                 new vscode.CodeLens(range, {
@@ -291,7 +291,7 @@ async function withSearchProgress(documentUri, title, search) {
 async function showImplementations(interfaceName, documentUri) {
     log(`showImplementations: ${interfaceName}`);
     const items = await withSearchProgress(documentUri, `Searching ${interfaceName} implementations...`, () => {
-        const found = workspaceIndex.findImplementations(interfaceName);
+        const found = workspaceIndex.findImplementations(interfaceName, documentUri.fsPath);
         return found
             .filter((r) => !shouldExclude(r.file, r.name))
             .map((r) => ({
@@ -312,7 +312,7 @@ async function showImplementations(interfaceName, documentUri) {
 async function showMethodImplementations(interfaceName, methodName, documentUri) {
     log(`showMethodImplementations: ${interfaceName}.${methodName}`);
     const items = await withSearchProgress(documentUri, `Searching ${methodName} implementations...`, () => {
-        const found = workspaceIndex.findMethodImplementations(interfaceName, methodName);
+        const found = workspaceIndex.findMethodImplementations(interfaceName, methodName, documentUri.fsPath);
         return found
             .filter((r) => !shouldExclude(r.file, r.name))
             .map((r) => ({
@@ -334,7 +334,9 @@ async function showMethodImplementations(interfaceName, methodName, documentUri)
 async function gotoInterface(receiverType, methodName, documentUri) {
     log(`gotoInterface: ${receiverType}.${methodName}`);
     const items = await withSearchProgress(documentUri, `Searching interfaces with ${methodName}...`, async () => {
-        const found = await workspaceIndex.findInterfaces(receiverType, methodName);
+        const found = await workspaceIndex.findInterfaces(receiverType, methodName, {
+            receiverFile: documentUri.fsPath,
+        });
         return found.map((r) => ({
             label: `$(symbol-interface) ${r.name}${r.external ? ' $(package)' : ''}`,
             description: `${path.basename(path.dirname(r.file))}/${path.basename(r.file)}:${r.line + 1}`,

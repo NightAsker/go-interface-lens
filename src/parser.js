@@ -339,6 +339,7 @@ function splitTopLevel(s, delim) {
  *
  * @param {string} text
  * @returns {{
+ *   packageName: string|null,
  *   interfaces: Map<string,{line:number, methods:Map<string,string>, embeds:string[]}>,
  *   types: Map<string,{line:number, methods:Map<string,string>, embeds:string[]}>
  * }}
@@ -435,7 +436,7 @@ function parseFile(text) {
         i += 1;
     }
 
-    return { interfaces, types };
+    return { packageName: pkgName, interfaces, types };
 }
 
 /**
@@ -610,7 +611,14 @@ function resolveInterfaceMethods(interfaceName, interfaces, _seen, _cache) {
             unresolved.push(embed);
             continue;
         }
-        const sub = resolveInterfaceMethods(embed, interfaces, new Set(seen), cache);
+        // Workspace-wide indexes key declarations by package identity + bare
+        // name. An unqualified embedded interface always refers to the current
+        // package, so resolve it within the owner's package instead of allowing
+        // a same-named declaration from another package to leak into the method
+        // set. Standalone parseFile callers still use bare-name maps and take the
+        // original path below.
+        const embeddedName = iface.packageKey ? `${iface.packageKey}\0${embed}` : embed;
+        const sub = resolveInterfaceMethods(embeddedName, interfaces, new Set(seen), cache);
         for (const [name, sig] of sub.methods) {
             if (!methods.has(name)) methods.set(name, sig);
         }
@@ -645,7 +653,11 @@ function resolveTypeMethods(typeName, types, _seen) {
     }
     for (const embed of t.embeds) {
         if (embed.includes('.')) continue; // imported embedded type, skip
-        const sub = resolveTypeMethods(embed, types, seen);
+        // As with interfaces, an unqualified embedded type is package-local.
+        // Preserve bare-name behaviour for parser-only callers while keeping a
+        // merged workspace index isolated by package.
+        const embeddedName = t.packageKey ? `${t.packageKey}\0${embed}` : embed;
+        const sub = resolveTypeMethods(embeddedName, types, seen);
         for (const [name, sig] of sub) {
             if (!methods.has(name)) methods.set(name, sig);
         }

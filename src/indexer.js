@@ -14,6 +14,24 @@ const {
 const { listGoFiles, resolveGoModCache, grepInterfaceFilesForMethod } = require('./search');
 const { resolveLockedModuleDirs } = require('./gomod');
 
+// A Go package is identified by its directory plus declared package name. The
+// package name component keeps an external test package (`foo_test`) distinct
+// from the production package (`foo`) even though both live in the same folder.
+// Symbols are then keyed by package identity + bare declaration name, preventing
+// unrelated `Service` / `Handler` declarations in different packages from being
+// merged into one synthetic method set.
+function packageKeyFor(file, packageName) {
+    return `${path.dirname(path.normalize(file))}\0${packageName || ''}`;
+}
+
+function symbolKeyFor(packageKey, name) {
+    return `${packageKey}\0${name}`;
+}
+
+function locationKeyFor(file, name) {
+    return `${path.normalize(file)}\0${name}`;
+}
+
 /**
  * Workspace-wide, incrementally maintained index of Go interfaces and types.
  *
@@ -32,14 +50,14 @@ class WorkspaceIndex {
         this.getConfig = getConfig;
         this.log = log || (() => {});
 
-        // Per-file parse results: absPath -> { interfaces, types } (from parseFile)
+        // Per-file parse results: absPath -> { packageName, interfaces, types }
         this.files = new Map();
         // Merged views, rebuilt on demand from per-file results.
-        this._mergedInterfaces = null; // name -> { file, line, methods, embeds }
-        this._mergedTypes = null; // name -> Map(file -> { line, methods, embeds })
-        this._resolvedTypeCache = null; // name -> resolved method Map, per merged build
-        this._resolvedInterfaceCache = null; // name -> resolved interface method set, per merged build
-        this._interfacesByMethod = null; // method name -> interface names, per merged build
+        this._mergedInterfaces = null; // package+name key -> interface summary
+        this._mergedTypes = null; // package+name key -> concrete type summary
+        this._resolvedTypeCache = null; // package+name key -> resolved method Map
+        this._resolvedInterfaceCache = null; // package+name key -> resolved interface method set
+        this._interfacesByMethod = null; // method name -> package-qualified interface keys
 
         // Root -> Promise<void> guarding the initial build.
         this._builds = new Map();
@@ -204,15 +222,19 @@ class WorkspaceIndex {
      * cached per merged view and reset on invalidation.
      * @param {string} receiverType
      * @param {string} methodName
+     * @param {string} [receiverFile] source file that identifies the package
      * @returns {boolean}
      */
-    hasLocalInterface(receiverType, methodName) {
+    hasLocalInterface(receiverType, methodName, receiverFile) {
         if (!this._hasInterfaceCache) this._hasInterfaceCache = new Map();
-        const key = `${receiverType}\u0000${methodName}`;
+        const key = `${receiverFile || ''}\u0000${receiverType}\u0000${methodName}`;
         const hit = this._hasInterfaceCache.get(key);
         if (hit !== undefined) return hit;
         const value =
-            this._collectLocalInterfaces(receiverType, methodName, { stopAfterFirst: true }).results.length > 0;
+            this._collectLocalInterfaces(receiverType, methodName, {
+                stopAfterFirst: true,
+                receiverFile,
+            }).results.length > 0;
         this._hasInterfaceCache.set(key, value);
         return value;
     }
@@ -232,18 +254,18 @@ class WorkspaceIndex {
      * type's full method set. `_collectImplementations` / `_collectMethodImplementations`
      * iterate every type and previously recomputed this recursively on each
      * pass — including the strict AND loose passes — which is O(types × embed
-     * depth) per click on large repos. Caching keyed on type name collapses that
+     * depth) per click on large repos. Caching by package-qualified type key collapses that
      * to a single computation per type per merged build.
-     * @param {string} typeName
+     * @param {string} typeKey
      * @param {Map<string,any>} types merged flat types view
      * @returns {Map<string,string>}
      */
-    _resolveTypeMethodsCached(typeName, types) {
+    _resolveTypeMethodsCached(typeKey, types) {
         if (!this._resolvedTypeCache) this._resolvedTypeCache = new Map();
-        const hit = this._resolvedTypeCache.get(typeName);
+        const hit = this._resolvedTypeCache.get(typeKey);
         if (hit) return hit;
-        const resolved = resolveTypeMethods(typeName, types);
-        this._resolvedTypeCache.set(typeName, resolved);
+        const resolved = resolveTypeMethods(typeKey, types);
+        this._resolvedTypeCache.set(typeKey, resolved);
         return resolved;
     }
 
@@ -302,27 +324,43 @@ class WorkspaceIndex {
         if (this._mergedInterfaces && this._mergedTypes) {
             return { interfaces: this._mergedInterfaces, types: this._mergedTypes };
         }
-        const interfaces = new Map(); // name -> { file, line, methods, embeds }
-        const typesByLocation = new Map(); // name -> [{ file, line, methods, embeds }]
-        // Flat map for embed resolution (name -> merged methods/embeds).
+        const interfaces = new Map(); // package+name key -> declaration location
+        const typesByLocation = new Map(); // package+name key -> declaration/method locations
+        // Flat maps for package-local embed resolution.
         const typesFlat = new Map();
         const interfacesFlat = new Map();
+        const interfaceKeyByLocation = new Map(); // file+bare name -> package+name key
+        const typeKeyByLocation = new Map(); // file+bare name -> package+name key
 
         for (const [file, parsed] of this.files) {
+            const packageKey = packageKeyFor(file, parsed.packageName);
             for (const [name, info] of parsed.interfaces) {
-                if (!interfaces.has(name)) {
-                    interfaces.set(name, { file, line: info.line, methods: info.methods, embeds: info.embeds });
+                const symbolKey = symbolKeyFor(packageKey, name);
+                interfaceKeyByLocation.set(locationKeyFor(file, name), symbolKey);
+                if (!interfaces.has(symbolKey)) {
+                    interfaces.set(symbolKey, {
+                        name,
+                        packageKey,
+                        file,
+                        line: info.line,
+                        methods: info.methods,
+                        embeds: info.embeds,
+                    });
                 }
-                if (!interfacesFlat.has(name)) {
-                    interfacesFlat.set(name, { methods: new Map(), embeds: [] });
+                if (!interfacesFlat.has(symbolKey)) {
+                    interfacesFlat.set(symbolKey, { name, packageKey, methods: new Map(), embeds: [] });
                 }
-                const flat = interfacesFlat.get(name);
+                const flat = interfacesFlat.get(symbolKey);
                 for (const [m, s] of info.methods) flat.methods.set(m, s);
                 flat.embeds.push(...info.embeds);
             }
             for (const [name, info] of parsed.types) {
-                if (!typesByLocation.has(name)) typesByLocation.set(name, []);
-                typesByLocation.get(name).push({
+                const symbolKey = symbolKeyFor(packageKey, name);
+                typeKeyByLocation.set(locationKeyFor(file, name), symbolKey);
+                if (!typesByLocation.has(symbolKey)) typesByLocation.set(symbolKey, []);
+                typesByLocation.get(symbolKey).push({
+                    name,
+                    packageKey,
                     file,
                     line: info.line,
                     methods: info.methods,
@@ -330,8 +368,10 @@ class WorkspaceIndex {
                     methodLines: info.methodLines || new Map(),
                 });
 
-                if (!typesFlat.has(name)) typesFlat.set(name, { methods: new Map(), embeds: [] });
-                const flat = typesFlat.get(name);
+                if (!typesFlat.has(symbolKey)) {
+                    typesFlat.set(symbolKey, { name, packageKey, methods: new Map(), embeds: [] });
+                }
+                const flat = typesFlat.get(symbolKey);
                 for (const [m, s] of info.methods) flat.methods.set(m, s);
                 flat.embeds.push(...info.embeds);
             }
@@ -341,6 +381,8 @@ class WorkspaceIndex {
         this._mergedTypes = typesFlat;
         this._typesByLocation = typesByLocation;
         this._interfaceDecls = interfaces;
+        this._interfaceKeyByLocation = interfaceKeyByLocation;
+        this._typeKeyByLocation = typeKeyByLocation;
 
         // Resolve each interface once and build a method-name inverted index.
         // Conditional goto-interface lenses can now inspect only interfaces that
@@ -348,24 +390,56 @@ class WorkspaceIndex {
         // instead of scanning every interface for every receiver method.
         this._resolvedInterfaceCache = new Map();
         this._interfacesByMethod = new Map();
-        for (const [ifaceName] of interfacesFlat) {
-            const resolved = this._resolveInterfaceMethodsCached(ifaceName, interfacesFlat);
+        for (const [interfaceKey] of interfacesFlat) {
+            const resolved = this._resolveInterfaceMethodsCached(interfaceKey, interfacesFlat);
             for (const methodName of resolved.methods.keys()) {
                 if (!this._interfacesByMethod.has(methodName)) this._interfacesByMethod.set(methodName, []);
-                this._interfacesByMethod.get(methodName).push(ifaceName);
+                this._interfacesByMethod.get(methodName).push(interfaceKey);
             }
         }
         return { interfaces: interfacesFlat, types: typesFlat };
     }
 
+    /** Resolve an interface declaration to its package-qualified index key. */
+    _findInterfaceKey(interfaceName, interfaceFile) {
+        this._merged();
+        if (interfaceFile) {
+            const exact = this._interfaceKeyByLocation.get(locationKeyFor(interfaceFile, interfaceName));
+            return exact || null;
+        }
+        // Backwards-compatible fallback for programmatic/test callers that only
+        // provide a bare name. Editor commands always provide the source file.
+        for (const [key, decl] of this._interfaceDecls) {
+            if (decl.name === interfaceName) return key;
+        }
+        return null;
+    }
+
+    /** Resolve a receiver type to its package-qualified index key. */
+    _findTypeKey(typeName, typeFile) {
+        this._merged();
+        if (typeFile) {
+            const exact = this._typeKeyByLocation.get(locationKeyFor(typeFile, typeName));
+            return exact || null;
+        }
+        // Same compatibility fallback as _findInterfaceKey.
+        for (const [key, info] of this._mergedTypes) {
+            if (info.name === typeName) return key;
+        }
+        return null;
+    }
+
     /**
      * Find all concrete types that implement the given interface (by signature).
      * @param {string} interfaceName
+     * @param {string} [interfaceFile] source file that identifies the package
      * @returns {{name:string, file:string, line:number}[]}
      */
-    findImplementations(interfaceName) {
+    findImplementations(interfaceName, interfaceFile) {
         const { interfaces, types } = this._merged();
-        const resolved = this._resolveInterfaceMethodsCached(interfaceName, interfaces);
+        const interfaceKey = this._findInterfaceKey(interfaceName, interfaceFile);
+        if (!interfaceKey) return [];
+        const resolved = this._resolveInterfaceMethodsCached(interfaceKey, interfaces);
         if (resolved.methods.size === 0) return [];
 
         // Run BOTH the strict pass (exact signatures) and the loose pass, then
@@ -379,27 +453,23 @@ class WorkspaceIndex {
         // loose matching is package-aware (see looseSignatureEqual): it no longer
         // equates two different packages' same-named types, so it does not
         // reintroduce cross-package false positives.
-        const strict = this._collectImplementations(interfaceName, resolved, types, false);
-        const loose = this._collectImplementations(interfaceName, resolved, types, true);
+        const strict = this._collectImplementations(resolved, types, false);
+        const loose = this._collectImplementations(resolved, types, true);
         return dedupeResults([...strict, ...loose]);
     }
 
-    _collectImplementations(interfaceName, resolved, types, loose) {
+    _collectImplementations(resolved, types, loose) {
         const results = [];
-        for (const [typeName] of types) {
-            const typeMethods = this._resolveTypeMethodsCached(typeName, types);
+        for (const [typeKey, typeInfo] of types) {
+            const typeMethods = this._resolveTypeMethodsCached(typeKey, types);
             if (satisfies(resolved.methods, typeMethods, { unresolved: resolved.unresolved, loose })) {
-                // A given type name can be declared once per package (e.g. every
-                // package has its own `Handler`/`Impl`), and the index keys types
-                // by bare name, so ALL those declarations share one entry. Emit a
-                // result for EACH declaration location rather than only the first,
-                // otherwise same-named implementations in different packages are
-                // collapsed into a single reported implementation (undercounting
-                // versus gopls). Deduplication by name+file+line still removes
-                // genuine duplicates (e.g. a type re-seen across index passes).
-                const locations = this._typesByLocation.get(typeName) || [];
+                // One package-qualified type can contribute declarations and
+                // methods from multiple files. Preserve its recorded locations;
+                // dedupeResults removes repeated location identities after the
+                // strict and loose passes are merged.
+                const locations = this._typesByLocation.get(typeKey) || [];
                 for (const decl of locations) {
-                    results.push({ name: typeName, file: decl.file, line: decl.line });
+                    results.push({ name: typeInfo.name, file: decl.file, line: decl.line });
                 }
             }
         }
@@ -411,11 +481,14 @@ class WorkspaceIndex {
      * the exact method definition location.
      * @param {string} interfaceName
      * @param {string} methodName
+     * @param {string} [interfaceFile] source file that identifies the package
      * @returns {{name:string, file:string, line:number, signature:string}[]}
      */
-    findMethodImplementations(interfaceName, methodName) {
+    findMethodImplementations(interfaceName, methodName, interfaceFile) {
         const { interfaces, types } = this._merged();
-        const resolved = this._resolveInterfaceMethodsCached(interfaceName, interfaces);
+        const interfaceKey = this._findInterfaceKey(interfaceName, interfaceFile);
+        if (!interfaceKey) return [];
+        const resolved = this._resolveInterfaceMethodsCached(interfaceKey, interfaces);
         const wantSig = resolved.methods.get(methodName);
 
         // Run both strict and loose passes and merge (deduped). A cross-package
@@ -437,8 +510,8 @@ class WorkspaceIndex {
             // different packages' same-named types (see looseSignatureEqual).
             return loose && looseSignatureEqual(a, b);
         };
-        for (const [typeName] of types) {
-            const typeMethods = this._resolveTypeMethodsCached(typeName, types);
+        for (const [typeKey, typeInfo] of types) {
+            const typeMethods = this._resolveTypeMethodsCached(typeKey, types);
             const sig = typeMethods.get(methodName);
             if (sig === undefined) continue;
             // If we know the interface's signature, require a (strict or loose) match.
@@ -456,11 +529,10 @@ class WorkspaceIndex {
                 continue;
             }
 
-            // Emit one result per declaring location so same-named types in
-            // different packages are each reported (they share one bare-name
-            // index entry). dedupeResults collapses genuine duplicates.
-            for (const loc of this._findMethodLocations(typeName, methodName)) {
-                results.push({ name: typeName, ...loc, signature: sig });
+            // Locations are already package-scoped by typeKey. Emit the direct
+            // declaration(s) for this method and dedupe the strict/loose passes.
+            for (const loc of this._findMethodLocations(typeKey, methodName)) {
+                results.push({ name: typeInfo.name, ...loc, signature: sig });
             }
         }
         return results;
@@ -479,7 +551,7 @@ class WorkspaceIndex {
      *
      * @param {string} receiverType
      * @param {string} methodName
-     * @param {{localOnly?:boolean}} [opts] when `localOnly` is true, skip the
+     * @param {{localOnly?:boolean,receiverFile?:string}} [opts] when `localOnly` is true, skip the
      *   on-demand module-cache grep entirely and only consider interfaces
      *   already indexed in the workspace. This is used by the conditional
      *   CodeLens (which must be cheap enough to run on every method of every
@@ -489,7 +561,11 @@ class WorkspaceIndex {
      */
     async findInterfaces(receiverType, methodName, opts) {
         const localOnly = !!(opts && opts.localOnly);
-        const { results, consider, typeMethods, mySig } = this._collectLocalInterfaces(receiverType, methodName);
+        const { results, consider, typeMethods, mySig } = this._collectLocalInterfaces(
+            receiverType,
+            methodName,
+            { receiverFile: opts && opts.receiverFile }
+        );
 
         // On-demand dependency (module cache) search when the local index has no
         // match. Gated by config; skipped entirely if disabled, no cache, or the
@@ -513,18 +589,19 @@ class WorkspaceIndex {
      * Contains no I/O, so it is safe to call synchronously and frequently.
      * @param {string} receiverType
      * @param {string} methodName
-     * @param {{stopAfterFirst?:boolean}} [opts]
+     * @param {{stopAfterFirst?:boolean,receiverFile?:string}} [opts]
      */
     _collectLocalInterfaces(receiverType, methodName, opts) {
         const stopAfterFirst = !!(opts && opts.stopAfterFirst);
         const { interfaces, types } = this._merged();
-        const typeMethods = this._resolveTypeMethodsCached(receiverType, types);
+        const typeKey = this._findTypeKey(receiverType, opts && opts.receiverFile);
+        const typeMethods = typeKey ? this._resolveTypeMethodsCached(typeKey, types) : new Map();
         const mySig = typeMethods.get(methodName);
 
         const results = [];
-        const seenNames = new Set();
+        const seenInterfaces = new Set();
 
-        const consider = (ifaceName, resolved, decl, external) => {
+        const consider = (interfaceKey, resolved, decl, external) => {
             const sig = resolved.methods.get(methodName);
             if (sig === undefined) return false;
 
@@ -564,19 +641,24 @@ class WorkspaceIndex {
                 if (mySig === undefined || !sigEqual) return false;
             }
             if (!decl) return false;
-            const key = `${ifaceName}:${decl.file}`;
-            if (seenNames.has(key)) return false;
-            seenNames.add(key);
-            results.push({ name: ifaceName, file: decl.file, line: decl.line, external: !!external });
+            const key = `${interfaceKey}:${decl.file}`;
+            if (seenInterfaces.has(key)) return false;
+            seenInterfaces.add(key);
+            results.push({
+                name: decl.name || interfaceKey,
+                file: decl.file,
+                line: decl.line,
+                external: !!external,
+            });
             return true;
         };
 
         const candidates = this._interfacesByMethod.get(methodName) || [];
-        for (const ifaceName of candidates) {
+        for (const interfaceKey of candidates) {
             const matched = consider(
-                ifaceName,
-                this._resolveInterfaceMethodsCached(ifaceName, interfaces),
-                this._interfaceDecls.get(ifaceName),
+                interfaceKey,
+                this._resolveInterfaceMethodsCached(interfaceKey, interfaces),
+                this._interfaceDecls.get(interfaceKey),
                 false
             );
             if (matched && stopAfterFirst) break;
@@ -648,22 +730,19 @@ class WorkspaceIndex {
         return [...dirs];
     }
 
-    _findMethodLocation(typeName, methodName) {
-        const all = this._findMethodLocations(typeName, methodName);
+    _findMethodLocation(typeKey, methodName) {
+        const all = this._findMethodLocations(typeKey, methodName);
         return all.length > 0 ? all[0] : null;
     }
 
     /**
-     * All declaration locations of `methodName` on `typeName`, across every
-     * package that declares a type of that (bare) name. Returns one entry per
-     * declaring location so that same-named types in different packages are each
-     * reported instead of being collapsed to the first match.
-     * @param {string} typeName
+     * All declaration locations of `methodName` on one package-qualified type.
+     * @param {string} typeKey
      * @param {string} methodName
      * @returns {{file:string, line:number}[]}
      */
-    _findMethodLocations(typeName, methodName) {
-        const locations = this._typesByLocation.get(typeName) || [];
+    _findMethodLocations(typeKey, methodName) {
+        const locations = this._typesByLocation.get(typeKey) || [];
         const out = [];
         for (const loc of locations) {
             if (loc.methods.has(methodName)) {

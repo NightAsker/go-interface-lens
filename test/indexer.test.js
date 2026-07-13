@@ -55,7 +55,9 @@ async function main() {
     assert('FullCustom (Read+Extra) reported as implementing Custom', customImpls.includes('FullCustom'));
 
     console.log('\n== interface method inverted index ==');
-    const readCandidates = idx._interfacesByMethod.get('Read') || [];
+    const readCandidates = (idx._interfacesByMethod.get('Read') || []).map(
+        (key) => idx._interfaceDecls.get(key).name
+    );
     assert('embedded io.Reader method indexes Custom', readCandidates.includes('Custom'));
     assert('goto-interface lookup finds inherited Read method', idx.hasLocalInterface('FullCustom', 'Read'));
 
@@ -69,6 +71,9 @@ async function main() {
     await chunkedIndexBuildYields();
     await invertedIndexStopsAfterFirstMatch();
     await sameNameDifferentPackages();
+    await sameNameInterfacesStayPackageScoped();
+    await sameNameTypesKeepIndependentSignatures();
+    await packageScopedEmbedsResolveLocally();
     await gotoInterfaceCrossPackage();
     done();
 }
@@ -183,9 +188,7 @@ async function gotoInterfaceCrossPackage() {
 }
 
 // Regression: types that share a bare name but live in different packages must
-// each be reported. The index keys types by bare name, so a naive "first
-// location only" lookup collapsed them into a single implementation and
-// undercounted versus gopls.
+// each be reported independently.
 async function sameNameDifferentPackages() {
     const fs = require('fs');
     const os = require('os');
@@ -238,6 +241,118 @@ async function sameNameDifferentPackages() {
 
     idx.dispose();
     fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+// The editor command supplies the interface's source file, so two packages may
+// safely declare different interfaces with the same bare name. Their method sets
+// must never be unioned into a synthetic interface requiring both methods.
+async function sameNameInterfacesStayPackageScoped() {
+    const idx = new WorkspaceIndex(cfg, () => {});
+    const aFile = '/synthetic/a/service.go';
+    const bFile = '/synthetic/b/service.go';
+    idx.files.set(
+        aFile,
+        parseFile(
+            [
+                'package a',
+                'type Service interface { A() }',
+                'type ImplA struct{}',
+                'func (ImplA) A() {}',
+            ].join('\n')
+        )
+    );
+    idx.files.set(
+        bFile,
+        parseFile(
+            [
+                'package b',
+                'type Service interface { B() }',
+                'type ImplB struct{}',
+                'func (ImplB) B() {}',
+            ].join('\n')
+        )
+    );
+
+    console.log('\n== same-named interfaces remain package-scoped ==');
+    const aImpls = idx.findImplementations('Service', aFile);
+    const bImpls = idx.findImplementations('Service', bFile);
+    assert('a.Service finds only ImplA', aImpls.length === 1 && aImpls[0].name === 'ImplA');
+    assert('b.Service finds only ImplB', bImpls.length === 1 && bImpls[0].name === 'ImplB');
+
+    const aMethods = idx.findMethodImplementations('Service', 'A', aFile);
+    assert('method lookup uses the selected interface package', aMethods.length === 1 && aMethods[0].name === 'ImplA');
+
+    const fromA = await idx.findInterfaces('ImplA', 'A', { receiverFile: aFile });
+    assert('reverse lookup keeps receiver identity package-scoped', fromA.length === 1 && fromA[0].file === aFile);
+    idx.dispose();
+}
+
+// Same-named receiver types in different packages may declare incompatible
+// signatures. One package's method must not overwrite the other's method in the
+// merged index and hide a valid implementation.
+async function sameNameTypesKeepIndependentSignatures() {
+    const idx = new WorkspaceIndex(cfg, () => {});
+    const ifaceFile = '/synthetic/contracts/iface.go';
+    const goodFile = '/synthetic/a/handler.go';
+    const wrongFile = '/synthetic/b/handler.go';
+    idx.files.set(ifaceFile, parseFile('package contracts\ntype IntHandler interface { Handle(int) }'));
+    idx.files.set(
+        goodFile,
+        parseFile('package a\ntype Handler struct{}\nfunc (Handler) Handle(v int) {}')
+    );
+    idx.files.set(
+        wrongFile,
+        parseFile('package b\ntype Handler struct{}\nfunc (Handler) Handle(v string) {}')
+    );
+
+    console.log('\n== same-named types retain package-specific signatures ==');
+    const impls = idx.findImplementations('IntHandler', ifaceFile);
+    assert('valid a.Handler is not overwritten by b.Handler', impls.length === 1 && impls[0].file === goodFile);
+
+    const methods = idx.findMethodImplementations('IntHandler', 'Handle', ifaceFile);
+    assert('method lookup excludes the incompatible same-named type', methods.length === 1 && methods[0].file === goodFile);
+    idx.dispose();
+}
+
+// Unqualified embeds resolve in the declaration's own package. Package-aware
+// symbol keys must preserve method promotion without borrowing a same-named
+// Parent/Base from a neighbouring package.
+async function packageScopedEmbedsResolveLocally() {
+    const idx = new WorkspaceIndex(cfg, () => {});
+    const aFile = '/synthetic/a/embed.go';
+    const bFile = '/synthetic/b/embed.go';
+    idx.files.set(
+        aFile,
+        parseFile(
+            [
+                'package a',
+                'type Parent interface { A() }',
+                'type Service interface { Parent; B() }',
+                'type Base struct{}',
+                'func (Base) A() {}',
+                'type Impl struct { Base }',
+                'func (Impl) B() {}',
+            ].join('\n')
+        )
+    );
+    idx.files.set(
+        bFile,
+        parseFile(
+            [
+                'package b',
+                'type Parent interface { X() }',
+                'type Base struct{}',
+                'func (Base) X() {}',
+                'type Impl struct { Base }',
+                'func (Impl) B() {}',
+            ].join('\n')
+        )
+    );
+
+    console.log('\n== package-local embeds remain isolated ==');
+    const impls = idx.findImplementations('Service', aFile);
+    assert('a.Impl promotes a.Base.A and satisfies a.Service', impls.length === 1 && impls[0].file === aFile);
+    idx.dispose();
 }
 
 main().catch((e) => {
