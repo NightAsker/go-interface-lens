@@ -2,6 +2,20 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [1.0.1] - 2026-07-13
+
+### Fixed
+
+- Keep same-named interfaces and receiver types isolated by package during
+  implementation and reverse-interface lookup.
+- Resolve unqualified embedded interfaces and types within their declaring
+  package instead of merging methods from neighbouring packages.
+
+### Packaging
+
+- Exclude tests, local outputs, publishing scripts, and development metadata
+  from the VSIX package.
+
 ## [1.0.0] - 2026-07-10
 
 ### Added
