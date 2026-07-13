@@ -1,0 +1,29 @@
+.vscodeignore
+  s_16b6844cb0597f::t_f36fd1bfb6320a 1-14
+extension.js
+  s_16b6844cb0597f::t_d62e3178b27efd 187,294,315,337-339
+src/indexer.js
+  s_16b6844cb0597f::t_6b35268f93da76 17-34,53,56-60,225,228,230,234-237,257,259,263,265,267-268,327-329,332-333,336,338-348,350-351,353,358-363,371-374,384-385,393-394,397,403-431,435,438,440-442,456-457,461,463-464,466-470,472,484,487,489-491,513-514,532-535,554,564-568,592,597-598,602,604,644-652,657,659-661,733-734,739-740,744-745
+src/parser.js
+  s_16b6844cb0597f::t_1534999b99b689 342,439,614-621,656-660
+test/indexer.test.js
+  s_16b6844cb0597f::t_f89b023e05c0e5 58-60,74-76,191,246-357
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "1f170c2ad94e266d3cdab906736a5a37336c4233",
+  "prompts": {},
+  "sessions": {
+    "s_16b6844cb0597f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5b70-5b2a-7e43-b4bf-7d4178882167",
+        "model": "unknown"
+      },
+      "human_author": "xiaoyao.777 <xiaoyao.777@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
