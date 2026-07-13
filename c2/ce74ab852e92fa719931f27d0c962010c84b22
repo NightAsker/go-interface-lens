@@ -1,0 +1,27 @@
+CHANGELOG.md
+  s_16b6844cb0597f::t_0ddd4d682403f5 5-18
+PUBLISH_GUIDE.md
+  s_16b6844cb0597f::t_b07799c33f0f91 22,42
+README.md
+  s_16b6844cb0597f::t_8c6fbbd6cf5562 3
+package.json
+  s_16b6844cb0597f::t_4b29d3156bb0f6 5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "c2ce74ab852e92fa719931f27d0c962010c84b22",
+  "prompts": {},
+  "sessions": {
+    "s_16b6844cb0597f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5b70-5b2a-7e43-b4bf-7d4178882167",
+        "model": "unknown"
+      },
+      "human_author": "xiaoyao.777 <xiaoyao.777@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
