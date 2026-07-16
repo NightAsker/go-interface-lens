@@ -24,6 +24,8 @@ ext._test.setWorkspaceIndex({
     ensureBuilt: async () => {},
 });
 
+eq('default progress feedback delay is responsive', ext._test.getProgressDelay(), 250);
+
 // Shorten the delay so the "slow" case does not make the test slow.
 ext._test.setProgressDelay(50);
 

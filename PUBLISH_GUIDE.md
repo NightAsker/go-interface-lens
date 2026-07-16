@@ -19,7 +19,7 @@ npx @vscode/vsce package
 生成的安装包名称为：
 
 ```text
-go-interface-lens-1.0.2.vsix
+go-interface-lens-1.0.3.vsix
 ```
 
 ## 发布到 VS Code Marketplace
@@ -39,7 +39,7 @@ npx @vscode/vsce publish
 ## 发布到 Open VSX
 
 ```bash
-OVSX_TOKEN=<token> npx ovsx publish go-interface-lens-1.0.2.vsix
+OVSX_TOKEN=<token> npx ovsx publish go-interface-lens-1.0.3.vsix
 ```
 
 ## 后续版本

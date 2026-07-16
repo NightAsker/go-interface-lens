@@ -162,6 +162,19 @@ async function main() {
     assert('interface alias gets a lens', implementationTargets.includes('Alias'));
     assert('next-line interface brace gets a lens', implementationTargets.includes('Split'));
 
+    let prewarmCalls = 0;
+    extension._test.setWorkspaceIndex({
+        areRootsBuilt: () => false,
+        ensureBuilt: async () => {
+            prewarmCalls += 1;
+        },
+    });
+    interfaceProvider.provideCodeLenses(fakeDocument(variantsPath));
+    await Promise.resolve();
+    console.log('\n== interface-only file prewarming ==');
+    assert('interface lens starts one background workspace build', prewarmCalls === 1);
+    extension._test.setWorkspaceIndex(idx);
+
     idx.dispose();
     fs.rmSync(tmp, { recursive: true, force: true });
     done();

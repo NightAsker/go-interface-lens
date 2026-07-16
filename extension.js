@@ -60,6 +60,38 @@ function shouldExclude(filePath, receiverType) {
 let workspaceIndex = null;
 const overlayTimers = new Map();
 const OVERLAY_DELAY_MS = 150;
+const WORKSPACE_PREWARM_DELAY_MS = 300;
+
+function resolvePrewarmRoots(documentUri) {
+    const roots = new Set();
+    for (const folder of vscode.workspace.workspaceFolders || []) {
+        roots.add(folder.uri.fsPath);
+    }
+
+    const owning = documentUri && vscode.workspace.getWorkspaceFolder(documentUri);
+    if (owning) roots.add(owning.uri.fsPath);
+
+    // A standalone Go file still benefits from indexing its containing folder.
+    // When a workspace IS open, deliberately do not add an external dependency
+    // directory here; dependency lookup remains on-demand.
+    if (roots.size === 0 && documentUri && documentUri.fsPath) {
+        roots.add(path.dirname(documentUri.fsPath));
+    }
+    return [...roots];
+}
+
+function prewarmRoots(roots, reason) {
+    if (!workspaceIndex || typeof workspaceIndex.ensureBuilt !== 'function' || roots.length === 0) return;
+    if (typeof workspaceIndex.areRootsBuilt === 'function' && workspaceIndex.areRootsBuilt(roots)) return;
+
+    Promise.all(roots.map((root) => workspaceIndex.ensureBuilt(root))).catch((err) => {
+        log(`${reason} prewarm failed: ${err && err.message}`);
+    });
+}
+
+function prewarmWorkspace(documentUri, reason) {
+    prewarmRoots(resolvePrewarmRoots(documentUri), reason);
+}
 
 function cancelOverlayTimer(filePath) {
     const timer = overlayTimers.get(filePath);
@@ -101,6 +133,13 @@ class GoInterfaceLensProvider {
     provideCodeLenses(document) {
         const codeLenses = [];
         const parsed = parseFile(document.getText());
+
+        if (parsed.interfaces.size > 0) {
+            // Pure interface files have no receiver methods, so the reverse-lens
+            // provider cannot trigger its existing lazy build. Start the same
+            // deduplicated build here without delaying CodeLens rendering.
+            prewarmWorkspace(document.uri, 'interface lens');
+        }
 
         const lineRange = (index) => new vscode.Range(index, 0, index, document.lineAt(index).text.length);
 
@@ -224,7 +263,7 @@ async function pickAndNavigate(items, placeHolder) {
 // Delay before a slow search shows its progress notification (ms). Searches
 // that finish faster than this show no progress bar at all, avoiding a
 // distracting flash for the common fast case.
-let PROGRESS_DELAY_MS = 1000;
+let PROGRESS_DELAY_MS = 250;
 
 /**
  * Run `search` (index building + searching) and only show a progress
@@ -368,6 +407,16 @@ function activate(context) {
     // Language-only matching covers local `file` and every remote scheme.
     const selector = { language: 'go' };
 
+    // Shift the first workspace scan into idle background time. The timer keeps
+    // activation and CodeLens rendering synchronous, while ensureBuilt's own
+    // promise guard prevents this and provider-triggered prewarming from doing
+    // duplicate work.
+    const prewarmTimer = setTimeout(
+        () => prewarmWorkspace(undefined, 'activation'),
+        WORKSPACE_PREWARM_DELAY_MS
+    );
+    if (typeof prewarmTimer.unref === 'function') prewarmTimer.unref();
+
     context.subscriptions.push(
         vscode.languages.registerCodeLensProvider(selector, provider),
         vscode.languages.registerCodeLensProvider(selector, gotoInterfaceProvider),
@@ -404,6 +453,7 @@ function activate(context) {
         }),
         {
             dispose: () => {
+                clearTimeout(prewarmTimer);
                 for (const timer of overlayTimers.values()) clearTimeout(timer);
                 overlayTimers.clear();
             },
@@ -432,4 +482,6 @@ module.exports._test = {
     },
     GoGotoInterfaceLensProvider,
     GoInterfaceLensProvider,
+    resolvePrewarmRoots,
+    prewarmRoots,
 };

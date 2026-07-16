@@ -2,6 +2,22 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [1.0.3] - 2026-07-16
+
+### Changed
+
+- Prewarm open workspace indexes in the background shortly after extension
+  activation, without blocking CodeLens rendering.
+- Start the same deduplicated background build when an interface-only file is
+  opened, so its first implementation lookup is usually ready before click.
+- Show progress feedback after 250ms instead of leaving slow first searches
+  without visible feedback for one second.
+
+### Performance
+
+- Keep dependency directories and the Go module cache out of automatic
+  prewarming; dependency lookup remains bounded and on-demand.
+
 ## [1.0.2] - 2026-07-16
 
 ### Added
