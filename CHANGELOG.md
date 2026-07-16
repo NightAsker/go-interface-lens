@@ -2,6 +2,33 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [1.0.2] - 2026-07-16
+
+### Added
+
+- Include unsaved Go document changes in implementation lookup through a
+  debounced in-memory overlay.
+- Respect current GOOS/GOARCH filename constraints and build expressions when
+  indexing workspace and dependency files.
+- Recognize interface literal aliases, next-line interface braces, and compact
+  receiver declarations.
+
+### Fixed
+
+- Canonicalize import aliases, package-local type aliases, and nested function
+  parameter names before comparing method signatures.
+- Return method-level results for implementations promoted through embedded
+  local types, with navigation to the declaring method.
+- Find compact single-line dependency interfaces and same-file interfaces that
+  inherit the queried method.
+
+### Performance
+
+- Keep signature canonicalization in the merged-index build and cache promoted
+  method locations, preserving in-memory query-time matching.
+- Keep dependency lookup bounded and avoid Go toolchain subprocesses or full
+  module-cache indexing.
+
 ## [1.0.1] - 2026-07-13
 
 ### Fixed

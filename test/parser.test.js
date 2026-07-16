@@ -319,9 +319,70 @@ console.log('\n== type alias shares the target method set ==');
 
 console.log('\n== generic receiver ==');
 {
-    const src = ['type Stack[T any] struct{}', 'func (s *Stack[T]) Push(v int) {}'].join('\n');
+    const src = ['type Stack[T any] struct{}', 'func (s *Stack[T]) Push(v int) {}', 'type Compact struct{}', 'func(Compact) Run() {}'].join('\n');
     const { types } = parseFile(src);
     assert('generic Stack.Push captured', resolveTypeMethods('Stack', types).has('Push'));
+    assert('receiver without formatting whitespace captured', resolveTypeMethods('Compact', types).has('Run'));
+}
+
+console.log('\n== interface declaration variants ==');
+{
+    const src = [
+        'package p',
+        'type Runner = interface { Run() }',
+        'type Split interface',
+        '{',
+        '  Do() error',
+        '}',
+    ].join('\n');
+    const { interfaces } = parseFile(src);
+    assert('interface literal alias is indexed', interfaces.has('Runner'));
+    assert('interface with next-line brace is indexed', interfaces.has('Split'));
+    assert('next-line interface method is captured', interfaces.get('Split').methods.has('Do'));
+}
+
+console.log('\n== import aliases canonicalize signature identity ==');
+{
+    const iface = parseFile(
+        ['package p', 'import wire "encoding/json"', 'type Decoder interface { Decode(wire.RawMessage) }'].join('\n')
+    );
+    const impl = parseFile(
+        [
+            'package p',
+            'import stdjson "encoding/json"',
+            'type JSONDecoder struct{}',
+            'func (JSONDecoder) Decode(stdjson.RawMessage) {}',
+        ].join('\n')
+    );
+    eq(
+        'different aliases for one import path normalize equally',
+        iface.interfaces.get('Decoder').methods.get('Decode'),
+        impl.types.get('JSONDecoder').methods.get('Decode')
+    );
+}
+
+console.log('\n== nested function parameter names are ignored ==');
+eq(
+    'func(x int) and func(int) are the same parameter type',
+    normalizeSignature('(fn func(x int) error)'),
+    normalizeSignature('(func(int) error)')
+);
+
+console.log('\n== aliased stdlib interface embed ==');
+{
+    const src = [
+        'package p',
+        'import stream "io"',
+        'type Reader interface { stream.Reader }',
+        'type Impl struct{}',
+        'func (Impl) Read([]byte) (int, error) { return 0, nil }',
+    ].join('\n');
+    const { interfaces, types } = parseFile(src);
+    const reader = resolveInterfaceMethods('Reader', interfaces);
+    assert(
+        'stream.Reader expands through canonical import path',
+        satisfies(reader.methods, resolveTypeMethods('Impl', types), { unresolved: reader.unresolved })
+    );
 }
 
 done();

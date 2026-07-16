@@ -3,12 +3,10 @@
 const vscode = require('vscode');
 const path = require('path');
 
-const { codeLines, braceDelta } = require('./src/tokenizer');
+const { codeLines } = require('./src/tokenizer');
 const {
+    parseFile,
     RECEIVER_METHOD_RE,
-    INTERFACE_STD_RE,
-    INTERFACE_BLOCK_RE,
-    IFACE_METHOD_RE,
 } = require('./src/parser');
 const { WorkspaceIndex } = require('./src/indexer');
 const { resolveSearchRoots } = require('./src/search');
@@ -60,6 +58,36 @@ function shouldExclude(filePath, receiverType) {
 
 // Shared index instance.
 let workspaceIndex = null;
+const overlayTimers = new Map();
+const OVERLAY_DELAY_MS = 150;
+
+function cancelOverlayTimer(filePath) {
+    const timer = overlayTimers.get(filePath);
+    if (timer) clearTimeout(timer);
+    overlayTimers.delete(filePath);
+}
+
+function scheduleDocumentOverlay(document) {
+    if (!workspaceIndex || !document || document.languageId !== 'go' || !document.uri.fsPath) return;
+    const filePath = document.uri.fsPath;
+    cancelOverlayTimer(filePath);
+    const timer = setTimeout(() => {
+        overlayTimers.delete(filePath);
+        workspaceIndex.updateOverlay(filePath, document.getText(), false);
+    }, OVERLAY_DELAY_MS);
+    if (typeof timer.unref === 'function') timer.unref();
+    overlayTimers.set(filePath, timer);
+}
+
+function syncOpenDocument(documentUri) {
+    if (!workspaceIndex || !documentUri || !documentUri.fsPath) return;
+    const documents = vscode.workspace.textDocuments || [];
+    const document = documents.find((doc) => doc.uri && doc.uri.fsPath === documentUri.fsPath);
+    if (document && document.isDirty) {
+        cancelOverlayTimer(documentUri.fsPath);
+        workspaceIndex.updateOverlay(documentUri.fsPath, document.getText(), false);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // CodeLens providers
@@ -72,64 +100,28 @@ class GoInterfaceLensProvider {
 
     provideCodeLenses(document) {
         const codeLenses = [];
-        const code = codeLines(document.getText()); // comment/string safe
+        const parsed = parseFile(document.getText());
 
         const lineRange = (index) => new vscode.Range(index, 0, index, document.lineAt(index).text.length);
 
-        // Emit a method lens for every interface-method declaration found in a
-        // single physical line's `segment`. Methods may share the opening `{`
-        // line or the closing `}` line, or be `;`-separated on one line; this
-        // mirrors the parser (parseBracedBlock) so every indexed method gets a
-        // lens. Multiple lenses on one line render side-by-side in VS Code.
-        const pushMethodLenses = (segment, index, ifaceName) => {
-            for (const part of segment.split(/[;}]/)) {
-                const m = part.match(IFACE_METHOD_RE);
-                if (!m) continue;
+        for (const [interfaceName, info] of parsed.interfaces) {
+            codeLenses.push(
+                new vscode.CodeLens(lineRange(info.line), {
+                    title: 'implementations',
+                    command: 'go-interface-lens.showImplementations',
+                    arguments: [interfaceName, document.uri],
+                })
+            );
+            for (const [methodName, methodLine] of info.methodLines || []) {
                 codeLenses.push(
-                    new vscode.CodeLens(lineRange(index), {
+                    new vscode.CodeLens(lineRange(methodLine), {
                         title: '→ implementations',
                         command: 'go-interface-lens.showMethodImplementations',
-                        arguments: [ifaceName, m[1], document.uri],
+                        arguments: [interfaceName, methodName, document.uri],
                     })
                 );
             }
-        };
-
-        let currentInterface = null;
-        let braceCount = 0;
-
-        code.forEach((line, index) => {
-            if (!currentInterface) {
-                const m = line.match(INTERFACE_STD_RE) || line.match(INTERFACE_BLOCK_RE);
-                if (!m) return;
-                currentInterface = m[1];
-                braceCount = braceDelta(line);
-                codeLenses.push(
-                    new vscode.CodeLens(lineRange(index), {
-                        title: 'implementations',
-                        command: 'go-interface-lens.showImplementations',
-                        arguments: [currentInterface, document.uri],
-                    })
-                );
-                // Methods sharing the opening line after `{` (e.g. a single-line
-                // interface `type Foo interface { Bar() error }`).
-                const openIdx = line.indexOf('{');
-                if (openIdx !== -1) pushMethodLenses(line.slice(openIdx + 1), index, currentInterface);
-                if (braceCount <= 0) currentInterface = null; // interface opened and closed on one line
-                return;
-            }
-
-            // Inside an interface body.
-            const before = braceCount;
-            braceCount += braceDelta(line);
-            if (before >= 1) {
-                // If this line closes the interface, only the text before the
-                // final `}` is still inside the body.
-                const body = braceCount <= 0 ? line.slice(0, line.lastIndexOf('}')) : line;
-                pushMethodLenses(body, index, currentInterface);
-            }
-            if (braceCount <= 0) currentInterface = null;
-        });
+        }
 
         return codeLenses;
     }
@@ -246,6 +238,10 @@ let PROGRESS_DELAY_MS = 1000;
  * @returns the value returned by `search`
  */
 async function withSearchProgress(documentUri, title, search) {
+    // A click may beat the edit-event debounce. Synchronize the originating
+    // dirty document before consulting the index so newly typed declarations
+    // are immediately searchable without requiring a save.
+    syncOpenDocument(documentUri);
     const roots = resolveSearchRoots(documentUri);
 
     const work = (async () => {
@@ -394,7 +390,24 @@ function activate(context) {
         workspaceIndex.onDidChange(() => {
             provider._onDidChangeCodeLenses.fire();
             gotoInterfaceProvider._onDidChangeCodeLenses.fire();
-        })
+        }),
+        vscode.workspace.onDidChangeTextDocument((event) => scheduleDocumentOverlay(event.document)),
+        vscode.workspace.onDidSaveTextDocument((document) => {
+            if (document.languageId !== 'go' || !document.uri.fsPath) return;
+            cancelOverlayTimer(document.uri.fsPath);
+            workspaceIndex.updateFileText(document.uri.fsPath, document.getText());
+        }),
+        vscode.workspace.onDidCloseTextDocument((document) => {
+            if (document.languageId !== 'go' || !document.uri.fsPath) return;
+            cancelOverlayTimer(document.uri.fsPath);
+            workspaceIndex.clearOverlay(document.uri.fsPath);
+        }),
+        {
+            dispose: () => {
+                for (const timer of overlayTimers.values()) clearTimeout(timer);
+                overlayTimers.clear();
+            },
+        }
     );
 
     log('All components registered');

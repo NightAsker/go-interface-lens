@@ -148,6 +148,20 @@ async function main() {
         !titles.includes('Lonely.NoSuchInterfaceMethod')
     );
 
+    const variantsPath = path.join(root, 'variants.go');
+    fs.writeFileSync(
+        variantsPath,
+        ['package processengine', 'type Alias = interface { AliasMethod() }', 'type Split interface', '{', 'SplitMethod()', '}'].join('\n')
+    );
+    const interfaceProvider = new extension._test.GoInterfaceLensProvider();
+    const interfaceLenses = interfaceProvider.provideCodeLenses(fakeDocument(variantsPath));
+    const implementationTargets = interfaceLenses
+        .filter((lens) => lens.command.command === 'go-interface-lens.showImplementations')
+        .map((lens) => lens.command.arguments[0]);
+    console.log('\n== interface declaration variant lenses ==');
+    assert('interface alias gets a lens', implementationTargets.includes('Alias'));
+    assert('next-line interface brace gets a lens', implementationTargets.includes('Split'));
+
     idx.dispose();
     fs.rmSync(tmp, { recursive: true, force: true });
     done();

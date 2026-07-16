@@ -47,6 +47,14 @@ async function main() {
     assert('matches IActionExecutorWithCode (Code() string)', codeNames.includes('IActionExecutorWithCode'));
     assert('does NOT match Coder (Code() int)', !codeNames.includes('Coder'));
 
+    console.log('\n== dependency search finds a single-line interface ==');
+    const byInline = await idx.findInterfaces('ProjectExecutor', 'Inline');
+    assert('finds InlineExecutor declared on one line', byInline.some((r) => r.name === 'InlineExecutor'));
+    assert(
+        'finds same-file interface inheriting the method',
+        byInline.some((r) => r.name === 'ExtendedInlineExecutor')
+    );
+
     console.log('\n== dependency search disabled -> no external results ==');
     const idx2 = new WorkspaceIndex(
         () => ({ ...cfg(), searchDependencies: false }),

@@ -132,10 +132,9 @@ async function grepInterfaceFilesForMethod(root, methodName, maxFiles, searchDir
     const rg = findRipgrep();
     const cap = maxFiles || 200;
 
-    // Match a line where the method is declared inside an interface, e.g.
-    // `\tMethodName(` — a word-boundaried method name followed by `(`.
-    // `-l` lists matching files only; multiline is unnecessary since Go
-    // interface methods are one per line.
+    // Match the conventional one-method-per-line form and compact declarations
+    // such as `type I interface { Method() }`. The parser still verifies every
+    // candidate, so broadening this grep does not weaken result correctness.
     const args = [
         '-l',
         '--glob',
@@ -143,7 +142,7 @@ async function grepInterfaceFilesForMethod(root, methodName, maxFiles, searchDir
         '--max-count',
         '1',
         '-e',
-        `^\\s*${methodName}\\s*\\(`,
+        `(?:^\\s*${methodName}\\s*\\(|\\binterface\\s*\\{[^}]*\\b${methodName}\\s*\\()`,
         '--',
     ];
 

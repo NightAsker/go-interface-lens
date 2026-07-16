@@ -105,6 +105,17 @@ const BUILTIN_INTERFACES = new Map([
     ],
 ]);
 
+// Real source files normally import these packages. Import-aware parsing below
+// canonicalizes `io.Reader` (and any local alias for it) to `@{io}.Reader`, so
+// register that spelling alongside the historical qualifier-only spelling used
+// by parser tests and snippets without import declarations.
+for (const [name, methods] of [...BUILTIN_INTERFACES]) {
+    const dot = name.indexOf('.');
+    if (dot !== -1) {
+        BUILTIN_INTERFACES.set(`@{${name.slice(0, dot)}}.${name.slice(dot + 1)}`, methods);
+    }
+}
+
 // normalizeSignature is defined below; wrap to allow use in the const above.
 function normalizeSignatureLazy(raw) {
     return normalizeSignature(raw);
@@ -113,7 +124,7 @@ function normalizeSignatureLazy(raw) {
 // Receiver method definition: func (r *Type[...]) Method(...) ...
 // Captures receiver type (without pointer / type params) and method name.
 const RECEIVER_METHOD_RE =
-    /^\s*func\s+\(\s*(?:[A-Z_a-z]\w*\s+)?\*?\s*([A-Z_a-z]\w*)(?:\s*\[[^\]]*\])?\s*\)\s+([A-Z_a-z]\w*)\s*\(/;
+    /^\s*func\s*\(\s*(?:[A-Z_a-z]\w*\s+)?\*?\s*([A-Z_a-z]\w*)(?:\s*\[[^\]]*\])?\s*\)\s+([A-Z_a-z]\w*)\s*\(/;
 
 // Interface declarations. Two spellings: the standard `type X interface {` and
 // the form inside a `type ( ... )` block (`X interface {`). These are the SINGLE
@@ -121,8 +132,9 @@ const RECEIVER_METHOD_RE =
 // provider (what shows a lens); keeping one copy prevents the lens and the index
 // from drifting apart. `INTERFACE_STD_RE` and `INTERFACE_BLOCK_RE` each capture
 // the interface name.
-const INTERFACE_STD_RE = /^\s*type\s+([A-Z_a-z]\w*)\s+interface\s*\{/;
-const INTERFACE_BLOCK_RE = /^\s*([A-Z_a-z]\w*)\s+interface\s*\{/;
+const INTERFACE_STD_RE = /^\s*type\s+([A-Z_a-z]\w*)\s+interface\s*(?:\{|$)/;
+const INTERFACE_ALIAS_RE = /^\s*type\s+([A-Z_a-z]\w*)\s*=\s*interface\s*(?:\{|$)/;
+const INTERFACE_BLOCK_RE = /^\s*([A-Z_a-z]\w*)\s+interface\s*(?:\{|$)/;
 // The interface method-line regex is IFACE_METHOD_RE (defined above); it is
 // exported so the CodeLens provider shares the exact same matcher.
 
@@ -167,7 +179,9 @@ function stripPackageQualifiers(sig) {
     // Replace an identifier followed by '.' and an identifier start with just
     // the trailing identifier. Applied repeatedly is unnecessary since Go has
     // at most one qualifier level per type name.
-    return sig.replace(/[A-Za-z_]\w*\.([A-Za-z_]\w*)/g, '$1');
+    return sig
+        .replace(/@\{[^}]+\}\.([A-Za-z_]\w*)/g, '$1')
+        .replace(/[A-Za-z_]\w*\.([A-Za-z_]\w*)/g, '$1');
 }
 
 /**
@@ -209,6 +223,70 @@ function extractPackageName(code) {
         if (m) return m[1];
     }
     return null;
+}
+
+/**
+ * Extract source qualifier -> import path mappings. Keeping the path in the
+ * normalized signature makes two different local aliases for the same package
+ * compare equal without invoking `go list` or reading dependency metadata.
+ * @param {string} text
+ * @returns {Map<string,string>}
+ */
+function extractImportAliases(text) {
+    const raw = text.split('\n');
+    const code = codeLines(text);
+    const imports = new Map();
+    let inBlock = false;
+
+    const addSpec = (source, hasImportKeyword) => {
+        let spec = source.trim();
+        if (hasImportKeyword) spec = spec.replace(/^import\s+/, '').trim();
+        const m = spec.match(/^(?:(\.|_|[A-Z_a-z]\w*)\s+)?(?:"([^"]+)"|`([^`]+)`)/);
+        if (!m) return;
+        const importPath = m[2] || m[3];
+        let alias = m[1];
+        if (!alias) {
+            const parts = importPath.split('/').filter(Boolean);
+            alias = parts.pop();
+            // Semantic-import-version paths conventionally end in /v2, /v3,
+            // etc. The package qualifier remains the preceding package name.
+            if (/^v\d+$/.test(alias) && parts.length > 0) alias = parts.pop();
+        }
+        if (alias && alias !== '_' && alias !== '.') imports.set(alias, importPath);
+    };
+
+    for (let i = 0; i < code.length; i++) {
+        const codeLine = code[i].trim();
+        if (!inBlock) {
+            if (/^import\s*\(/.test(codeLine)) {
+                inBlock = true;
+                continue;
+            }
+            if (/^import\b/.test(codeLine)) addSpec(raw[i], true);
+            continue;
+        }
+
+        if (codeLine.startsWith(')')) {
+            inBlock = false;
+            continue;
+        }
+        addSpec(raw[i], false);
+    }
+    return imports;
+}
+
+/** Canonical internal spelling for a package-qualified source type. */
+function canonicalizeImportedQualifiers(value, imports) {
+    let result = value;
+    for (const [alias, importPath] of imports || []) {
+        const re = new RegExp(`(^|[^\\w.])${escapeRegExp(alias)}\\.`, 'g');
+        result = result.replace(re, (_match, prefix) => `${prefix}@{${importPath}}.`);
+    }
+    return result;
+}
+
+function canonicalizeTypeReference(value, imports) {
+    return canonicalizeImportedQualifiers(value, imports);
 }
 
 /**
@@ -284,6 +362,45 @@ function normalizeTypeList(list, dropNames) {
 }
 
 /**
+ * Normalize parameter names nested inside function types. Go ignores those
+ * names for type identity just as it ignores names in a method's outer
+ * signature, e.g. `func(x int) error` and `func(int) error` are identical.
+ * This stays deliberately scoped to function parameter/result groups; the
+ * surrounding type syntax is preserved and compacted afterwards.
+ */
+function normalizeTypeExpression(typeText) {
+    const s = typeText.trim();
+    let cursor = 0;
+    let out = '';
+
+    while (cursor < s.length) {
+        const tail = s.slice(cursor);
+        const match = /\bfunc\s*\(/.exec(tail);
+        if (!match) break;
+
+        const funcAt = cursor + match.index;
+        const open = s.indexOf('(', funcAt);
+        const params = extractBalanced(s, open);
+        if (!params) break;
+
+        out += s.slice(cursor, funcAt) + `func(${normalizeTypeList(params.inner, true)})`;
+        cursor = params.end;
+
+        let resultAt = cursor;
+        while (resultAt < s.length && /\s/.test(s[resultAt])) resultAt += 1;
+        if (s[resultAt] === '(') {
+            const results = extractBalanced(s, resultAt);
+            if (results) {
+                out += `(${normalizeTypeList(results.inner, true)})`;
+                cursor = results.end;
+            }
+        }
+    }
+
+    return (out + s.slice(cursor)).replace(/\s+/g, '');
+}
+
+/**
  * Classify a single parameter segment. Returns:
  *  - { kind: 'named', type }  when it is an explicit `name type`
  *  - { kind: 'bare',  text }  when it is a single identifier / a plain type
@@ -303,10 +420,10 @@ function analyzeParam(param) {
     // token is not a type keyword (chan/map/func/...).
     const m = p.match(/^([A-Z_a-z]\w*)\s+(.*)$/);
     if (m && !TYPE_KEYWORDS.has(m[1])) {
-        return { kind: 'named', type: m[2].replace(/\s+/g, '') };
+        return { kind: 'named', type: normalizeTypeExpression(m[2]) };
     }
 
-    return { kind: 'bare', text: compact };
+    return { kind: 'bare', text: normalizeTypeExpression(p) || compact };
 }
 
 /**
@@ -359,25 +476,28 @@ function parseFile(text) {
     const rawLines = text.split('\n');
     const code = codeLines(text);
     const pkgName = extractPackageName(code);
+    const imports = extractImportAliases(text);
 
     const interfaces = new Map();
     const types = new Map();
+    const aliases = new Map();
 
     let i = 0;
     while (i < code.length) {
         const line = code[i];
 
         // Interface declaration (standard or inside a `type (...)` block).
-        const ifaceStd = line.match(INTERFACE_STD_RE);
+        const ifaceStd = line.match(INTERFACE_STD_RE) || line.match(INTERFACE_ALIAS_RE);
         const ifaceBlock = line.match(INTERFACE_BLOCK_RE);
         const ifaceMatch = ifaceStd || ifaceBlock;
         if (ifaceMatch) {
             const name = ifaceMatch[1];
-            const parsed = parseBracedBlock(code, rawLines, i, pkgName);
+            const parsed = parseBracedBlock(code, rawLines, i, pkgName, imports);
             interfaces.set(name, {
                 line: i,
                 methods: parsed.methods,
                 embeds: parsed.embeds,
+                methodLines: parsed.methodLines,
             });
             i = parsed.endLine + 1;
             continue;
@@ -395,11 +515,12 @@ function parseFile(text) {
         );
         if (aliasMatch) {
             const name = aliasMatch[1];
-            const target = aliasMatch[2];
+            const target = canonicalizeTypeReference(aliasMatch[2], imports);
             const entry = types.get(name) || newTypeEntry(i);
             if (!types.has(name)) entry.line = i;
             if (!entry.embeds.includes(target)) entry.embeds.push(target);
             types.set(name, entry);
+            aliases.set(name, target);
             i += 1;
             continue;
         }
@@ -410,7 +531,7 @@ function parseFile(text) {
         const structMatch = structStd || structBlock;
         if (structMatch) {
             const name = structMatch[1];
-            const parsed = parseBracedBlock(code, rawLines, i, pkgName);
+            const parsed = parseBracedBlock(code, rawLines, i, pkgName, imports);
             const entry = types.get(name) || newTypeEntry(i);
             if (!types.has(name)) entry.line = i;
             entry.embeds = parsed.embeds;
@@ -424,7 +545,7 @@ function parseFile(text) {
         if (recv) {
             const recvType = recv[1];
             const methodName = recv[2];
-            const sig = signatureFromLine(code, i, methodName, pkgName);
+            const sig = signatureFromLine(code, i, methodName, pkgName, imports);
             const entry = types.get(recvType) || newTypeEntry(i);
             entry.methods.set(methodName, sig);
             // Record the 0-based declaration line so callers can navigate to the
@@ -436,7 +557,7 @@ function parseFile(text) {
         i += 1;
     }
 
-    return { packageName: pkgName, interfaces, types };
+    return { packageName: pkgName, imports, aliases, interfaces, types };
 }
 
 /**
@@ -447,30 +568,45 @@ function parseFile(text) {
  * @param {number} startLine
  * @param {string|null} [pkgName] the file's own package name (for self-qualifier stripping)
  */
-function parseBracedBlock(code, rawLines, startLine, pkgName) {
+function parseBracedBlock(code, rawLines, startLine, pkgName, imports) {
     const methods = new Map();
+    const methodLines = new Map();
     const embeds = [];
 
-    const processSegment = (seg, srcLines, srcIndex) => {
+    const processSegment = (seg, srcLines, srcIndex, declarationLine) => {
         const method = seg.match(IFACE_METHOD_RE);
         if (method) {
-            methods.set(method[1], signatureFromLine(srcLines, srcIndex, method[1], pkgName));
+            methods.set(method[1], signatureFromLine(srcLines, srcIndex, method[1], pkgName, imports));
+            methodLines.set(method[1], declarationLine);
             return;
         }
         const embed = seg.match(EMBED_RE);
-        if (embed) embeds.push(embed[1]);
+        if (embed) embeds.push(canonicalizeTypeReference(embed[1], imports));
     };
 
-    // The start line always contributes its content after the first `{`.
-    const openIdx = code[startLine].indexOf('{');
-    const startInline = openIdx === -1 ? '' : code[startLine].slice(openIdx + 1);
-    // Members can be separated by `;` or `}` on a single physical line.
-    for (const seg of startInline.split(/[;}]/)) {
-        if (seg.trim()) processSegment(seg, [startInline], 0);
+    // Gofmt places `{` on the declaration line, but the grammar also permits it
+    // on the next non-empty line after `interface`. Accept that form without
+    // making the declaration regex span the whole file.
+    let openLine = startLine;
+    let openIdx = code[openLine].indexOf('{');
+    while (openIdx === -1 && openLine + 1 < code.length) {
+        openLine += 1;
+        if (!code[openLine].trim()) continue;
+        openIdx = code[openLine].indexOf('{');
+        break;
+    }
+    if (openIdx === -1) {
+        return { methods, methodLines, embeds, endLine: startLine };
     }
 
-    let depth = braceDelta(code[startLine]);
-    let line = startLine + 1;
+    const startInline = code[openLine].slice(openIdx + 1);
+    // Members can be separated by `;` or `}` on a single physical line.
+    for (const seg of startInline.split(/[;}]/)) {
+        if (seg.trim()) processSegment(seg, [startInline], 0, openLine);
+    }
+
+    let depth = braceDelta(code[openLine]);
+    let line = openLine + 1;
 
     // Continue with subsequent lines only if the block spans multiple lines.
     while (line < code.length && depth > 0) {
@@ -478,13 +614,13 @@ function parseBracedBlock(code, rawLines, startLine, pkgName) {
         depth += braceDelta(code[line]);
         if (before === 1) {
             for (const seg of code[line].split(/[;}]/)) {
-                if (seg.trim()) processSegment(seg, code, line);
+                if (seg.trim()) processSegment(seg, code, line, line);
             }
         }
         line += 1;
     }
 
-    return { methods, embeds, endLine: Math.max(startLine, line - 1) };
+    return { methods, methodLines, embeds, endLine: Math.max(openLine, line - 1) };
 }
 
 /**
@@ -497,7 +633,7 @@ function parseBracedBlock(code, rawLines, startLine, pkgName) {
  * @param {string|null} [pkgName] the file's own package name (for self-qualifier stripping)
  * @returns {string}
  */
-function signatureFromLine(code, line, methodName, pkgName) {
+function signatureFromLine(code, line, methodName, pkgName, imports) {
     let joined = code[line];
     // For receiver methods the name appears after the receiver; slice from the
     // method name occurrence to focus on the signature.
@@ -520,7 +656,10 @@ function signatureFromLine(code, line, methodName, pkgName) {
     // interface using the bare name and an implementation using the fully
     // qualified name of a type from THEIR OWN package compare equal under strict
     // matching. Cross-package qualifiers are preserved.
-    return stripSelfPackageQualifier(normalizeSignature(sigText.trim()), pkgName);
+    return canonicalizeImportedQualifiers(
+        stripSelfPackageQualifier(normalizeSignature(sigText.trim()), pkgName),
+        imports
+    );
 }
 
 /**
@@ -749,8 +888,10 @@ function splitNormalizedSignature(sig) {
 function looseTypeSlotEqual(a, b) {
     if (a === b) return true;
     if (stripPackageQualifiers(a) !== stripPackageQualifiers(b)) return false;
-    const qa = [...a.matchAll(/([A-Za-z_]\w*)\.[A-Za-z_]\w*/g)].map((m) => m[1]);
-    const qb = [...b.matchAll(/([A-Za-z_]\w*)\.[A-Za-z_]\w*/g)].map((m) => m[1]);
+    const qualifiers = (slot) =>
+        [...slot.matchAll(/(?:@\{([^}]+)\}|([A-Za-z_]\w*))\.[A-Za-z_]\w*/g)].map((m) => m[1] || m[2]);
+    const qa = qualifiers(a);
+    const qb = qualifiers(b);
     // Only when both sides qualify the same number of types do we require the
     // package names to line up; a differing count means one side left a type
     // unqualified (the cross-package scenario) and is allowed.
@@ -804,8 +945,11 @@ module.exports = {
     looseSignatureEqual,
     extractPackageName,
     splitTopLevel,
+    extractImportAliases,
+    canonicalizeImportedQualifiers,
     RECEIVER_METHOD_RE,
     INTERFACE_STD_RE,
+    INTERFACE_ALIAS_RE,
     INTERFACE_BLOCK_RE,
     IFACE_METHOD_RE,
 };

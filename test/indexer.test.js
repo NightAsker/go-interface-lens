@@ -75,7 +75,76 @@ async function main() {
     await sameNameTypesKeepIndependentSignatures();
     await packageScopedEmbedsResolveLocally();
     await gotoInterfaceCrossPackage();
+    promotedMethodImplementationLocation();
+    typeAliasesCanonicalizeSignatures();
+    unsavedDocumentOverlay();
     done();
+}
+
+function promotedMethodImplementationLocation() {
+    const idx = new WorkspaceIndex(cfg, () => {});
+    const file = '/synthetic/promoted/service.go';
+    idx.files.set(
+        file,
+        parseFile(
+            [
+                'package promoted',
+                'type Service interface { Run() }',
+                'type Base struct{}',
+                'func (Base) Run() {}',
+                'type Derived struct { Base }',
+            ].join('\n')
+        )
+    );
+
+    console.log('\n== promoted method implementation location ==');
+    const implementations = idx.findImplementations('Service', file).map((r) => r.name);
+    const methods = idx.findMethodImplementations('Service', 'Run', file).map((r) => r.name);
+    assert('Derived satisfies Service through Base', implementations.includes('Derived'));
+    assert('method search includes promoted implementation Derived', methods.includes('Derived'));
+    idx.dispose();
+}
+
+function typeAliasesCanonicalizeSignatures() {
+    const idx = new WorkspaceIndex(cfg, () => {});
+    const file = '/synthetic/aliases/service.go';
+    idx.files.set(
+        file,
+        parseFile(
+            [
+                'package aliases',
+                'type ID = string',
+                'type Consumer interface { Use(ID) }',
+                'type Impl struct{}',
+                'func (Impl) Use(string) {}',
+            ].join('\n')
+        )
+    );
+
+    console.log('\n== type aliases canonicalize signatures ==');
+    const implementations = idx.findImplementations('Consumer', file).map((r) => r.name);
+    assert('method using alias matches its canonical target', implementations.includes('Impl'));
+    idx.dispose();
+}
+
+function unsavedDocumentOverlay() {
+    const idx = new WorkspaceIndex(cfg, () => {});
+    const file = '/synthetic/overlay/service.go';
+    idx.files.set(
+        file,
+        parseFile(['package overlay', 'type Service interface { Run() }', 'type Impl struct{}'].join('\n'))
+    );
+
+    console.log('\n== unsaved document overlay ==');
+    assert('disk snapshot has no implementation', idx.findImplementations('Service', file).length === 0);
+    idx.updateOverlay(
+        file,
+        ['package overlay', 'type Service interface { Run() }', 'type Impl struct{}', 'func (Impl) Run() {}'].join('\n')
+    );
+    assert('overlay makes unsaved method searchable', idx.findImplementations('Service', file).some((r) => r.name === 'Impl'));
+    idx.clearOverlay(file);
+    assert('clearing overlay restores disk snapshot', idx.findImplementations('Service', file).length === 0);
+    idx.dispose();
 }
 
 async function chunkedIndexBuildYields() {

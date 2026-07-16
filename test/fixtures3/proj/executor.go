@@ -11,3 +11,5 @@ func (e *ProjectExecutor) Execute(ctx context.Context, code string) (string, err
 }
 
 func (e *ProjectExecutor) Code() string { return "" }
+
+func (e *ProjectExecutor) Inline() error { return nil }
