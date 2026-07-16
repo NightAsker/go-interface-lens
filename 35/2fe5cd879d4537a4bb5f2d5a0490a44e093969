@@ -1,0 +1,23 @@
+test/fixtures3/proj/executor.go
+  s_c9a8f97458fc41::t_8ac28e6c09b1cd 14-15
+test/indexer.test.js
+  s_c9a8f97458fc41::t_16292063523acd 78-80,84-149
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "352fe5cd879d4537a4bb5f2d5a0490a44e093969",
+  "prompts": {},
+  "sessions": {
+    "s_c9a8f97458fc41": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6a98-26c0-7d80-999f-590831706f38",
+        "model": "unknown"
+      },
+      "human_author": "xiaoyao.777 <xiaoyao.777@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
