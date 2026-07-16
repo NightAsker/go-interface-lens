@@ -1,0 +1,33 @@
+CHANGELOG.md
+  s_c9a8f97458fc41::t_38d4fc9928e1ba 5-20
+PUBLISH_GUIDE.md
+  s_c9a8f97458fc41::t_c7593fae65b30e 22,42
+README.md
+  s_c9a8f97458fc41::t_4da13e0e0e2161 3
+extension.js
+  s_c9a8f97458fc41::t_84864cb609bd92 63-94,137-143,266,410-419,456,485-486
+package.json
+  s_c9a8f97458fc41::t_971e6bf954708e 5
+test/gotolens.test.js
+  s_c9a8f97458fc41::t_63ec5c52996a46 165-177
+test/progress.test.js
+  s_c9a8f97458fc41::t_1c936b21e928cf 27-28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "c5da6d4d72a47576bc93ef549fa466b0e95cfedc",
+  "prompts": {},
+  "sessions": {
+    "s_c9a8f97458fc41": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6a98-26c0-7d80-999f-590831706f38",
+        "model": "unknown"
+      },
+      "human_author": "xiaoyao.777 <xiaoyao.777@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
