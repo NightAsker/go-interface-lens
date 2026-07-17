@@ -7,13 +7,53 @@ const path = require('path');
 const {
     parseFile,
     resolveInterfaceMethods,
-    resolveTypeMethods,
     satisfies,
     looseSignatureEqual,
+    BUILTIN_INTERFACES,
 } = require('./parser');
 const { listGoFiles, resolveGoModCache, grepInterfaceFilesForMethod } = require('./search');
-const { resolveLockedModuleDirs } = require('./gomod');
+const { findGoMod, resolveLockedModuleDirs } = require('./gomod');
 const { currentBuildContext, shouldIncludeGoFile } = require('./build');
+const { AstWorkerPool } = require('./ast-cache');
+
+const NON_METHOD_CALLS = new Set([
+    'if',
+    'for',
+    'switch',
+    'select',
+    'func',
+    'go',
+    'defer',
+    'return',
+    'append',
+    'cap',
+    'clear',
+    'close',
+    'complex',
+    'copy',
+    'delete',
+    'imag',
+    'len',
+    'make',
+    'max',
+    'min',
+    'new',
+    'panic',
+    'print',
+    'println',
+    'real',
+    'recover',
+]);
+
+function scanCandidateMethodNames(text) {
+    const names = new Set();
+    const matcher = /\b([A-Z_a-z]\w*)\s*\(/g;
+    let match;
+    while ((match = matcher.exec(text))) {
+        if (!NON_METHOD_CALLS.has(match[1])) names.add(match[1]);
+    }
+    return names;
+}
 
 // A Go package is identified by its directory plus declared package name. The
 // package name component keeps an external test package (`foo_test`) distinct
@@ -31,6 +71,11 @@ function symbolKeyFor(packageKey, name) {
 
 function locationKeyFor(file, name) {
     return `${path.normalize(file)}\0${name}`;
+}
+
+function importedReferenceIdentity(reference) {
+    const match = reference && reference.match(/^@\{([^}]+)\}\.([A-Z_a-z]\w*)$/);
+    return match ? { importPath: match[1], name: match[2] } : null;
 }
 
 /**
@@ -72,6 +117,18 @@ function canonicalizeAliases(signature, aliases) {
     return result;
 }
 
+function canonicalizeLocalTypes(signature, localNames, importPath) {
+    if (!importPath || !localNames || localNames.size === 0) return signature;
+    return signature.replace(/[A-Z_a-z]\w*/g, (token, offset, whole) => {
+        if (!localNames.has(token)) return token;
+        const previous = offset > 0 ? whole[offset - 1] : '';
+        const next = whole[offset + token.length] || '';
+        if (previous === '.' || next === '.') return token;
+        if (whole.lastIndexOf('@{', offset) > whole.lastIndexOf('}', offset)) return token;
+        return `@{${importPath}}.${token}`;
+    });
+}
+
 /**
  * Workspace-wide, incrementally maintained index of Go interfaces and types.
  *
@@ -86,20 +143,23 @@ class WorkspaceIndex {
      * @param {() => {excludedFolders:string[], excludedFilePatterns:string[], excludedTypePatterns:string[]}} getConfig
      * @param {(msg:string)=>void} log
      */
-    constructor(getConfig, log) {
+    constructor(getConfig, log, options) {
         this.getConfig = getConfig;
         this.log = log || (() => {});
+        this.options = options || {};
 
         // Per-file parse results: absPath -> { packageName, interfaces, types }
         this.files = new Map();
         // Unsaved editor buffers override the corresponding on-disk parse result
         // in merged views without forcing a workspace rebuild.
         this.overlays = new Map();
+        this.overlayTexts = new Map();
         this._buildContext = currentBuildContext();
         // Merged views, rebuilt on demand from per-file results.
         this._mergedInterfaces = null; // package+name key -> interface summary
         this._mergedTypes = null; // package+name key -> concrete type summary
         this._resolvedTypeCache = null; // package+name key -> resolved method Map
+        this._resolvedTypeSetCache = null; // package+name key -> {value,pointer} method Maps
         this._resolvedInterfaceCache = null; // package+name key -> resolved interface method set
         this._interfacesByMethod = null; // method name -> package-qualified interface keys
         this._methodLocationCache = null;
@@ -114,6 +174,28 @@ class WorkspaceIndex {
         // Listeners notified after the merged view is invalidated (e.g. so
         // CodeLens providers can recompute). Plain callbacks; no vscode types.
         this._changeListeners = new Set();
+
+        // The startup scan records broad method-name candidates only. Exact Go
+        // declarations are parsed lazily, in workers, for candidate packages.
+        this._candidateFilesByMethod = new Map();
+        this._candidateMethodsByFile = new Map();
+        this._packageFiles = new Map();
+        this._packageKeyByFile = new Map();
+        this._packageKeysByDirectory = new Map();
+        this._embeddedFiles = new Set();
+        this._astQueryCache = new Map();
+        this._astInflight = new Map();
+        this._astGeneration = 1;
+        this._importPathByDirectory = new Map();
+        this._packageKeyByImportPath = new Map();
+        const cfg = this.getConfig();
+        this.astPool = this.options.disableAst
+            ? null
+            : new AstWorkerPool({
+                  concurrency: cfg.astConcurrency || 2,
+                  cacheDir: this.options.cacheDir || '',
+                  log: this.log,
+              });
     }
 
     /**
@@ -230,13 +312,80 @@ class WorkspaceIndex {
         return new Promise((resolve) => setImmediate(resolve));
     }
 
-    _indexText(absPath, text) {
+    _removeCandidateFile(absPath) {
+        const normalized = path.normalize(absPath);
+        const names = this._candidateMethodsByFile.get(normalized);
+        if (names) {
+            for (const name of names) {
+                const files = this._candidateFilesByMethod.get(name);
+                if (!files) continue;
+                files.delete(normalized);
+                if (files.size === 0) this._candidateFilesByMethod.delete(name);
+            }
+        }
+        this._candidateMethodsByFile.delete(normalized);
+
+        const packageKey = this._packageKeyByFile.get(normalized);
+        if (packageKey) {
+            const files = this._packageFiles.get(packageKey);
+            let packageRemoved = false;
+            if (files) {
+                files.delete(normalized);
+                if (files.size === 0) {
+                    this._packageFiles.delete(packageKey);
+                    packageRemoved = true;
+                }
+            }
+            if (packageRemoved) {
+                const directory = path.dirname(normalized);
+                const packageKeys = this._packageKeysByDirectory.get(directory);
+                if (packageKeys) {
+                    packageKeys.delete(packageKey);
+                    if (packageKeys.size === 0) this._packageKeysByDirectory.delete(directory);
+                }
+            }
+        }
+        this._packageKeyByFile.delete(normalized);
+        this._embeddedFiles.delete(normalized);
+    }
+
+    _recordCandidateFile(absPath, text, parsed) {
+        const normalized = path.normalize(absPath);
+        this._removeCandidateFile(normalized);
+        const names = scanCandidateMethodNames(text);
+        this._candidateMethodsByFile.set(normalized, names);
+        for (const name of names) {
+            if (!this._candidateFilesByMethod.has(name)) this._candidateFilesByMethod.set(name, new Set());
+            this._candidateFilesByMethod.get(name).add(normalized);
+        }
+        const packageKey = packageKeyFor(normalized, parsed.packageName);
+        this._packageKeyByImportPath.clear();
+        this._packageKeyByFile.set(normalized, packageKey);
+        const directory = path.dirname(normalized);
+        if (!this._packageKeysByDirectory.has(directory)) {
+            this._packageKeysByDirectory.set(directory, new Set());
+        }
+        this._packageKeysByDirectory.get(directory).add(packageKey);
+        if (!this._packageFiles.has(packageKey)) this._packageFiles.set(packageKey, new Set());
+        this._packageFiles.get(packageKey).add(normalized);
+        const hasEmbeds =
+            [...parsed.interfaces.values()].some((info) => info.embeds && info.embeds.length > 0) ||
+            [...parsed.types.values()].some((info) => info.embeds && info.embeds.length > 0);
+        if (hasEmbeds) this._embeddedFiles.add(normalized);
+    }
+
+    _indexText(absPath, text, invalidateAst) {
         try {
             if (this._isExcluded(absPath) || !shouldIncludeGoFile(absPath, text, this._buildContext)) {
                 this.files.delete(absPath);
+                this._removeCandidateFile(absPath);
+                if (invalidateAst && this.astPool) this.astPool.invalidate(absPath);
                 return;
             }
-            this.files.set(absPath, parseFile(text));
+            const parsed = parseFile(text);
+            this.files.set(absPath, parsed);
+            this._recordCandidateFile(absPath, text, parsed);
+            if (invalidateAst && this.astPool) this.astPool.invalidate(absPath);
         } catch (err) {
             this.log(`Failed to parse ${absPath}: ${err.message}`);
         }
@@ -245,7 +394,7 @@ class WorkspaceIndex {
     _indexFile(absPath) {
         try {
             const text = fs.readFileSync(absPath, 'utf8');
-            this._indexText(absPath, text);
+            this._indexText(absPath, text, true);
         } catch (err) {
             this.log(`Failed to index ${absPath}: ${err.message}`);
         }
@@ -254,29 +403,45 @@ class WorkspaceIndex {
     _removeFile(absPath) {
         this.files.delete(absPath);
         this.overlays.delete(absPath);
+        this.overlayTexts.delete(absPath);
+        this._removeCandidateFile(absPath);
+        if (this.astPool) this.astPool.invalidate(absPath);
     }
 
     updateOverlay(absPath, text, notify) {
         if (this._isExcluded(absPath) || !shouldIncludeGoFile(absPath, text, this._buildContext)) {
             this.overlays.delete(absPath);
+            this.overlayTexts.delete(absPath);
             this._invalidateMerged();
             if (notify !== false) this._emitChange();
             return;
         }
         this.overlays.set(absPath, parseFile(text));
+        this.overlayTexts.set(absPath, text);
+        this._recordCandidateFile(absPath, text, this.overlays.get(absPath));
         this._invalidateMerged();
         if (notify !== false) this._emitChange();
     }
 
     clearOverlay(absPath) {
         if (!this.overlays.delete(absPath)) return;
+        this.overlayTexts.delete(absPath);
+        if (this.astPool) this.astPool.clearOverlay(absPath);
+        try {
+            const text = fs.readFileSync(absPath, 'utf8');
+            const parsed = this.files.get(absPath) || parseFile(text);
+            this._recordCandidateFile(absPath, text, parsed);
+        } catch (_) {
+            this._removeCandidateFile(absPath);
+        }
         this._invalidateMerged();
         this._emitChange();
     }
 
     updateFileText(absPath, text) {
         this.overlays.delete(absPath);
-        this._indexText(absPath, text);
+        this.overlayTexts.delete(absPath);
+        this._indexText(absPath, text, true);
         this._invalidateMerged();
         this._emitChange();
     }
@@ -286,11 +451,15 @@ class WorkspaceIndex {
         this._mergedTypes = null;
         // Resolved-method sets are derived from the merged view; drop them too.
         this._resolvedTypeCache = null;
+        this._resolvedTypeSetCache = null;
         this._resolvedInterfaceCache = null;
         this._interfacesByMethod = null;
         this._methodLocationCache = null;
         // "receiver\u0000method -> hasLocalInterface" memo is also view-derived.
         this._hasInterfaceCache = null;
+        this._astGeneration += 1;
+        this._astQueryCache.clear();
+        this._astInflight.clear();
     }
 
     /**
@@ -320,11 +489,52 @@ class WorkspaceIndex {
     }
 
     /** Resolve and memoize one interface's expanded method set. */
-    _resolveInterfaceMethodsCached(interfaceName, interfaces) {
+    _resolveInterfaceMethodsCached(interfaceName, interfaces, seen) {
         if (!this._resolvedInterfaceCache) this._resolvedInterfaceCache = new Map();
         const hit = this._resolvedInterfaceCache.get(interfaceName);
         if (hit) return hit;
-        const resolved = resolveInterfaceMethods(interfaceName, interfaces, undefined, this._resolvedInterfaceCache);
+        const visiting = seen || new Set();
+        if (visiting.has(interfaceName)) return { methods: new Map(), unresolved: [] };
+        visiting.add(interfaceName);
+        const info = interfaces.get(interfaceName);
+        if (!info) return { methods: new Map(), unresolved: [interfaceName] };
+        const methods = new Map(info.methods);
+        const unresolved = [];
+        for (const embed of info.embeds || []) {
+            if (info.genericEmbeds && info.genericEmbeds.has(embed)) {
+                unresolved.push(embed);
+                continue;
+            }
+            if (BUILTIN_INTERFACES.has(embed)) {
+                for (const [name, signature] of BUILTIN_INTERFACES.get(embed)) {
+                    if (!methods.has(name)) methods.set(name, signature);
+                }
+                continue;
+            }
+            const imported = importedReferenceIdentity(embed);
+            let embeddedKey = null;
+            if (imported && this._interfaceKeyByImportIdentity) {
+                embeddedKey = this._interfaceKeyByImportIdentity.get(
+                    `${imported.importPath}\0${imported.name}`
+                );
+            } else if (!embed.includes('.')) {
+                embeddedKey = symbolKeyFor(info.packageKey, embed);
+            }
+            if (!embeddedKey || !interfaces.has(embeddedKey)) {
+                unresolved.push(embed);
+                continue;
+            }
+            const nested = this._resolveInterfaceMethodsCached(
+                embeddedKey,
+                interfaces,
+                new Set(visiting)
+            );
+            for (const [name, signature] of nested.methods) {
+                if (!methods.has(name)) methods.set(name, signature);
+            }
+            unresolved.push(...nested.unresolved);
+        }
+        const resolved = { methods, unresolved };
         this._resolvedInterfaceCache.set(interfaceName, resolved);
         return resolved;
     }
@@ -344,8 +554,63 @@ class WorkspaceIndex {
         if (!this._resolvedTypeCache) this._resolvedTypeCache = new Map();
         const hit = this._resolvedTypeCache.get(typeKey);
         if (hit) return hit;
-        const resolved = resolveTypeMethods(typeKey, types);
+        const resolved = this._resolveTypeMethodSetsCached(typeKey, types).pointer;
         this._resolvedTypeCache.set(typeKey, resolved);
+        return resolved;
+    }
+
+    _resolveTypeMethodSetsCached(typeKey, types, seen) {
+        if (!this._resolvedTypeSetCache) this._resolvedTypeSetCache = new Map();
+        const cached = this._resolvedTypeSetCache.get(typeKey);
+        if (cached) return cached;
+        const visiting = seen || new Set();
+        if (visiting.has(typeKey)) return { value: new Map(), pointer: new Map() };
+        visiting.add(typeKey);
+
+        const type = types.get(typeKey);
+        if (!type) return { value: new Map(), pointer: new Map() };
+        const value = new Map();
+        const pointer = new Map(type.methods);
+        for (const [name, signature] of type.methods) {
+            if (!type.pointerOnlyMethods || !type.pointerOnlyMethods.has(name)) value.set(name, signature);
+        }
+
+        const promote = (target, mode) => {
+            const candidates = new Map();
+            for (const embed of type.embeds) {
+                if (type.genericEmbeds && type.genericEmbeds.has(embed)) continue;
+                const imported = importedReferenceIdentity(embed);
+                let embeddedKey = null;
+                if (imported && this._typeKeyByImportIdentity) {
+                    embeddedKey = this._typeKeyByImportIdentity.get(
+                        `${imported.importPath}\0${imported.name}`
+                    );
+                } else if (!embed.includes('.')) {
+                    embeddedKey = symbolKeyFor(type.packageKey, embed);
+                }
+                if (!embeddedKey) continue;
+                const methods = this._resolveTypeMethodSetsCached(
+                    embeddedKey,
+                    types,
+                    new Set(visiting)
+                );
+                const pointerEmbed = type.pointerEmbeds && type.pointerEmbeds.has(embed);
+                const source = pointerEmbed || mode === 'pointer' ? methods.pointer : methods.value;
+                for (const [name, signature] of source) {
+                    const candidate = candidates.get(name);
+                    if (candidate) candidate.count += 1;
+                    else candidates.set(name, { signature, count: 1 });
+                }
+            }
+            for (const [name, candidate] of candidates) {
+                if (candidate.count === 1 && !target.has(name)) target.set(name, candidate.signature);
+            }
+        };
+
+        promote(value, 'value');
+        promote(pointer, 'pointer');
+        const resolved = { value, pointer };
+        this._resolvedTypeSetCache.set(typeKey, resolved);
         return resolved;
     }
 
@@ -399,6 +664,32 @@ class WorkspaceIndex {
         return false;
     }
 
+    _importPathForFile(file) {
+        const directory = path.dirname(file);
+        if (this._importPathByDirectory.has(directory)) {
+            return this._importPathByDirectory.get(directory);
+        }
+        let importPath = null;
+        try {
+            const goModPath = findGoMod(directory);
+            if (goModPath) {
+                const source = fs.readFileSync(goModPath, 'utf8');
+                const moduleMatch = source.match(/^\s*module\s+(\S+)/m);
+                if (moduleMatch) {
+                    const relative = path.relative(path.dirname(goModPath), directory);
+                    importPath = moduleMatch[1];
+                    if (relative && relative !== '.') {
+                        importPath += `/${relative.split(path.sep).join('/')}`;
+                    }
+                }
+            }
+        } catch (_) {
+            importPath = null;
+        }
+        this._importPathByDirectory.set(directory, importPath);
+        return importPath;
+    }
+
     /** Build (and memoize) the merged interface / type views. */
     _merged() {
         if (this._mergedInterfaces && this._mergedTypes) {
@@ -416,16 +707,34 @@ class WorkspaceIndex {
         for (const [file, parsed] of this.overlays) effectiveFiles.set(file, parsed);
 
         const aliasesByPackage = new Map();
+        const localNamesByPackage = new Map();
+        const importPathsByPackage = new Map();
         for (const [file, parsed] of effectiveFiles) {
             const packageKey = packageKeyFor(file, parsed.packageName);
             if (!aliasesByPackage.has(packageKey)) aliasesByPackage.set(packageKey, new Map());
             const aliases = aliasesByPackage.get(packageKey);
             for (const [name, target] of parsed.aliases || []) aliases.set(name, target);
+            if (parsed.syntax === 'declaration-ast-v1') {
+                if (!localNamesByPackage.has(packageKey)) localNamesByPackage.set(packageKey, new Set());
+                const localNames = localNamesByPackage.get(packageKey);
+                for (const name of parsed.interfaces.keys()) localNames.add(name);
+                for (const name of parsed.types.keys()) localNames.add(name);
+                for (const name of (parsed.aliases || new Map()).keys()) localNames.add(name);
+                if (!importPathsByPackage.has(packageKey)) {
+                    importPathsByPackage.set(packageKey, this._importPathForFile(file));
+                }
+            }
         }
 
         for (const [file, parsed] of effectiveFiles) {
             const packageKey = packageKeyFor(file, parsed.packageName);
             const aliases = aliasesByPackage.get(packageKey);
+            const canonicalSignature = (signature) =>
+                canonicalizeLocalTypes(
+                    canonicalizeAliases(signature, aliases),
+                    localNamesByPackage.get(packageKey),
+                    importPathsByPackage.get(packageKey)
+                );
             for (const [name, info] of parsed.interfaces) {
                 const symbolKey = symbolKeyFor(packageKey, name);
                 interfaceKeyByLocation.set(locationKeyFor(file, name), symbolKey);
@@ -437,14 +746,29 @@ class WorkspaceIndex {
                         line: info.line,
                         methods: info.methods,
                         embeds: info.embeds,
+                        constraint: !!info.constraint,
+                        generic: !!info.generic,
                     });
                 }
                 if (!interfacesFlat.has(symbolKey)) {
-                    interfacesFlat.set(symbolKey, { name, packageKey, methods: new Map(), embeds: [] });
+                    interfacesFlat.set(symbolKey, {
+                        name,
+                        packageKey,
+                        methods: new Map(),
+                        embeds: [],
+                        constraint: false,
+                        generic: false,
+                        genericEmbeds: new Set(),
+                        importPath: importPathsByPackage.get(packageKey) || null,
+                    });
                 }
                 const flat = interfacesFlat.get(symbolKey);
-                for (const [m, s] of info.methods) flat.methods.set(m, canonicalizeAliases(s, aliases));
+                for (const [m, s] of info.methods) flat.methods.set(m, canonicalSignature(s));
                 flat.embeds.push(...info.embeds);
+                flat.constraint = flat.constraint || !!info.constraint;
+                flat.generic = flat.generic || !!info.generic;
+                for (const embed of info.genericEmbeds || []) flat.genericEmbeds.add(embed);
+                if (!flat.importPath) flat.importPath = importPathsByPackage.get(packageKey) || null;
             }
             for (const [name, info] of parsed.types) {
                 const symbolKey = symbolKeyFor(packageKey, name);
@@ -458,15 +782,48 @@ class WorkspaceIndex {
                     methods: info.methods,
                     embeds: info.embeds,
                     methodLines: info.methodLines || new Map(),
+                    methodCharacters: info.methodCharacters || new Map(),
+                    pointerMethods: info.pointerMethods || new Set(),
+                    pointerEmbeds: info.pointerEmbeds || new Set(),
+                    genericEmbeds: info.genericEmbeds || new Set(),
+                    declared: info.declared !== false,
                 });
 
                 if (!typesFlat.has(symbolKey)) {
-                    typesFlat.set(symbolKey, { name, packageKey, methods: new Map(), embeds: [] });
+                    typesFlat.set(symbolKey, {
+                        name,
+                        packageKey,
+                        methods: new Map(),
+                        embeds: [],
+                        pointerOnlyMethods: new Set(),
+                        pointerEmbeds: new Set(),
+                        genericEmbeds: new Set(),
+                        importPath: importPathsByPackage.get(packageKey) || null,
+                    });
                 }
                 const flat = typesFlat.get(symbolKey);
-                for (const [m, s] of info.methods) flat.methods.set(m, canonicalizeAliases(s, aliases));
+                for (const [m, s] of info.methods) {
+                    flat.methods.set(m, canonicalSignature(s));
+                    if (info.pointerMethods && info.pointerMethods.has(m)) {
+                        flat.pointerOnlyMethods.add(m);
+                    } else {
+                        flat.pointerOnlyMethods.delete(m);
+                    }
+                }
                 flat.embeds.push(...info.embeds);
+                for (const embed of info.pointerEmbeds || []) flat.pointerEmbeds.add(embed);
+                for (const embed of info.genericEmbeds || []) flat.genericEmbeds.add(embed);
+                if (!flat.importPath) flat.importPath = importPathsByPackage.get(packageKey) || null;
             }
+        }
+
+        const interfaceKeyByImportIdentity = new Map();
+        const typeKeyByImportIdentity = new Map();
+        for (const [key, info] of interfacesFlat) {
+            if (info.importPath) interfaceKeyByImportIdentity.set(`${info.importPath}\0${info.name}`, key);
+        }
+        for (const [key, info] of typesFlat) {
+            if (info.importPath) typeKeyByImportIdentity.set(`${info.importPath}\0${info.name}`, key);
         }
 
         this._mergedInterfaces = interfacesFlat;
@@ -475,6 +832,8 @@ class WorkspaceIndex {
         this._interfaceDecls = interfaces;
         this._interfaceKeyByLocation = interfaceKeyByLocation;
         this._typeKeyByLocation = typeKeyByLocation;
+        this._interfaceKeyByImportIdentity = interfaceKeyByImportIdentity;
+        this._typeKeyByImportIdentity = typeKeyByImportIdentity;
 
         // Resolve each interface once and build a method-name inverted index.
         // Conditional goto-interface lenses can now inspect only interfaces that
@@ -521,6 +880,286 @@ class WorkspaceIndex {
         return null;
     }
 
+    _packageForFile(file) {
+        return this._packageKeyByFile.get(path.normalize(file)) || null;
+    }
+
+    _candidatePackagesForMethods(methodNames) {
+        const embeddedPackages = new Set();
+        for (const file of this._embeddedFiles) {
+            const packageKey = this._packageKeyByFile.get(file);
+            if (packageKey) embeddedPackages.add(packageKey);
+        }
+
+        const sets = [];
+        for (const methodName of methodNames) {
+            const packages = new Set(embeddedPackages);
+            for (const file of this._candidateFilesByMethod.get(methodName) || []) {
+                const packageKey = this._packageKeyByFile.get(file);
+                if (packageKey) packages.add(packageKey);
+            }
+            sets.push(packages);
+        }
+        if (sets.length === 0) return new Set();
+        sets.sort((a, b) => a.size - b.size);
+        const candidates = new Set(sets[0]);
+        for (let i = 1; i < sets.length; i++) {
+            for (const packageKey of [...candidates]) {
+                if (!sets[i].has(packageKey)) candidates.delete(packageKey);
+            }
+        }
+        return candidates;
+    }
+
+    async _parseAstPackages(packageKeys, priority) {
+        if (!this.astPool) throw new Error('lazy AST index is disabled');
+        const requests = [];
+        const seen = new Set();
+        for (const packageKey of packageKeys) {
+            for (const file of this._packageFiles.get(packageKey) || []) {
+                if (seen.has(file)) continue;
+                seen.add(file);
+                requests.push({ file, text: this.overlayTexts.get(file) });
+            }
+        }
+        if (requests.length === 0) return new Map();
+        return this.astPool.parseFiles(requests, priority === undefined ? 100 : priority);
+    }
+
+    _packageForImportPath(importPath) {
+        if (this._packageKeyByImportPath.has(importPath)) {
+            return this._packageKeyByImportPath.get(importPath);
+        }
+        for (const root of this._builds.keys()) {
+            try {
+                const goModPath = findGoMod(root);
+                if (!goModPath) continue;
+                const source = fs.readFileSync(goModPath, 'utf8');
+                const moduleMatch = source.match(/^\s*module\s+(\S+)/m);
+                if (!moduleMatch) continue;
+                const modulePath = moduleMatch[1];
+                if (importPath !== modulePath && !importPath.startsWith(`${modulePath}/`)) continue;
+                const suffix = importPath === modulePath ? '' : importPath.slice(modulePath.length + 1);
+                const directory = path.join(path.dirname(goModPath), ...suffix.split('/').filter(Boolean));
+                const packageKeys = this._packageKeysByDirectory.get(path.normalize(directory));
+                if (packageKeys && packageKeys.size > 0) {
+                    const packageKey = packageKeys.values().next().value;
+                    this._packageKeyByImportPath.set(importPath, packageKey);
+                    return packageKey;
+                }
+            } catch (_) {
+                // Fall through to the package scan for local replacements and
+                // non-module workspace layouts.
+            }
+        }
+        for (const [packageKey, files] of this._packageFiles) {
+            const firstFile = files.values().next().value;
+            if (!firstFile) continue;
+            const candidate = this._importPathForFile(firstFile);
+            if (candidate) this._packageKeyByImportPath.set(candidate, packageKey);
+            if (candidate === importPath) return packageKey;
+        }
+        this._packageKeyByImportPath.set(importPath, null);
+        return null;
+    }
+
+    async _expandEmbeddedAstPackages(packageKeys, astFiles, priority) {
+        const packages = new Set(packageKeys);
+        const parsed = new Map(astFiles);
+        for (let round = 0; round < 20; round++) {
+            const additions = new Set();
+            for (const fileInfo of parsed.values()) {
+                const declarations = [...fileInfo.interfaces.values(), ...fileInfo.types.values()];
+                for (const declaration of declarations) {
+                    for (const embed of declaration.embeds || []) {
+                        const imported = importedReferenceIdentity(embed);
+                        if (!imported) continue;
+                        const packageKey = this._packageForImportPath(imported.importPath);
+                        if (packageKey && !packages.has(packageKey)) additions.add(packageKey);
+                    }
+                }
+            }
+            if (additions.size === 0) break;
+            for (const packageKey of additions) packages.add(packageKey);
+            const addedFiles = await this._parseAstPackages(additions, priority);
+            for (const [file, info] of addedFiles) parsed.set(file, info);
+        }
+        return { packages, astFiles: parsed };
+    }
+
+    _createAstView(astFiles) {
+        const view = new WorkspaceIndex(this.getConfig, this.log, { disableAst: true });
+        view.files = new Map(astFiles);
+        return view;
+    }
+
+    _interfaceDescriptor(view, interfaceName, interfaceFile) {
+        const { interfaces } = view._merged();
+        const interfaceKey = view._findInterfaceKey(interfaceName, interfaceFile);
+        if (!interfaceKey) return null;
+        const declaration = interfaces.get(interfaceKey);
+        if (!declaration || declaration.constraint || declaration.generic) return null;
+        const resolved = view._resolveInterfaceMethodsCached(interfaceKey, interfaces);
+        if (resolved.methods.size === 0) return null;
+        return { interfaceKey, resolved };
+    }
+
+    _cachedAstQuery(key, work) {
+        if (this._astQueryCache.has(key)) return Promise.resolve(this._astQueryCache.get(key));
+        if (this._astInflight.has(key)) return this._astInflight.get(key);
+        const generation = this._astGeneration;
+        let request;
+        request = Promise.resolve()
+            .then(work)
+            .then((result) => {
+                if (generation !== this._astGeneration) return this._cachedAstQuery(key, work);
+                this._astQueryCache.set(key, result);
+                return result;
+            })
+            .finally(() => {
+                if (this._astInflight.get(key) === request) this._astInflight.delete(key);
+            });
+        this._astInflight.set(key, request);
+        return request;
+    }
+
+    async _implementationAstContext(interfaceName, interfaceFile) {
+        const interfacePackage = this._packageForFile(interfaceFile);
+        if (!interfacePackage) return null;
+        const interfaceFiles = await this._parseAstPackages(new Set([interfacePackage]), 200);
+        const interfaceClosure = await this._expandEmbeddedAstPackages(
+            new Set([interfacePackage]),
+            interfaceFiles,
+            200
+        );
+        const interfaceView = this._createAstView(interfaceClosure.astFiles);
+        const descriptor = this._interfaceDescriptor(interfaceView, interfaceName, interfaceFile);
+        if (!descriptor) return null;
+        const candidates = this._candidatePackagesForMethods(descriptor.resolved.methods.keys());
+        candidates.add(interfacePackage);
+        for (const packageKey of interfaceClosure.packages) candidates.add(packageKey);
+        const astFiles = await this._parseAstPackages(candidates, 200);
+        const closure = await this._expandEmbeddedAstPackages(candidates, astFiles, 200);
+        return { astFiles: closure.astFiles, candidatePackages: candidates };
+    }
+
+    findImplementationsAst(interfaceName, interfaceFile) {
+        const key = `implementations\0${interfaceFile}\0${interfaceName}`;
+        return this._cachedAstQuery(key, async () => {
+            const started = Date.now();
+            const context = await this._implementationAstContext(interfaceName, interfaceFile);
+            if (!context) return [];
+            const view = this._createAstView(context.astFiles);
+            const results = view.findImplementations(interfaceName, interfaceFile);
+            this.log(
+                `AST implementation query ${interfaceName}: ${context.candidatePackages.size} package(s), ` +
+                    `${context.astFiles.size} file(s), ${Date.now() - started}ms`
+            );
+            return results;
+        });
+    }
+
+    findMethodImplementationsAst(interfaceName, methodName, interfaceFile) {
+        const key = `method\0${interfaceFile}\0${interfaceName}\0${methodName}`;
+        return this._cachedAstQuery(key, async () => {
+            const started = Date.now();
+            const context = await this._implementationAstContext(interfaceName, interfaceFile);
+            if (!context) return [];
+            const view = this._createAstView(context.astFiles);
+            const results = view.findMethodImplementations(interfaceName, methodName, interfaceFile);
+            this.log(
+                `AST method query ${interfaceName}.${methodName}: ${context.candidatePackages.size} package(s), ` +
+                    `${context.astFiles.size} file(s), ${Date.now() - started}ms`
+            );
+            return results;
+        });
+    }
+
+    findInterfacesAst(receiverType, methodName, opts) {
+        const receiverFile = opts && opts.receiverFile;
+        const key = `reverse\0${receiverFile || ''}\0${receiverType}\0${methodName}`;
+        return this._cachedAstQuery(key, async () => {
+            const receiverPackage = this._packageForFile(receiverFile);
+            if (!receiverPackage) return [];
+            const candidates = this._candidatePackagesForMethods([methodName]);
+            candidates.add(receiverPackage);
+            const started = Date.now();
+            const astFiles = await this._parseAstPackages(candidates, 200);
+            const closure = await this._expandEmbeddedAstPackages(candidates, astFiles, 200);
+            const view = this._createAstView(closure.astFiles);
+            const local = view._collectLocalInterfaces(receiverType, methodName, { receiverFile });
+            const results = local.results;
+            const cfg = this.getConfig();
+            if (results.length === 0 && cfg.searchDependencies !== false) {
+                const cacheRoot = resolveGoModCache(cfg.goModCache);
+                if (cacheRoot) await this._searchDependencyInterfacesAst(cacheRoot, methodName, local);
+            }
+            this.log(
+                `AST reverse query ${receiverType}.${methodName}: ${candidates.size} package(s), ` +
+                    `${closure.astFiles.size} file(s), ${Date.now() - started}ms`
+            );
+            return results;
+        });
+    }
+
+    async _searchDependencyInterfacesAst(cacheRoot, methodName, local) {
+        const lockedDirs = this._resolveLockedDirs(cacheRoot);
+        let candidates;
+        try {
+            candidates = await grepInterfaceFilesForMethod(
+                cacheRoot,
+                methodName,
+                undefined,
+                lockedDirs
+            );
+        } catch (err) {
+            this.log(`AST dependency candidate search failed: ${err.message}`);
+            return;
+        }
+        const sources = await Promise.all(
+            candidates.map(async (file) => {
+                try {
+                    if (!shouldIncludeGoFile(file, '', this._buildContext)) return null;
+                    const text = await fs.promises.readFile(file, 'utf8');
+                    if (!shouldIncludeGoFile(file, text, this._buildContext)) return null;
+                    return { file, text };
+                } catch (_) {
+                    return null;
+                }
+            })
+        );
+        const requests = sources.filter(Boolean);
+        if (requests.length === 0) return;
+        let parsed;
+        try {
+            parsed = await this.astPool.parseFiles(requests, 200);
+        } catch (err) {
+            this.log(`AST dependency parsing failed: ${err.message}`);
+            return;
+        }
+        const view = this._createAstView(parsed);
+        const { interfaces } = view._merged();
+        for (const interfaceKey of view._interfacesByMethod.get(methodName) || []) {
+            const declaration = view._interfaceDecls.get(interfaceKey);
+            const info = interfaces.get(interfaceKey);
+            if (!declaration || !info || info.constraint) continue;
+            local.consider(
+                interfaceKey,
+                view._resolveInterfaceMethodsCached(interfaceKey, interfaces),
+                declaration,
+                true
+            );
+        }
+        this.log(
+            `AST dependency query ${methodName}: ${candidates.length} candidate file(s), ` +
+                `${parsed.size} parsed file(s)`
+        );
+    }
+
+    getAstStats() {
+        return this.astPool ? { ...this.astPool.stats } : null;
+    }
+
     /**
      * Find all concrete types that implement the given interface (by signature).
      * @param {string} interfaceName
@@ -553,15 +1192,31 @@ class WorkspaceIndex {
     _collectImplementations(resolved, types, loose) {
         const results = [];
         for (const [typeKey, typeInfo] of types) {
-            const typeMethods = this._resolveTypeMethodsCached(typeKey, types);
-            if (satisfies(resolved.methods, typeMethods, { unresolved: resolved.unresolved, loose })) {
+            const methodSets = this._resolveTypeMethodSetsCached(typeKey, types);
+            const valueImplements = satisfies(resolved.methods, methodSets.value, {
+                unresolved: resolved.unresolved,
+                loose,
+            });
+            const pointerImplements =
+                valueImplements ||
+                satisfies(resolved.methods, methodSets.pointer, {
+                    unresolved: resolved.unresolved,
+                    loose,
+                });
+            if (pointerImplements) {
                 // One package-qualified type can contribute declarations and
                 // methods from multiple files. Preserve its recorded locations;
                 // dedupeResults removes repeated location identities after the
                 // strict and loose passes are merged.
-                const locations = this._typesByLocation.get(typeKey) || [];
+                const allLocations = this._typesByLocation.get(typeKey) || [];
+                const declarations = allLocations.filter((location) => location.declared !== false);
+                const locations = declarations.length > 0 ? declarations : allLocations;
                 for (const decl of locations) {
-                    results.push({ name: typeInfo.name, file: decl.file, line: decl.line });
+                    results.push({
+                        name: valueImplements ? typeInfo.name : `*${typeInfo.name}`,
+                        file: decl.file,
+                        line: decl.line,
+                    });
                 }
             }
         }
@@ -603,28 +1258,30 @@ class WorkspaceIndex {
             return loose && looseSignatureEqual(a, b);
         };
         for (const [typeKey, typeInfo] of types) {
-            const typeMethods = this._resolveTypeMethodsCached(typeKey, types);
-            const sig = typeMethods.get(methodName);
-            if (sig === undefined) continue;
-            // If we know the interface's signature, require a (strict or loose) match.
-            if (wantSig !== undefined && !sigMatches(sig, wantSig)) continue;
-            // Only include types that satisfy the whole interface, to reduce
-            // noise. The specific method signature above already anchors this
-            // result, so imported embedded interfaces may be tolerated here.
-            if (
-                !satisfies(resolved.methods, typeMethods, {
+            const methodSets = this._resolveTypeMethodSetsCached(typeKey, types);
+            const implementsWith = (methods) => {
+                const sig = methods.get(methodName);
+                if (sig === undefined) return false;
+                if (wantSig !== undefined && !sigMatches(sig, wantSig)) return false;
+                return satisfies(resolved.methods, methods, {
                     unresolved: resolved.unresolved,
                     allowUnresolved: true,
                     loose,
-                })
-            ) {
-                continue;
-            }
+                });
+            };
+            const valueImplements = implementsWith(methodSets.value);
+            const pointerImplements = valueImplements || implementsWith(methodSets.pointer);
+            if (!pointerImplements) continue;
+            const sig = (valueImplements ? methodSets.value : methodSets.pointer).get(methodName);
 
             // Locations are already package-scoped by typeKey. Emit the direct
             // declaration(s) for this method and dedupe the strict/loose passes.
             for (const loc of this._findMethodLocations(typeKey, methodName)) {
-                results.push({ name: typeInfo.name, ...loc, signature: sig });
+                results.push({
+                    name: valueImplements ? typeInfo.name : `*${typeInfo.name}`,
+                    ...loc,
+                    signature: sig,
+                });
             }
         }
         return results;
@@ -862,11 +1519,19 @@ class WorkspaceIndex {
         const typeInfo = this._mergedTypes && this._mergedTypes.get(typeKey);
         if (!typeInfo) return out;
         for (const embed of typeInfo.embeds) {
-            if (embed.includes('.')) continue;
-            const embeddedKey = symbolKeyFor(typeInfo.packageKey, embed);
+            const imported = importedReferenceIdentity(embed);
+            let embeddedKey = null;
+            if (imported && this._typeKeyByImportIdentity) {
+                embeddedKey = this._typeKeyByImportIdentity.get(
+                    `${imported.importPath}\0${imported.name}`
+                );
+            } else if (!embed.includes('.')) {
+                embeddedKey = symbolKeyFor(typeInfo.packageKey, embed);
+            }
+            if (!embeddedKey) continue;
             const promoted = this._findMethodLocationsRecursive(embeddedKey, methodName, new Set(seen));
-            // resolveTypeMethods uses the first promoted method at a given type;
-            // follow the same order so navigation points at that declaration.
+            // Follow the resolved promotion order so navigation points at the
+            // declaration that contributed the method.
             if (promoted.length > 0) return promoted;
         }
         return out;
@@ -875,6 +1540,15 @@ class WorkspaceIndex {
     clear() {
         this.files.clear();
         this.overlays.clear();
+        this.overlayTexts.clear();
+        this._candidateFilesByMethod.clear();
+        this._candidateMethodsByFile.clear();
+        this._packageFiles.clear();
+        this._packageKeyByFile.clear();
+        this._packageKeysByDirectory.clear();
+        this._embeddedFiles.clear();
+        this._packageKeyByImportPath.clear();
+        if (this.astPool) this.astPool.clear();
         this._invalidateMerged();
         this._builds.clear();
         this._builtRoots.clear();
@@ -889,7 +1563,22 @@ class WorkspaceIndex {
             this._watcher.dispose();
             this._watcher = null;
         }
-        this.clear();
+        if (this.astPool) {
+            this.astPool.dispose();
+            this.astPool = null;
+        }
+        this.files.clear();
+        this.overlays.clear();
+        this.overlayTexts.clear();
+        this._candidateFilesByMethod.clear();
+        this._candidateMethodsByFile.clear();
+        this._packageFiles.clear();
+        this._packageKeyByFile.clear();
+        this._packageKeysByDirectory.clear();
+        this._embeddedFiles.clear();
+        this._packageKeyByImportPath.clear();
+        this._builds.clear();
+        this._builtRoots.clear();
     }
 }
 

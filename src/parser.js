@@ -952,4 +952,5 @@ module.exports = {
     INTERFACE_ALIAS_RE,
     INTERFACE_BLOCK_RE,
     IFACE_METHOD_RE,
+    BUILTIN_INTERFACES,
 };

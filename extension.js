@@ -3,13 +3,9 @@
 const vscode = require('vscode');
 const path = require('path');
 
-const { codeLines } = require('./src/tokenizer');
-const {
-    parseFile,
-    RECEIVER_METHOD_RE,
-} = require('./src/parser');
 const { WorkspaceIndex } = require('./src/indexer');
 const { resolveSearchRoots } = require('./src/search');
+const { parseGoFile } = require('./src/ast');
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -30,6 +26,7 @@ function getConfiguration() {
         excludedTypePatterns: config.get('excludedTypePatterns', ['Mock', 'mock', 'Stub', 'Fake']),
         searchDependencies: config.get('searchDependencies', true),
         goModCache: config.get('goModCache', ''),
+        astConcurrency: config.get('astConcurrency', 2),
     };
 }
 
@@ -47,10 +44,11 @@ function shouldExclude(filePath, receiverType) {
     }
 
     if (receiverType) {
+        const typeName = receiverType.startsWith('*') ? receiverType.slice(1) : receiverType;
         for (const pattern of config.excludedTypePatterns) {
-            if (receiverType.includes(pattern)) return true;
+            if (typeName.includes(pattern)) return true;
         }
-        if (receiverType.startsWith('_')) return true;
+        if (typeName.startsWith('_')) return true;
     }
 
     return false;
@@ -132,18 +130,18 @@ class GoInterfaceLensProvider {
 
     provideCodeLenses(document) {
         const codeLenses = [];
-        const parsed = parseFile(document.getText());
+        const parsed = parseGoFile(document.getText());
 
         if (parsed.interfaces.size > 0) {
-            // Pure interface files have no receiver methods, so the reverse-lens
-            // provider cannot trigger its existing lazy build. Start the same
-            // deduplicated build here without delaying CodeLens rendering.
+            // Build the broad candidate index in the background. Exact AST
+            // parsing remains lazy until a lens is clicked.
             prewarmWorkspace(document.uri, 'interface lens');
         }
 
         const lineRange = (index) => new vscode.Range(index, 0, index, document.lineAt(index).text.length);
 
         for (const [interfaceName, info] of parsed.interfaces) {
+            if (info.constraint || info.generic) continue;
             codeLenses.push(
                 new vscode.CodeLens(lineRange(info.line), {
                     title: 'implementations',
@@ -177,53 +175,22 @@ class GoGotoInterfaceLensProvider {
     }
 
     provideCodeLenses(document) {
-        const code = codeLines(document.getText());
-
-        // Collect candidate receiver-method declarations first.
-        const candidates = [];
-        code.forEach((line, index) => {
-            const match = line.match(RECEIVER_METHOD_RE);
-            if (!match) return;
-            const receiverType = match[1];
-            const methodName = match[2];
-            if (shouldExclude(document.fileName, receiverType)) return;
-            candidates.push({ index, receiverType, methodName });
-        });
-
-        if (candidates.length === 0) return [];
-
-        // The lens is only shown for methods that actually implement some
-        // interface. That check reads the index, so it must be cheap enough to
-        // run on every file switch. Two guarantees keep it fast:
-        //   1. We never block on indexing here. If the relevant roots are not yet
-        //      built we kick off the build in the background and return no
-        //      goto-interface lenses for now; when the build finishes the index
-        //      fires onDidChange and VS Code re-invokes this provider, so the
-        //      lenses appear a moment later without stalling the editor.
-        //   2. When the roots ARE built we use a synchronous, memoized,
-        //      workspace-only check (hasLocalInterface) that never greps the
-        //      module cache. The expensive dependency search stays in the
-        //      explicit "goto interface" click handler.
-        const roots = resolveSearchRoots(document.uri);
-        if (!workspaceIndex.areRootsBuilt(roots)) {
-            // Build in the background; do not await. onDidChange will refresh.
-            Promise.all(roots.map((root) => workspaceIndex.ensureBuilt(root))).catch((err) => {
-                log(`goto-interface lens: background index build failed: ${err && err.message}`);
-            });
-            return [];
-        }
-
+        const parsed = parseGoFile(document.getText());
         const codeLenses = [];
-        for (const c of candidates) {
-            if (!workspaceIndex.hasLocalInterface(c.receiverType, c.methodName, document.fileName)) continue;
-            const range = new vscode.Range(c.index, 0, c.index, document.lineAt(c.index).text.length);
-            codeLenses.push(
-                new vscode.CodeLens(range, {
-                    title: '← goto interface',
-                    command: 'go-interface-lens.gotoInterface',
-                    arguments: [c.receiverType, c.methodName, document.uri],
-                })
-            );
+        for (const [receiverType, info] of parsed.types) {
+            if (shouldExclude(document.fileName, receiverType)) continue;
+            for (const methodName of info.methods.keys()) {
+                const line = info.methodLines.get(methodName);
+                if (typeof line !== 'number') continue;
+                const range = new vscode.Range(line, 0, line, document.lineAt(line).text.length);
+                codeLenses.push(
+                    new vscode.CodeLens(range, {
+                        title: '← goto interface',
+                        command: 'go-interface-lens.gotoInterface',
+                        arguments: [receiverType, methodName, document.uri],
+                    })
+                );
+            }
         }
         return codeLenses;
     }
@@ -325,8 +292,8 @@ async function withSearchProgress(documentUri, title, search) {
 // ---------------------------------------------------------------------------
 async function showImplementations(interfaceName, documentUri) {
     log(`showImplementations: ${interfaceName}`);
-    const items = await withSearchProgress(documentUri, `Searching ${interfaceName} implementations...`, () => {
-        const found = workspaceIndex.findImplementations(interfaceName, documentUri.fsPath);
+    const items = await withSearchProgress(documentUri, `Searching ${interfaceName} implementations...`, async () => {
+        const found = await workspaceIndex.findImplementationsAst(interfaceName, documentUri.fsPath);
         return found
             .filter((r) => !shouldExclude(r.file, r.name))
             .map((r) => ({
@@ -346,8 +313,12 @@ async function showImplementations(interfaceName, documentUri) {
 
 async function showMethodImplementations(interfaceName, methodName, documentUri) {
     log(`showMethodImplementations: ${interfaceName}.${methodName}`);
-    const items = await withSearchProgress(documentUri, `Searching ${methodName} implementations...`, () => {
-        const found = workspaceIndex.findMethodImplementations(interfaceName, methodName, documentUri.fsPath);
+    const items = await withSearchProgress(documentUri, `Searching ${methodName} implementations...`, async () => {
+        const found = await workspaceIndex.findMethodImplementationsAst(
+            interfaceName,
+            methodName,
+            documentUri.fsPath
+        );
         return found
             .filter((r) => !shouldExclude(r.file, r.name))
             .map((r) => ({
@@ -369,7 +340,7 @@ async function showMethodImplementations(interfaceName, methodName, documentUri)
 async function gotoInterface(receiverType, methodName, documentUri) {
     log(`gotoInterface: ${receiverType}.${methodName}`);
     const items = await withSearchProgress(documentUri, `Searching interfaces with ${methodName}...`, async () => {
-        const found = await workspaceIndex.findInterfaces(receiverType, methodName, {
+        const found = await workspaceIndex.findInterfacesAst(receiverType, methodName, {
             receiverFile: documentUri.fsPath,
         });
         return found.map((r) => ({
@@ -395,7 +366,9 @@ function activate(context) {
     context.subscriptions.push(output);
     log('Go Interface Lens activated');
 
-    workspaceIndex = new WorkspaceIndex(getConfiguration, log);
+    workspaceIndex = new WorkspaceIndex(getConfiguration, log, {
+        cacheDir: context.globalStorageUri && context.globalStorageUri.fsPath,
+    });
     context.subscriptions.push({ dispose: () => workspaceIndex.dispose() });
 
     const provider = new GoInterfaceLensProvider();

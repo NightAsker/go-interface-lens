@@ -1,7 +1,7 @@
 'use strict';
 
-// Verifies that the "← goto interface" CodeLens is only emitted for methods
-// that actually have a matching interface, and suppressed otherwise.
+// Verifies that declaration AST CodeLenses appear immediately. Exact interface
+// matching happens lazily after click.
 
 const path = require('path');
 const fs = require('fs');
@@ -107,10 +107,13 @@ async function main() {
             'package penalty',
             'import "x/processengine"',
             'type PenaltyPushBackboneActionV2 struct{}',
-            // Has a matching interface (Action) -> lens SHOULD appear.
-            'func (action *PenaltyPushBackboneActionV2) ExecuteAction(context *processengine.FlowContext) {}',
+            // Has a matching interface (Action).
+            'func (',
+            '    action *PenaltyPushBackboneActionV2,',
+            ') ExecuteAction(context *processengine.FlowContext) {}',
             'type Lonely struct{}',
-            // No interface declares this method -> lens should NOT appear.
+            // No interface declares this method; the action still appears and
+            // the lazy AST query returns an empty result after click.
             'func (l *Lonely) NoSuchInterfaceMethod(x int) string { return "" }',
         ].join('\n')
     );
@@ -137,15 +140,15 @@ async function main() {
     const lenses = await provider.provideCodeLenses(fakeDocument(implPath), { isCancellationRequested: false });
     const titles = lenses.map((l) => `${l.command.arguments[0]}.${l.command.arguments[1]}`);
 
-    console.log('== goto-interface lens suppression ==');
+    console.log('== immediate AST goto-interface lenses ==');
     console.log('  lenses for:', titles);
     assert(
         'lens shown for method WITH a matching interface',
         titles.includes('PenaltyPushBackboneActionV2.ExecuteAction')
     );
     assert(
-        'lens HIDDEN for method with NO matching interface',
-        !titles.includes('Lonely.NoSuchInterfaceMethod')
+        'lens shown before lazy AST checks a method with no interface',
+        titles.includes('Lonely.NoSuchInterfaceMethod')
     );
 
     const variantsPath = path.join(root, 'variants.go');

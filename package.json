@@ -2,7 +2,7 @@
   "name": "go-interface-lens",
   "displayName": "Go Interface Lens",
   "description": "Fast bidirectional CodeLens navigation between Go interfaces and their implementations",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "publisher": "xiaoyao",
   "author": {
     "name": "xiaoyao"
@@ -103,12 +103,19 @@
           "type": "string",
           "default": "",
           "description": "Optional absolute path to the Go module cache. Leave empty to auto-detect via $GOMODCACHE, $GOPATH/pkg/mod, then ~/go/pkg/mod."
+        },
+        "goInterfaceLens.astConcurrency": {
+          "type": "integer",
+          "default": 2,
+          "minimum": 1,
+          "maximum": 4,
+          "description": "Maximum worker threads used to parse candidate Go packages for precise implementation matching."
         }
       }
     }
   },
   "scripts": {
-    "test": "node test/parser.test.js && node test/indexer.test.js && node test/build.test.js && node test/search.test.js && node test/multiroot.test.js && node test/deps.test.js && node test/gomod.test.js && node test/deps-version.test.js && node test/deps-crosspkg.test.js && node test/progress.test.js && node test/gotolens.test.js",
+    "test": "node test/parser.test.js && node test/ast.test.js && node test/ast-cache.test.js && node test/indexer.test.js && node test/lazy-index.test.js && node test/lazy-deps.test.js && node test/performance.test.js && node test/build.test.js && node test/search.test.js && node test/multiroot.test.js && node test/deps.test.js && node test/gomod.test.js && node test/deps-version.test.js && node test/deps-crosspkg.test.js && node test/progress.test.js && node test/gotolens.test.js",
     "package": "vsce package",
     "publish": "vsce publish"
   },

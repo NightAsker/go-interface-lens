@@ -1,6 +1,6 @@
 # Go Interface Lens
 
-[![Version](https://img.shields.io/badge/version-1.0.3-blue.svg)](https://github.com/NightAsker/go-interface-lens)
+[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](https://github.com/NightAsker/go-interface-lens)
 [![VSCode](https://img.shields.io/badge/VSCode-1.60+-green.svg)](https://code.visualstudio.com/)
 
 > Show implementation count above Go interfaces with one-click navigation to interface and method implementations.
@@ -11,10 +11,10 @@
 - 🎯 **Method-level CodeLens** - Each method has "→ implementations" for direct navigation
 - 🔙 **Goto Interface** Navigate from implementation methods back to their interface declarations with "← goto interface"
 - 📊 **Click to navigate** - Opens a quick pick with all implementations
-- ⚡ **Fast search** using grep for instant results
+- ⚡ **Fast candidate search** with lazy, worker-based AST validation
 - 🚫 **Smart filtering** - Automatically excludes mock implementations
 - 🏗️ **Multi-package support** - Works perfectly with Go modules
-- 💾 **Smart detection** - Intelligently finds types that implement all interface methods
+- 💾 **Persistent AST cache** - Reuses compact declaration data across queries and restarts
 
 ## 📸 Screenshots
 
@@ -99,22 +99,24 @@ func (r *PostgresUserRepository) FindByID(id string) (*User, error) {
 - **VSCode/Cursor**: 1.60.0 or higher
 - **Go files**: `.go` extension
 - **Project structure**: Works with Go modules and any project structure
-- **Search tool**: `grep` (pre-installed on macOS/Linux, Git Bash on Windows)
+- **No gopls required**: Parsing and interface matching run inside the extension
 
 ## ⚙️ How It Works
 
 ### CodeLens Provider
 The extension registers a CodeLens provider that:
-1. Scans all Go files for `type Name interface {` declarations
-2. Shows a clickable lens above each interface
-3. On click, searches for types that implement all interface methods
+1. Parses the open document for interface and receiver-method declarations
+2. Shows clickable interface, method, and reverse-navigation lenses
+3. Starts precise implementation matching only after click
 
 ### Search Strategy
 The extension:
-1. Extracts all method signatures from the interface
-2. Searches for receiver functions matching the first method
-3. Validates that the type implements ALL interface methods
-4. Shows only types that fully implement the interface
+1. Builds a broad method-name candidate index during workspace startup
+2. Chooses the least-common interface methods to narrow candidate packages
+3. Parses only candidate package declarations in a bounded worker pool
+4. Resolves aliases, import paths, embedded interfaces/types, and Go pointer method sets
+5. Validates the complete interface method set using compact declaration IR
+6. Caches file AST summaries and completed queries in memory and on disk
 
 This pattern matches Go's implicit interface implementation:
 ```go
@@ -138,9 +140,11 @@ func (r *PostgresUserRepository) Save(user *User) error {
 ```
 
 ### Performance
-- **First search**: ~50-300ms (depending on project size)
-- **Validation**: Checks all methods to ensure complete implementation
-- **Smart filtering**: Only shows types that implement ALL interface methods
+- **Startup**: Broad text indexing only; the workspace AST is never built eagerly
+- **First query**: Parses candidate packages in 1-4 worker threads (default: 2)
+- **Cached query**: Returns from the in-memory query cache
+- **Persistent cache**: Restores unchanged candidate files using file metadata
+- **Synthetic baseline**: 402 Go files indexed in ~77ms; a rare-method cold AST query took ~33ms and parsed 2 files on the development machine
 
 ## 🎨 Configuration
 
@@ -153,6 +157,10 @@ You can configure which folders, files, and types to exclude from the implementa
 #### Settings
 
 Open VS Code/Cursor settings (`Cmd+,` or `Ctrl+,`) and search for "Go Interface Lens" to configure:
+
+**`goInterfaceLens.astConcurrency`**
+- Worker threads used for candidate-package AST parsing
+- Range: `1-4`; default: `2`
 
 **`goInterfaceLens.excludedFolders`**
 - Array of folder names to exclude from search
@@ -175,6 +183,7 @@ Add to your `settings.json`:
 
 ```json
 {
+  "goInterfaceLens.astConcurrency": 2,
   "goInterfaceLens.excludedFolders": [
     "mocks",
     "mock",

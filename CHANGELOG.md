@@ -2,6 +2,37 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [1.1.0] - 2026-07-17
+
+### Added
+
+- Add a declaration-level Go lexer and AST parser for interfaces, structs,
+  aliases, receiver methods, imports, generics, and nested type expressions.
+- Parse candidate packages concurrently in a bounded worker pool and persist
+  compact per-file declaration IR across extension restarts.
+- Add lazy workspace and module-cache AST filtering for interface,
+  method-implementation, and reverse-interface navigation.
+
+### Improved
+
+- Distinguish value and pointer receiver method sets, including the different
+  promotion rules for embedded `T` and `*T`.
+- Resolve workspace imported interfaces and embedded types by module import
+  path, preventing unrelated packages' same-named types from matching.
+- Recognize split multiline declarations that the previous receiver regex could
+  not parse, while retaining fast text matching only as candidate recall.
+- Show reverse-interface actions immediately and perform precise matching only
+  after click.
+
+### Performance
+
+- Keep startup limited to the existing broad source index; no workspace-wide
+  AST is constructed.
+- Parse only candidate packages, prioritize interactive jobs, deduplicate
+  in-flight file parsing, and cache completed query results.
+- On the synthetic 402-file benchmark, startup indexing took about 77ms, the
+  cold rare-method AST query took about 33ms, and only two files were parsed.
+
 ## [1.0.3] - 2026-07-16
 
 ### Changed
