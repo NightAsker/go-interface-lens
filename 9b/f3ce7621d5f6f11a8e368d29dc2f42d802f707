@@ -1,0 +1,21 @@
+src/ast-worker.js
+  s_c9a8f97458fc41::t_e01ba87cfd92d6 1-17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "9bf3ce7621d5f6f11a8e368d29dc2f42d802f707",
+  "prompts": {},
+  "sessions": {
+    "s_c9a8f97458fc41": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6a98-26c0-7d80-999f-590831706f38",
+        "model": "unknown"
+      },
+      "human_author": "xiaoyao.777 <xiaoyao.777@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
