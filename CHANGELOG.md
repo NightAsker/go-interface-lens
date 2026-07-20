@@ -2,6 +2,14 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [1.1.4] - 2026-07-20
+
+### Fixed
+
+- Respect Go method shadowing when a struct embeds an interface but declares a
+  same-named pointer-receiver method, so only `*T` is reported as implementing
+  the interface.
+
 ## [1.1.3] - 2026-07-20
 
 ### Changed
