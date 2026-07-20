@@ -1,0 +1,29 @@
+src/ast-cache.js
+  s_c9a8f97458fc41::t_2494e723d2f611 9
+src/gomod.js
+  s_c9a8f97458fc41::t_b5903d2982950d 50,57,98,117,121,130,148,152-153,243-302,308
+src/parser.js
+  s_c9a8f97458fc41::t_4fd6087d1cccca 472,538,947
+test/gomod.test.js
+  s_c9a8f97458fc41::t_35d8b3a87c04cb 6-12,51,55-58,95-134
+test/indexer.test.js
+  s_c9a8f97458fc41::t_14f54f857f825e 16,81,132-171
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "e0f1776c1bc93d0667e48f1ee4e5b652661ce45b",
+  "prompts": {},
+  "sessions": {
+    "s_c9a8f97458fc41": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6a98-26c0-7d80-999f-590831706f38",
+        "model": "unknown"
+      },
+      "human_author": "xiaoyao.777 <xiaoyao.777@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
