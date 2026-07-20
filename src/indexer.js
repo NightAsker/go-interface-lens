@@ -725,7 +725,13 @@ class WorkspaceIndex {
                 }
             }
             for (const [name, candidate] of candidates) {
-                if (candidate.count === 1 && !target.has(name)) target.set(name, candidate.signature);
+                // A method declared directly on T or *T shadows every promoted
+                // method with the same name. A pointer-only method is absent
+                // from T's value method set, but it still blocks an embedded
+                // interface method from being promoted into that set.
+                if (candidate.count === 1 && !type.methods.has(name) && !target.has(name)) {
+                    target.set(name, candidate.signature);
+                }
             }
         };
 

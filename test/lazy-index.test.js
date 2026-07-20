@@ -55,6 +55,8 @@ async function main() {
             'type DoneWaiter interface { Done() <-chan struct{} }',
             'type Delegated interface { Delegate() error }',
             'type DelegatedAlias = Delegated',
+            'type FlowContext struct{}',
+            'type Action interface { ExecuteAction(context *FlowContext) }',
             'type Combined interface {',
             '    base.Remote',
             '    Local() error',
@@ -139,6 +141,9 @@ async function main() {
             'type LocalDelegatedAlias = LocalDelegated',
             'type LocalDelegating struct { LocalDelegated }',
             'type LocalAliasDelegating struct { LocalDelegatedAlias }',
+            'type EmbeddedAction struct { api.Action }',
+            'type RecordMqMsgConCntAction struct { api.Action }',
+            'func (*RecordMqMsgConCntAction) ExecuteAction(flowContext *api.FlowContext) {}',
             'type EnterLeaveServiceImpl struct{}',
             'func (EnterLeaveServiceImpl) PutConversationIntoLeaveMsg(ctx context.Context, req *pigeon_conversation_paas.EnterLeaveMsgRequest) (resp *pigeon_conversation_paas.EnterLeaveMsgResponse, err error) { return nil, nil }',
         ].join('\n')
@@ -251,6 +256,12 @@ async function main() {
     assert(
         'promoted method navigates to the embedded interface declaration',
         delegatedMethods[0].file === interfaceFile
+    );
+    const actions = await index.findImplementationsAst('Action', interfaceFile);
+    eq(
+        'pointer method shadows the embedded interface method in the value method set',
+        actions.map((r) => r.name).sort(),
+        ['*RecordMqMsgConCntAction', 'EmbeddedAction']
     );
     const localInterfaceFile = path.join(implDir, 'export.go');
     const localDelegated = await index.findImplementationsAst('LocalDelegated', localInterfaceFile);
