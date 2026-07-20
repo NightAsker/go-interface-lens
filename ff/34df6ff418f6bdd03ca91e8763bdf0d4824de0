@@ -1,0 +1,25 @@
+CHANGELOG.md
+  s_c9a8f97458fc41::t_0e89bc5a82af87 5-12
+README.md
+  s_c9a8f97458fc41::t_8f5b7134b7b0cf 3
+package.json
+  s_c9a8f97458fc41::t_c9bb79f44e27d7 5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "ff34df6ff418f6bdd03ca91e8763bdf0d4824de0",
+  "prompts": {},
+  "sessions": {
+    "s_c9a8f97458fc41": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6a98-26c0-7d80-999f-590831706f38",
+        "model": "unknown"
+      },
+      "human_author": "xiaoyao.777 <xiaoyao.777@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
