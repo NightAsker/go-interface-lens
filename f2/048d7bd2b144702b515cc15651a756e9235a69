@@ -1,0 +1,23 @@
+src/indexer.js
+  s_c9a8f97458fc41::t_7545aa141767e6 728-734
+test/lazy-index.test.js
+  s_c9a8f97458fc41::t_7eb0fc308ca1cd 58-59,144-146,260-265
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "f2048d7bd2b144702b515cc15651a756e9235a69",
+  "prompts": {},
+  "sessions": {
+    "s_c9a8f97458fc41": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6a98-26c0-7d80-999f-590831706f38",
+        "model": "unknown"
+      },
+      "human_author": "xiaoyao.777 <xiaoyao.777@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
