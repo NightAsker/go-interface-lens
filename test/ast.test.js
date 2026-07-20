@@ -77,6 +77,88 @@ eq(
 );
 assert('constraint interface marked non-basic', imports.interfaces.get('Number').constraint);
 
+console.log('\n== declaration AST: complete field normalization ==');
+const normalized = parse([
+    'package p',
+    'import q "example.com/model"',
+    'type T struct{}',
+    'type Box[V any] struct{}',
+    'type ResponseA struct{}',
+    'type ResponseB struct{}',
+    'type Shape interface {',
+    '    Pointer(x *T)',
+    '    Slice(x []T)',
+    '    Array(x [3]T)',
+    '    Variadic(x ...T)',
+    '    Receive(x <-chan T)',
+    '    Send(x chan<- T)',
+    '    Qualified(x *q.Value)',
+    '    Map(x map[string]T)',
+    '    Generic(x Box[T])',
+    '    Grouped(a, b *T)',
+    '    Callback(fn func(x *T) (result []T))',
+    '    Unicode(值 *T)',
+    '    Contract(x interface { Second(y []T); First(value *T) })',
+    '    NestedStruct(x struct { Callback func(value *T); Name string })',
+    '    Result() (resp *ResponseA, err error)',
+    '    SliceResult() (items []ResponseA, err error)',
+    '}',
+    'type Impl struct{}',
+    'func (Impl) Pointer(y *T) {}',
+    'func (Impl) Slice(y []T) {}',
+    'func (Impl) Array(y [3]T) {}',
+    'func (Impl) Variadic(y ...T) {}',
+    'func (Impl) Receive(y <-chan T) {}',
+    'func (Impl) Send(y chan<- T) {}',
+    'func (Impl) Qualified(y *q.Value) {}',
+    'func (Impl) Map(y map[string]T) {}',
+    'func (Impl) Generic(y Box[T]) {}',
+    'func (Impl) Grouped(x, y *T) {}',
+    'func (Impl) Callback(callback func(y *T) (output []T)) {}',
+    'func (Impl) Unicode(参数 *T) {}',
+    'func (Impl) Contract(value interface { First(arg *T); Second(arg []T) }) {}',
+    'func (Impl) NestedStruct(value struct { Callback func(arg *T); Name string }) {}',
+    'func (Impl) Result() (*ResponseA, error) { return nil, nil }',
+    'func (Impl) SliceResult() ([]ResponseA, error) { return nil, nil }',
+]);
+for (const methodName of normalized.interfaces.get('Shape').methods.keys()) {
+    eq(
+        `${methodName} ignores field names without losing its type`,
+        normalized.types.get('Impl').methods.get(methodName),
+        normalized.interfaces.get('Shape').methods.get(methodName)
+    );
+}
+
+const distinctResults = parse([
+    'package p',
+    'type ResponseA struct{}',
+    'type ResponseB struct{}',
+    'type Wanted interface { Build() (resp *ResponseA, err error) }',
+    'type Wrong struct{}',
+    'func (Wrong) Build() (resp *ResponseB, err error) { return nil, nil }',
+    'type StructWanted interface { Use(struct { X int }) }',
+    'type StructWrong struct{}',
+    'func (StructWrong) Use(struct { Y int }) {}',
+    'type SliceWanted interface { List() (items []ResponseA, err error) }',
+    'type SliceWrong struct{}',
+    'func (SliceWrong) List() (items []ResponseB, err error) { return nil, nil }',
+]);
+assert(
+    'named pointer result types remain distinguishable',
+    distinctResults.interfaces.get('Wanted').methods.get('Build') !==
+        distinctResults.types.get('Wrong').methods.get('Build')
+);
+assert(
+    'anonymous struct field names remain part of type identity',
+    distinctResults.interfaces.get('StructWanted').methods.get('Use') !==
+        distinctResults.types.get('StructWrong').methods.get('Use')
+);
+assert(
+    'named slice result types remain distinguishable',
+    distinctResults.interfaces.get('SliceWanted').methods.get('List') !==
+        distinctResults.types.get('SliceWrong').methods.get('List')
+);
+
 console.log('\n== declaration AST skips function bodies ==');
 const localDeclarations = parse([
     'package p',
@@ -99,5 +181,6 @@ eq(
     service.interfaces.get('Runner').methods.get('Run')
 );
 assert('serialized pointer metadata restored', restored.types.get('Worker').pointerMethods.has('Run'));
+assert('serialized struct metadata restored', restored.types.get('Worker').struct);
 
 done();

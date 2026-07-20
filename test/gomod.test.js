@@ -3,12 +3,13 @@
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { parseGoMod, escapeModulePath, resolveLockedModuleDirs, isLocalPath } = require(path.join(
-    __dirname,
-    '..',
-    'src',
-    'gomod'
-));
+const {
+    parseGoMod,
+    escapeModulePath,
+    resolveLockedModuleDirs,
+    resolveModuleImportDirectory,
+    isLocalPath,
+} = require(path.join(__dirname, '..', 'src', 'gomod'));
 const { eq, assert, done } = require(path.join(__dirname, 'harness'));
 
 console.log('== escapeModulePath (cache escaping) ==');
@@ -47,10 +48,14 @@ console.log('\n== parseGoMod with replace ==');
         'replace github.com/old/lib => github.com/new/lib v2.2.2',
         'replace github.com/acme/x => ../local/x',
     ].join('\n');
-    const { versions, localReplaces } = parseGoMod(mod);
+    const { versions, localReplaces, moduleReplaces } = parseGoMod(mod);
     eq('replaced-by-module version applied to target', versions.get('github.com/new/lib'), 'v2.2.2');
     eq('local replace recorded', localReplaces.get('github.com/acme/x'), '../local/x');
     assert('locally-replaced module removed from cache versions', !versions.has('github.com/acme/x'));
+    eq('module replacement target retained', moduleReplaces.get('github.com/old/lib'), {
+        modulePath: 'github.com/new/lib',
+        version: 'v2.2.2',
+    });
 }
 
 console.log('\n== isLocalPath ==');
@@ -84,6 +89,46 @@ console.log('\n== resolveLockedModuleDirs (only locked versions) ==');
     assert('EXCLUDES stale v1.2.0 dir', !dirs.includes(modDirV12));
     eq('exactly one locked dir', dirs.length, 1);
 
+    fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+console.log('\n== resolveModuleImportDirectory ==');
+{
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gomod-import-test-'));
+    const proj = path.join(tmp, 'proj');
+    const cache = path.join(tmp, 'modcache');
+    const local = path.join(tmp, 'local');
+    const normalPackage = path.join(cache, 'example.com', 'dep@v1.2.0', 'runner');
+    const replacedPackage = path.join(cache, 'example.com', 'new@v2.0.0', 'api');
+    const localPackage = path.join(local, 'adapter');
+    for (const directory of [proj, normalPackage, replacedPackage, localPackage]) {
+        fs.mkdirSync(directory, { recursive: true });
+    }
+    fs.writeFileSync(
+        path.join(proj, 'go.mod'),
+        [
+            'module example.com/project',
+            'require example.com/dep v1.2.0',
+            'require example.com/old v1.0.0',
+            'replace example.com/old => example.com/new v2.0.0',
+            'replace example.com/local => ../local',
+        ].join('\n')
+    );
+    eq(
+        'locked module package resolved',
+        resolveModuleImportDirectory(proj, 'example.com/dep/runner', cache),
+        normalPackage
+    );
+    eq(
+        'module replacement package resolved',
+        resolveModuleImportDirectory(proj, 'example.com/old/api', cache),
+        replacedPackage
+    );
+    eq(
+        'local replacement package resolved',
+        resolveModuleImportDirectory(proj, 'example.com/local/adapter', cache),
+        localPackage
+    );
     fs.rmSync(tmp, { recursive: true, force: true });
 }
 

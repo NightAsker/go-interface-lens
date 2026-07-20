@@ -3,16 +3,18 @@
 const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
+const { execFile } = require('child_process');
 
 const {
     parseFile,
     resolveInterfaceMethods,
     satisfies,
     looseSignatureEqual,
+    splitNormalizedSignature,
     BUILTIN_INTERFACES,
 } = require('./parser');
 const { listGoFiles, resolveGoModCache, grepInterfaceFilesForMethod } = require('./search');
-const { findGoMod, resolveLockedModuleDirs } = require('./gomod');
+const { findGoMod, resolveLockedModuleDirs, resolveModuleImportDirectory } = require('./gomod');
 const { currentBuildContext, shouldIncludeGoFile } = require('./build');
 const { AstWorkerPool } = require('./ast-cache');
 
@@ -78,6 +80,49 @@ function importedReferenceIdentity(reference) {
     return match ? { importPath: match[1], name: match[2] } : null;
 }
 
+function importedSignatureReferences(signature) {
+    return [...signature.matchAll(/@\{([^}]+)\}\.([A-Z_a-z]\w*)/g)].map((match) => ({
+        importPath: match[1],
+        name: match[2],
+    }));
+}
+
+function potentialAliasImports(signatures) {
+    const imports = new Set();
+    const groups = new Map();
+    for (const signature of new Set(signatures)) {
+        const slots = splitNormalizedSignature(signature);
+        if (!slots) continue;
+        const key = `${slots.params.length}\0${slots.results.length}`;
+        if (!groups.has(key)) {
+            groups.set(key, {
+                params: slots.params.map(() => new Map()),
+                results: slots.results.map(() => new Map()),
+            });
+        }
+        const group = groups.get(key);
+        for (const section of ['params', 'results']) {
+            for (let i = 0; i < slots[section].length; i++) {
+                const slot = slots[section][i];
+                if (!group[section][i].has(slot)) {
+                    group[section][i].set(slot, importedSignatureReferences(slot));
+                }
+            }
+        }
+    }
+    for (const group of groups.values()) {
+        for (const section of ['params', 'results']) {
+            for (const slotValues of group[section]) {
+                if (slotValues.size < 2) continue;
+                for (const references of slotValues.values()) {
+                    for (const reference of references) imports.add(reference.importPath);
+                }
+            }
+        }
+    }
+    return imports;
+}
+
 /**
  * Replace package-local aliases in a normalized signature. This is computed
  * once while building the merged view, so query-time matching remains a direct
@@ -128,6 +173,46 @@ function canonicalizeLocalTypes(signature, localNames, importPath) {
         return `@{${importPath}}.${token}`;
     });
 }
+
+const PREDECLARED_TYPE_ALIASES = new Map([
+    ['byte', 'uint8'],
+    ['rune', 'int32'],
+    ['any', 'interface{}'],
+]);
+
+function canonicalizePredeclaredAliases(signature, localNames) {
+    return signature.replace(/[A-Z_a-z]\w*/g, (token, offset, whole) => {
+        const target = PREDECLARED_TYPE_ALIASES.get(token);
+        if (!target || (localNames && localNames.has(token))) return token;
+        const previous = offset > 0 ? whole[offset - 1] : '';
+        const next = whole[offset + token.length] || '';
+        if (previous === '.' || next === '.') return token;
+        if (whole.lastIndexOf('@{', offset) > whole.lastIndexOf('}', offset)) return token;
+        return target;
+    });
+}
+
+function canonicalizeQualifiedAliases(signature, resolveAlias, seen) {
+    return signature.replace(/@\{([^}]+)\}\.([A-Z_a-z]\w*)/g, (reference, importPath, name) => {
+        const key = `${importPath}\0${name}`;
+        if (seen && seen.has(key)) return reference;
+        const nextSeen = new Set(seen || []);
+        nextSeen.add(key);
+        return resolveAlias(importPath, name, nextSeen) || reference;
+    });
+}
+
+const CANONICAL_BUILTIN_INTERFACES = new Map(
+    [...BUILTIN_INTERFACES].map(([name, methods]) => [
+        name,
+        new Map(
+            [...methods].map(([methodName, signature]) => [
+                methodName,
+                canonicalizePredeclaredAliases(signature),
+            ])
+        ),
+    ])
+);
 
 /**
  * Workspace-wide, incrementally maintained index of Go interfaces and types.
@@ -188,6 +273,9 @@ class WorkspaceIndex {
         this._astGeneration = 1;
         this._importPathByDirectory = new Map();
         this._packageKeyByImportPath = new Map();
+        this._externalImportDirectoryCache = new Map();
+        this._externalPackageCache = new Map();
+        this._goRootPromise = null;
         const cfg = this.getConfig();
         this.astPool = this.options.disableAst
             ? null
@@ -506,7 +594,7 @@ class WorkspaceIndex {
                 continue;
             }
             if (BUILTIN_INTERFACES.has(embed)) {
-                for (const [name, signature] of BUILTIN_INTERFACES.get(embed)) {
+                for (const [name, signature] of CANONICAL_BUILTIN_INTERFACES.get(embed)) {
                     if (!methods.has(name)) methods.set(name, signature);
                 }
                 continue;
@@ -579,23 +667,57 @@ class WorkspaceIndex {
             const candidates = new Map();
             for (const embed of type.embeds) {
                 if (type.genericEmbeds && type.genericEmbeds.has(embed)) continue;
+                const canPromoteInterface = type.struct || type.interfaceAlias;
                 const imported = importedReferenceIdentity(embed);
                 let embeddedKey = null;
+                let embeddedInterfaceKey = null;
                 if (imported && this._typeKeyByImportIdentity) {
                     embeddedKey = this._typeKeyByImportIdentity.get(
                         `${imported.importPath}\0${imported.name}`
                     );
+                    if (!embeddedKey && canPromoteInterface && this._interfaceKeyByImportIdentity) {
+                        embeddedInterfaceKey = this._interfaceKeyByImportIdentity.get(
+                            `${imported.importPath}\0${imported.name}`
+                        );
+                    }
                 } else if (!embed.includes('.')) {
-                    embeddedKey = symbolKeyFor(type.packageKey, embed);
+                    const localKey = symbolKeyFor(type.packageKey, embed);
+                    if (types.has(localKey)) embeddedKey = localKey;
+                    else if (
+                        canPromoteInterface &&
+                        this._mergedInterfaces &&
+                        this._mergedInterfaces.has(localKey)
+                    ) {
+                        embeddedInterfaceKey = localKey;
+                    }
                 }
-                if (!embeddedKey) continue;
-                const methods = this._resolveTypeMethodSetsCached(
-                    embeddedKey,
-                    types,
-                    new Set(visiting)
-                );
-                const pointerEmbed = type.pointerEmbeds && type.pointerEmbeds.has(embed);
-                const source = pointerEmbed || mode === 'pointer' ? methods.pointer : methods.value;
+                let source;
+                if (embeddedKey) {
+                    const methods = this._resolveTypeMethodSetsCached(
+                        embeddedKey,
+                        types,
+                        new Set(visiting)
+                    );
+                    const pointerEmbed = type.pointerEmbeds && type.pointerEmbeds.has(embed);
+                    source = pointerEmbed || mode === 'pointer' ? methods.pointer : methods.value;
+                } else if (embeddedInterfaceKey) {
+                    const embeddedInterface = this._mergedInterfaces.get(embeddedInterfaceKey);
+                    if (
+                        !embeddedInterface ||
+                        embeddedInterface.constraint ||
+                        embeddedInterface.generic
+                    ) {
+                        continue;
+                    }
+                    source = this._resolveInterfaceMethodsCached(
+                        embeddedInterfaceKey,
+                        this._mergedInterfaces
+                    ).methods;
+                } else if (canPromoteInterface && BUILTIN_INTERFACES.has(embed)) {
+                    source = CANONICAL_BUILTIN_INTERFACES.get(embed);
+                } else {
+                    continue;
+                }
                 for (const [name, signature] of source) {
                     const candidate = candidates.get(name);
                     if (candidate) candidate.count += 1;
@@ -721,20 +843,55 @@ class WorkspaceIndex {
                 for (const name of parsed.types.keys()) localNames.add(name);
                 for (const name of (parsed.aliases || new Map()).keys()) localNames.add(name);
                 if (!importPathsByPackage.has(packageKey)) {
-                    importPathsByPackage.set(packageKey, this._importPathForFile(file));
+                    importPathsByPackage.set(
+                        packageKey,
+                        parsed.importPath || this._importPathForFile(file)
+                    );
                 }
             }
         }
 
+        const packageByImportPath = new Map();
+        for (const [packageKey, importPath] of importPathsByPackage) {
+            if (importPath && !packageByImportPath.has(importPath)) {
+                packageByImportPath.set(importPath, packageKey);
+            }
+        }
+        const canonicalizeWithinPackage = (signature, packageKey) =>
+            canonicalizeLocalTypes(
+                canonicalizePredeclaredAliases(
+                    canonicalizeAliases(signature, aliasesByPackage.get(packageKey)),
+                    localNamesByPackage.get(packageKey)
+                ),
+                localNamesByPackage.get(packageKey),
+                importPathsByPackage.get(packageKey)
+            );
+        const qualifiedAliasCache = new Map();
+        const resolveQualifiedAlias = (importPath, name, seen) => {
+            const identity = `${importPath}\0${name}`;
+            if (qualifiedAliasCache.has(identity)) return qualifiedAliasCache.get(identity);
+            const targetPackage = packageByImportPath.get(importPath);
+            const aliases = targetPackage && aliasesByPackage.get(targetPackage);
+            const target = aliases && aliases.get(name);
+            if (!target) return null;
+            const canonicalTarget = canonicalizeWithinPackage(target, targetPackage);
+            const resolved = canonicalizeQualifiedAliases(
+                canonicalTarget,
+                resolveQualifiedAlias,
+                seen
+            );
+            qualifiedAliasCache.set(identity, resolved);
+            return resolved;
+        };
+
         for (const [file, parsed] of effectiveFiles) {
             const packageKey = packageKeyFor(file, parsed.packageName);
-            const aliases = aliasesByPackage.get(packageKey);
             const canonicalSignature = (signature) =>
-                canonicalizeLocalTypes(
-                    canonicalizeAliases(signature, aliases),
-                    localNamesByPackage.get(packageKey),
-                    importPathsByPackage.get(packageKey)
-                );
+                canonicalizeQualifiedAliases(
+                    canonicalizeWithinPackage(signature, packageKey),
+                    resolveQualifiedAlias
+                ).replace(/\s+/g, '');
+            const aliases = aliasesByPackage.get(packageKey);
             for (const [name, info] of parsed.interfaces) {
                 const symbolKey = symbolKeyFor(packageKey, name);
                 interfaceKeyByLocation.set(locationKeyFor(file, name), symbolKey);
@@ -746,8 +903,10 @@ class WorkspaceIndex {
                         line: info.line,
                         methods: info.methods,
                         embeds: info.embeds,
+                        methodLines: info.methodLines || new Map(),
                         constraint: !!info.constraint,
                         generic: !!info.generic,
+                        externalSource: !!parsed.externalSource,
                     });
                 }
                 if (!interfacesFlat.has(symbolKey)) {
@@ -759,6 +918,7 @@ class WorkspaceIndex {
                         constraint: false,
                         generic: false,
                         genericEmbeds: new Set(),
+                        externalSource: false,
                         importPath: importPathsByPackage.get(packageKey) || null,
                     });
                 }
@@ -767,6 +927,7 @@ class WorkspaceIndex {
                 flat.embeds.push(...info.embeds);
                 flat.constraint = flat.constraint || !!info.constraint;
                 flat.generic = flat.generic || !!info.generic;
+                flat.externalSource = flat.externalSource || !!parsed.externalSource;
                 for (const embed of info.genericEmbeds || []) flat.genericEmbeds.add(embed);
                 if (!flat.importPath) flat.importPath = importPathsByPackage.get(packageKey) || null;
             }
@@ -787,6 +948,7 @@ class WorkspaceIndex {
                     pointerEmbeds: info.pointerEmbeds || new Set(),
                     genericEmbeds: info.genericEmbeds || new Set(),
                     declared: info.declared !== false,
+                    externalSource: !!parsed.externalSource,
                 });
 
                 if (!typesFlat.has(symbolKey)) {
@@ -798,6 +960,10 @@ class WorkspaceIndex {
                         pointerOnlyMethods: new Set(),
                         pointerEmbeds: new Set(),
                         genericEmbeds: new Set(),
+                        struct: false,
+                        aliasTarget: null,
+                        interfaceAlias: false,
+                        externalSource: false,
                         importPath: importPathsByPackage.get(packageKey) || null,
                     });
                 }
@@ -813,6 +979,11 @@ class WorkspaceIndex {
                 flat.embeds.push(...info.embeds);
                 for (const embed of info.pointerEmbeds || []) flat.pointerEmbeds.add(embed);
                 for (const embed of info.genericEmbeds || []) flat.genericEmbeds.add(embed);
+                flat.struct = flat.struct || info.struct === true;
+                flat.externalSource = flat.externalSource || !!parsed.externalSource;
+                if (!flat.aliasTarget && aliases && aliases.has(name)) {
+                    flat.aliasTarget = aliases.get(name);
+                }
                 if (!flat.importPath) flat.importPath = importPathsByPackage.get(packageKey) || null;
             }
         }
@@ -824,6 +995,40 @@ class WorkspaceIndex {
         }
         for (const [key, info] of typesFlat) {
             if (info.importPath) typeKeyByImportIdentity.set(`${info.importPath}\0${info.name}`, key);
+        }
+
+        const interfaceAliasCache = new Map();
+        const isInterfaceAlias = (typeKey, seen) => {
+            if (interfaceAliasCache.has(typeKey)) return interfaceAliasCache.get(typeKey);
+            const visiting = seen || new Set();
+            if (visiting.has(typeKey)) return false;
+            visiting.add(typeKey);
+            const type = typesFlat.get(typeKey);
+            const target = type && type.aliasTarget;
+            if (!target) return false;
+            if (BUILTIN_INTERFACES.has(target)) {
+                interfaceAliasCache.set(typeKey, true);
+                return true;
+            }
+            const imported = importedReferenceIdentity(target);
+            let interfaceKey = null;
+            let targetTypeKey = null;
+            if (imported) {
+                const identity = `${imported.importPath}\0${imported.name}`;
+                interfaceKey = interfaceKeyByImportIdentity.get(identity);
+                targetTypeKey = typeKeyByImportIdentity.get(identity);
+            } else if (!target.includes('.')) {
+                interfaceKey = symbolKeyFor(type.packageKey, target);
+                targetTypeKey = interfaceKey;
+            }
+            const result =
+                !!(interfaceKey && interfacesFlat.has(interfaceKey)) ||
+                !!(targetTypeKey && typesFlat.has(targetTypeKey) && isInterfaceAlias(targetTypeKey, visiting));
+            interfaceAliasCache.set(typeKey, result);
+            return result;
+        };
+        for (const [typeKey, type] of typesFlat) {
+            type.interfaceAlias = isInterfaceAlias(typeKey);
         }
 
         this._mergedInterfaces = interfacesFlat;
@@ -963,28 +1168,212 @@ class WorkspaceIndex {
         return null;
     }
 
+    _getGoRoot() {
+        const configured = process.env.GOROOT;
+        if (configured) return Promise.resolve(configured);
+        if (this._goRootPromise) return this._goRootPromise;
+        this._goRootPromise = new Promise((resolve) => {
+            execFile(
+                'go',
+                ['env', 'GOROOT'],
+                { timeout: 3000, maxBuffer: 1024 * 1024 },
+                (error, stdout) => resolve(error ? null : (stdout || '').trim() || null)
+            );
+        });
+        return this._goRootPromise;
+    }
+
+    async _resolveExternalImportDirectory(importPath) {
+        const segments = importPath && importPath.split('/');
+        if (
+            !segments ||
+            segments.some((segment) => !segment || segment === '.' || segment === '..') ||
+            importPath.includes('\\') ||
+            path.isAbsolute(importPath)
+        ) {
+            return null;
+        }
+        if (this._externalImportDirectoryCache.has(importPath)) {
+            return this._externalImportDirectoryCache.get(importPath);
+        }
+        const request = (async () => {
+            const cfg = this.getConfig();
+            const modCache = resolveGoModCache(cfg.goModCache);
+            for (const root of this._builds.keys()) {
+                const directory = resolveModuleImportDirectory(root, importPath, modCache);
+                if (directory) return directory;
+            }
+
+            const goRoot = await this._getGoRoot();
+            if (!goRoot) return null;
+            const standardDirectory = path.join(goRoot, 'src', ...importPath.split('/'));
+            try {
+                if (fs.existsSync(standardDirectory) && fs.statSync(standardDirectory).isDirectory()) {
+                    return standardDirectory;
+                }
+            } catch (_) {
+                // The import is not available from this GOROOT.
+            }
+            return null;
+        })();
+        this._externalImportDirectoryCache.set(importPath, request);
+        return request;
+    }
+
+    async _loadExternalPackage(importPath) {
+        if (!this.astPool) return null;
+        const directory = await this._resolveExternalImportDirectory(importPath);
+        if (!directory) return null;
+        const cacheKey = `${directory}\0${importPath}`;
+        if (this._externalPackageCache.has(cacheKey)) {
+            return this._externalPackageCache.get(cacheKey);
+        }
+        const request = (async () => {
+            let entries;
+            try {
+                entries = await fs.promises.readdir(directory, { withFileTypes: true });
+            } catch (_) {
+                return null;
+            }
+            const files = entries
+                .filter(
+                    (entry) =>
+                        entry.isFile() &&
+                        entry.name.endsWith('.go') &&
+                        !entry.name.endsWith('_test.go')
+                )
+                .map((entry) => path.join(directory, entry.name))
+                .filter((file) => shouldIncludeGoFile(file, '', this._buildContext));
+            const sources = await Promise.all(
+                files.map(async (file) => {
+                    try {
+                        const text = await fs.promises.readFile(file, 'utf8');
+                        if (!shouldIncludeGoFile(file, text, this._buildContext)) return null;
+                        return { file, text };
+                    } catch (_) {
+                        return null;
+                    }
+                })
+            );
+            const parsed = await this.astPool.parseFiles(sources.filter(Boolean), 150);
+            return {
+                directory,
+                files: new Map(
+                    [...parsed].map(([file, info]) => [
+                        file,
+                        { ...info, importPath, externalSource: true },
+                    ])
+                ),
+            };
+        })().catch((error) => {
+            this.log(`External package parse failed for ${importPath}: ${error.message}`);
+            return null;
+        });
+        this._externalPackageCache.set(cacheKey, request);
+        return request;
+    }
+
     async _expandEmbeddedAstPackages(packageKeys, astFiles, priority) {
         const packages = new Set(packageKeys);
         const parsed = new Map(astFiles);
+        const externalImports = new Set();
         for (let round = 0; round < 20; round++) {
             const additions = new Set();
+            const externalAdditions = new Set();
             for (const fileInfo of parsed.values()) {
                 const declarations = [...fileInfo.interfaces.values(), ...fileInfo.types.values()];
                 for (const declaration of declarations) {
                     for (const embed of declaration.embeds || []) {
+                        if (BUILTIN_INTERFACES.has(embed)) continue;
                         const imported = importedReferenceIdentity(embed);
                         if (!imported) continue;
                         const packageKey = this._packageForImportPath(imported.importPath);
                         if (packageKey && !packages.has(packageKey)) additions.add(packageKey);
+                        else if (!packageKey && !externalImports.has(imported.importPath)) {
+                            externalAdditions.add(imported.importPath);
+                        }
                     }
                 }
             }
-            if (additions.size === 0) break;
+            if (additions.size === 0 && externalAdditions.size === 0) break;
             for (const packageKey of additions) packages.add(packageKey);
             const addedFiles = await this._parseAstPackages(additions, priority);
             for (const [file, info] of addedFiles) parsed.set(file, info);
+            for (const importPath of externalAdditions) externalImports.add(importPath);
+            const externalPackages = await Promise.all(
+                [...externalAdditions].map((importPath) => this._loadExternalPackage(importPath))
+            );
+            for (const externalPackage of externalPackages) {
+                if (!externalPackage) continue;
+                for (const [file, info] of externalPackage.files) parsed.set(file, info);
+            }
         }
         return { packages, astFiles: parsed };
+    }
+
+    _potentialSignatureAliasImports(astFiles, methodNames) {
+        const wanted = new Set(methodNames);
+        const view = this._createAstView(astFiles);
+        const { interfaces, types } = view._merged();
+        const signaturesByMethod = new Map();
+        const collect = (methods) => {
+            for (const [name, signature] of methods) {
+                if (!wanted.has(name)) continue;
+                if (!signaturesByMethod.has(name)) signaturesByMethod.set(name, []);
+                signaturesByMethod.get(name).push(signature);
+            }
+        };
+        for (const info of interfaces.values()) collect(info.methods);
+        for (const info of types.values()) collect(info.methods);
+        const imports = new Set();
+        for (const signatures of signaturesByMethod.values()) {
+            for (const importPath of potentialAliasImports(signatures)) imports.add(importPath);
+        }
+        return imports;
+    }
+
+    async _expandSignatureAliasPackages(astFiles, methodNames, priority) {
+        let parsed = new Map(astFiles);
+        for (let round = 0; round < 10; round++) {
+            const requested = this._potentialSignatureAliasImports(parsed, methodNames);
+            const representedPackages = new Set();
+            const representedImports = new Set();
+            for (const [file, info] of parsed) {
+                const packageKey = this._packageForFile(file);
+                if (packageKey) representedPackages.add(packageKey);
+                if (info.importPath) representedImports.add(info.importPath);
+            }
+
+            const workspaceAdditions = new Set();
+            const externalAdditions = new Set();
+            for (const importPath of requested) {
+                const packageKey = this._packageForImportPath(importPath);
+                if (packageKey) {
+                    if (!representedPackages.has(packageKey)) workspaceAdditions.add(packageKey);
+                } else if (!representedImports.has(importPath)) {
+                    externalAdditions.add(importPath);
+                }
+            }
+            if (workspaceAdditions.size === 0 && externalAdditions.size === 0) break;
+
+            const workspaceFiles = await this._parseAstPackages(workspaceAdditions, priority);
+            for (const [file, info] of workspaceFiles) parsed.set(file, info);
+            const externalPackages = await Promise.all(
+                [...externalAdditions].map((importPath) => this._loadExternalPackage(importPath))
+            );
+            let added = workspaceFiles.size > 0;
+            for (const externalPackage of externalPackages) {
+                if (!externalPackage) continue;
+                for (const [file, info] of externalPackage.files) parsed.set(file, info);
+                if (externalPackage.files.size > 0) added = true;
+            }
+            if (!added) break;
+
+            const allPackages = new Set([...representedPackages, ...workspaceAdditions]);
+            const closure = await this._expandEmbeddedAstPackages(allPackages, parsed, priority);
+            parsed = closure.astFiles;
+        }
+        return parsed;
     }
 
     _createAstView(astFiles) {
@@ -1040,7 +1429,15 @@ class WorkspaceIndex {
         for (const packageKey of interfaceClosure.packages) candidates.add(packageKey);
         const astFiles = await this._parseAstPackages(candidates, 200);
         const closure = await this._expandEmbeddedAstPackages(candidates, astFiles, 200);
-        return { astFiles: closure.astFiles, candidatePackages: candidates };
+        const aliasExpandedFiles = await this._expandSignatureAliasPackages(
+            closure.astFiles,
+            descriptor.resolved.methods.keys(),
+            200
+        );
+        return {
+            astFiles: aliasExpandedFiles,
+            candidatePackages: candidates,
+        };
     }
 
     findImplementationsAst(interfaceName, interfaceFile) {
@@ -1086,7 +1483,12 @@ class WorkspaceIndex {
             const started = Date.now();
             const astFiles = await this._parseAstPackages(candidates, 200);
             const closure = await this._expandEmbeddedAstPackages(candidates, astFiles, 200);
-            const view = this._createAstView(closure.astFiles);
+            const aliasExpandedFiles = await this._expandSignatureAliasPackages(
+                closure.astFiles,
+                [methodName],
+                200
+            );
+            const view = this._createAstView(aliasExpandedFiles);
             const local = view._collectLocalInterfaces(receiverType, methodName, { receiverFile });
             const results = local.results;
             const cfg = this.getConfig();
@@ -1096,7 +1498,7 @@ class WorkspaceIndex {
             }
             this.log(
                 `AST reverse query ${receiverType}.${methodName}: ${candidates.size} package(s), ` +
-                    `${closure.astFiles.size} file(s), ${Date.now() - started}ms`
+                    `${aliasExpandedFiles.size} file(s), ${Date.now() - started}ms`
             );
             return results;
         });
@@ -1137,7 +1539,13 @@ class WorkspaceIndex {
             this.log(`AST dependency parsing failed: ${err.message}`);
             return;
         }
-        const view = this._createAstView(parsed);
+        const closure = await this._expandEmbeddedAstPackages(new Set(), parsed, 200);
+        const aliasExpandedFiles = await this._expandSignatureAliasPackages(
+            closure.astFiles,
+            [methodName],
+            200
+        );
+        const view = this._createAstView(aliasExpandedFiles);
         const { interfaces } = view._merged();
         for (const interfaceKey of view._interfacesByMethod.get(methodName) || []) {
             const declaration = view._interfaceDecls.get(interfaceKey);
@@ -1192,6 +1600,7 @@ class WorkspaceIndex {
     _collectImplementations(resolved, types, loose) {
         const results = [];
         for (const [typeKey, typeInfo] of types) {
+            if (typeInfo.interfaceAlias || typeInfo.externalSource) continue;
             const methodSets = this._resolveTypeMethodSetsCached(typeKey, types);
             const valueImplements = satisfies(resolved.methods, methodSets.value, {
                 unresolved: resolved.unresolved,
@@ -1258,6 +1667,7 @@ class WorkspaceIndex {
             return loose && looseSignatureEqual(a, b);
         };
         for (const [typeKey, typeInfo] of types) {
+            if (typeInfo.interfaceAlias || typeInfo.externalSource) continue;
             const methodSets = this._resolveTypeMethodSetsCached(typeKey, types);
             const implementsWith = (methods) => {
                 const sig = methods.get(methodName);
@@ -1404,11 +1814,12 @@ class WorkspaceIndex {
 
         const candidates = this._interfacesByMethod.get(methodName) || [];
         for (const interfaceKey of candidates) {
+            const declaration = this._interfaceDecls.get(interfaceKey);
             const matched = consider(
                 interfaceKey,
                 this._resolveInterfaceMethodsCached(interfaceKey, interfaces),
-                this._interfaceDecls.get(interfaceKey),
-                false
+                declaration,
+                !!(declaration && declaration.externalSource)
             );
             if (matched && stopAfterFirst) break;
         }
@@ -1519,20 +1930,64 @@ class WorkspaceIndex {
         const typeInfo = this._mergedTypes && this._mergedTypes.get(typeKey);
         if (!typeInfo) return out;
         for (const embed of typeInfo.embeds) {
+            const canPromoteInterface = typeInfo.struct || typeInfo.interfaceAlias;
             const imported = importedReferenceIdentity(embed);
             let embeddedKey = null;
+            let embeddedInterfaceKey = null;
             if (imported && this._typeKeyByImportIdentity) {
                 embeddedKey = this._typeKeyByImportIdentity.get(
                     `${imported.importPath}\0${imported.name}`
                 );
+                if (!embeddedKey && canPromoteInterface && this._interfaceKeyByImportIdentity) {
+                    embeddedInterfaceKey = this._interfaceKeyByImportIdentity.get(
+                        `${imported.importPath}\0${imported.name}`
+                    );
+                }
             } else if (!embed.includes('.')) {
-                embeddedKey = symbolKeyFor(typeInfo.packageKey, embed);
+                const localKey = symbolKeyFor(typeInfo.packageKey, embed);
+                if (this._mergedTypes.has(localKey)) embeddedKey = localKey;
+                else if (
+                    canPromoteInterface &&
+                    this._mergedInterfaces &&
+                    this._mergedInterfaces.has(localKey)
+                ) {
+                    embeddedInterfaceKey = localKey;
+                }
             }
-            if (!embeddedKey) continue;
-            const promoted = this._findMethodLocationsRecursive(embeddedKey, methodName, new Set(seen));
-            // Follow the resolved promotion order so navigation points at the
-            // declaration that contributed the method.
-            if (promoted.length > 0) return promoted;
+            if (embeddedKey) {
+                const promoted = this._findMethodLocationsRecursive(
+                    embeddedKey,
+                    methodName,
+                    new Set(seen)
+                );
+                // Follow the resolved promotion order so navigation points at the
+                // declaration that contributed the method.
+                if (promoted.length > 0) return promoted;
+            } else if (embeddedInterfaceKey) {
+                const info = this._mergedInterfaces.get(embeddedInterfaceKey);
+                if (!info || info.constraint || info.generic) continue;
+                const resolved = this._resolveInterfaceMethodsCached(
+                    embeddedInterfaceKey,
+                    this._mergedInterfaces
+                );
+                if (!resolved.methods.has(methodName)) continue;
+                const declaration = this._interfaceDecls.get(embeddedInterfaceKey);
+                if (!declaration) continue;
+                const recorded = declaration.methodLines && declaration.methodLines.get(methodName);
+                return [{
+                    file: declaration.file,
+                    line: typeof recorded === 'number' ? recorded : declaration.line,
+                }];
+            } else if (canPromoteInterface && BUILTIN_INTERFACES.has(embed)) {
+                const builtinMethods = BUILTIN_INTERFACES.get(embed);
+                if (!builtinMethods.has(methodName)) continue;
+                const declarations = (this._typesByLocation.get(typeKey) || []).filter(
+                    (location) => location.declared !== false
+                );
+                if (declarations.length > 0) {
+                    return [{ file: declarations[0].file, line: declarations[0].line }];
+                }
+            }
         }
         return out;
     }
@@ -1548,6 +2003,8 @@ class WorkspaceIndex {
         this._packageKeysByDirectory.clear();
         this._embeddedFiles.clear();
         this._packageKeyByImportPath.clear();
+        this._externalImportDirectoryCache.clear();
+        this._externalPackageCache.clear();
         if (this.astPool) this.astPool.clear();
         this._invalidateMerged();
         this._builds.clear();
@@ -1577,6 +2034,8 @@ class WorkspaceIndex {
         this._packageKeysByDirectory.clear();
         this._embeddedFiles.clear();
         this._packageKeyByImportPath.clear();
+        this._externalImportDirectoryCache.clear();
+        this._externalPackageCache.clear();
         this._builds.clear();
         this._builtRoots.clear();
     }

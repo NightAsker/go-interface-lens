@@ -13,6 +13,7 @@ Module._resolveFilename = function (request, ...rest) {
 
 const { WorkspaceIndex } = require(path.join(__dirname, '..', 'src', 'indexer'));
 const { parseFile } = require(path.join(__dirname, '..', 'src', 'parser'));
+const { parseGoFile } = require(path.join(__dirname, '..', 'src', 'ast'));
 const { assert, done } = require(path.join(__dirname, 'harness'));
 
 const cfg = () => ({
@@ -77,6 +78,7 @@ async function main() {
     await gotoInterfaceCrossPackage();
     promotedMethodImplementationLocation();
     typeAliasesCanonicalizeSignatures();
+    predeclaredAliasesRespectShadowing();
     unsavedDocumentOverlay();
     done();
 }
@@ -124,6 +126,46 @@ function typeAliasesCanonicalizeSignatures() {
     console.log('\n== type aliases canonicalize signatures ==');
     const implementations = idx.findImplementations('Consumer', file).map((r) => r.name);
     assert('method using alias matches its canonical target', implementations.includes('Impl'));
+    idx.dispose();
+}
+
+function predeclaredAliasesRespectShadowing() {
+    const idx = new WorkspaceIndex(cfg, () => {});
+    const builtinFile = '/synthetic/predeclared/builtin.go';
+    const shadowFile = '/synthetic/shadow/shadow.go';
+    idx.files.set(
+        builtinFile,
+        parseGoFile(
+            [
+                'package predeclared',
+                'type Consumer interface { Use(byte, rune, any) }',
+                'type Impl struct{}',
+                'func (Impl) Use(uint8, int32, interface{}) {}',
+            ].join('\n')
+        )
+    );
+    idx.files.set(
+        shadowFile,
+        parseGoFile(
+            [
+                'package shadow',
+                'type byte string',
+                'type Consumer interface { Use(byte) }',
+                'type Impl struct{}',
+                'func (Impl) Use(uint8) {}',
+            ].join('\n')
+        )
+    );
+
+    console.log('\n== predeclared aliases respect package shadowing ==');
+    assert(
+        'byte/rune/any match their predeclared targets',
+        idx.findImplementations('Consumer', builtinFile).some((result) => result.name === 'Impl')
+    );
+    assert(
+        'package-local byte declaration is not rewritten to uint8',
+        idx.findImplementations('Consumer', shadowFile).length === 0
+    );
     idx.dispose();
 }
 

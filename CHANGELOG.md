@@ -2,6 +2,42 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [1.1.3] - 2026-07-20
+
+### Changed
+
+- Rewrite the README around the extension's candidate-index and lazy-AST
+  architecture, supported Go syntax, configuration, usage, and troubleshooting.
+
+## [1.1.2] - 2026-07-20
+
+### Fixed
+
+- Normalize named pointer, slice, array, variadic, channel, qualified, and
+  Unicode parameters without discarding their types or named result types.
+- Normalize field names recursively inside function and anonymous-interface
+  types while preserving anonymous-struct field identity.
+- Resolve package-qualified type aliases and alias chains lazily when they are
+  needed to compare otherwise mismatched method signature slots.
+
+## [1.1.1] - 2026-07-20
+
+### Fixed
+
+- Recognize structs that implement interfaces through embedded local, imported,
+  aliased, standard-library, or module dependency interfaces.
+- Treat `byte`/`uint8`, `rune`/`int32`, and `any`/`interface{}` as identical in
+  method signatures while respecting package-level shadowing.
+- Keep interface aliases out of concrete implementation results while still
+  promoting their methods through embedding.
+
+### Improved
+
+- Resolve embedded dependency declarations lazily from the exact go.mod-locked
+  module version, local replacement, module replacement, or GOROOT package.
+- Reuse the worker-backed declaration cache for dependency packages without
+  expanding the startup index or returning dependency concrete types.
+
 ## [1.1.0] - 2026-07-17
 
 ### Added

@@ -22,10 +22,12 @@ async function main() {
     const implDir = path.join(root, 'impl');
     const wrongDir = path.join(root, 'wrong');
     const baseDir = path.join(root, 'base');
+    const pigeonDir = path.join(root, 'pigeon');
     fs.mkdirSync(apiDir, { recursive: true });
     fs.mkdirSync(implDir, { recursive: true });
     fs.mkdirSync(wrongDir, { recursive: true });
     fs.mkdirSync(baseDir, { recursive: true });
+    fs.mkdirSync(pigeonDir, { recursive: true });
     fs.writeFileSync(path.join(root, 'go.mod'), 'module example.com/project\n\ngo 1.22\n');
 
     const interfaceFile = path.join(apiDir, 'service.go');
@@ -35,6 +37,7 @@ async function main() {
             'package api',
             'import "context"',
             'import base "example.com/project/base"',
+            'import pigeon_conversation_paas "example.com/project/pigeon"',
             'type Service interface {',
             '    Run(',
             '        context.Context,',
@@ -43,12 +46,28 @@ async function main() {
             '}',
             'type Closer interface { Close() error }',
             'type Result struct{}',
+            'type EnterLeaveService interface {',
+            '    PutConversationIntoLeaveMsg(ctx context.Context, r *pigeon_conversation_paas.EnterLeaveMsgRequest) (resp *pigeon_conversation_paas.EnterLeaveMsgResponse, err error)',
+            '}',
             'type Exporter interface { Export() Result }',
+            'type ByteConsumer interface { Consume(byte, rune, any) }',
+            'type Reader interface { Read([]byte) (int, error) }',
+            'type DoneWaiter interface { Done() <-chan struct{} }',
+            'type Delegated interface { Delegate() error }',
+            'type DelegatedAlias = Delegated',
             'type Combined interface {',
             '    base.Remote',
             '    Local() error',
             '}',
             'type Number interface { ~int | int64 }',
+        ].join('\n')
+    );
+    fs.writeFileSync(
+        path.join(pigeonDir, 'types.go'),
+        [
+            'package pigeon_conversation_paas',
+            'type EnterLeaveMsgRequest struct{}',
+            'type EnterLeaveMsgResponse struct{}',
         ].join('\n')
     );
     fs.writeFileSync(
@@ -83,11 +102,16 @@ async function main() {
         path.join(wrongDir, 'wrong.go'),
         [
             'package wrong',
+            'import "context"',
+            'import pigeon_conversation_paas "example.com/project/pigeon"',
             'type Wrong struct{}',
             'func (Wrong) Run(value string) error { return nil }',
             'type Result struct{}',
             'type WrongExporter struct{}',
             'func (WrongExporter) Export() Result { return Result{} }',
+            'type WrongEnterLeaveMsgResponse struct{}',
+            'type WrongEnterLeaveService struct{}',
+            'func (WrongEnterLeaveService) PutConversationIntoLeaveMsg(ctx context.Context, req *pigeon_conversation_paas.EnterLeaveMsgRequest) (*WrongEnterLeaveMsgResponse, error) { return nil, nil }',
         ].join('\n')
     );
     fs.writeFileSync(
@@ -105,8 +129,30 @@ async function main() {
         [
             'package impl',
             'import api "example.com/project/api"',
+            'import "context"',
+            'import pigeon_conversation_paas "example.com/project/pigeon"',
             'type GoodExporter struct{}',
             'func (GoodExporter) Export() api.Result { return api.Result{} }',
+            'type Delegating struct { api.Delegated }',
+            'type AliasDelegating struct { api.DelegatedAlias }',
+            'type LocalDelegated interface { LocalDelegate() error }',
+            'type LocalDelegatedAlias = LocalDelegated',
+            'type LocalDelegating struct { LocalDelegated }',
+            'type LocalAliasDelegating struct { LocalDelegatedAlias }',
+            'type EnterLeaveServiceImpl struct{}',
+            'func (EnterLeaveServiceImpl) PutConversationIntoLeaveMsg(ctx context.Context, req *pigeon_conversation_paas.EnterLeaveMsgRequest) (resp *pigeon_conversation_paas.EnterLeaveMsgResponse, err error) { return nil, nil }',
+        ].join('\n')
+    );
+    fs.writeFileSync(
+        path.join(implDir, 'predeclared.go'),
+        [
+            'package impl',
+            'import "io"',
+            'import "context"',
+            'type AliasConsumer struct{}',
+            'func (AliasConsumer) Consume(uint8, int32, interface{}) {}',
+            'type ReaderHolder struct { io.Reader }',
+            'type ContextHolder struct { context.Context }',
         ].join('\n')
     );
     fs.writeFileSync(
@@ -172,12 +218,59 @@ async function main() {
         exporters.map((result) => result.name),
         ['GoodExporter']
     );
+    const enterLeaveImplementations = await index.findImplementationsAst(
+        'EnterLeaveService',
+        interfaceFile
+    );
+    eq(
+        'pointer parameter names are ignored while named pointer result types are preserved',
+        enterLeaveImplementations.map((result) => result.name),
+        ['EnterLeaveServiceImpl']
+    );
     const combined = await index.findImplementationsAst('Combined', interfaceFile);
     eq(
         'workspace imported interfaces and promoted imported methods resolve lazily',
         combined.map((result) => result.name).sort(),
         ['Direct', 'Promoted']
     );
+    const delegated = await index.findImplementationsAst('Delegated', interfaceFile);
+    eq(
+        'struct embedding an imported interface or its alias inherits its method set',
+        delegated.map((r) => r.name).sort(),
+        ['AliasDelegating', 'Delegating']
+    );
+    const delegatedMethods = await index.findMethodImplementationsAst(
+        'Delegated',
+        'Delegate',
+        interfaceFile
+    );
+    eq('promoted interface methods remain navigable', delegatedMethods.map((r) => r.name).sort(), [
+        'AliasDelegating',
+        'Delegating',
+    ]);
+    assert(
+        'promoted method navigates to the embedded interface declaration',
+        delegatedMethods[0].file === interfaceFile
+    );
+    const localInterfaceFile = path.join(implDir, 'export.go');
+    const localDelegated = await index.findImplementationsAst('LocalDelegated', localInterfaceFile);
+    eq(
+        'struct embedding a package-local interface or alias inherits its method set',
+        localDelegated.map((r) => r.name).sort(),
+        ['LocalAliasDelegating', 'LocalDelegating']
+    );
+    const byteConsumers = await index.findImplementationsAst('ByteConsumer', interfaceFile);
+    eq('predeclared Go aliases normalize to identical method signatures', byteConsumers.map((r) => r.name), [
+        'AliasConsumer',
+    ]);
+    const readers = await index.findImplementationsAst('Reader', interfaceFile);
+    eq('struct embedding a known standard-library interface is found', readers.map((r) => r.name), [
+        'ReaderHolder',
+    ]);
+    const doneWaiters = await index.findImplementationsAst('DoneWaiter', interfaceFile);
+    eq('channel signatures match promoted standard-library methods', doneWaiters.map((r) => r.name), [
+        'ContextHolder',
+    ]);
 
     console.log('\n== unsaved AST overlay invalidation ==');
     const diskImplementation = fs.readFileSync(implementationFile, 'utf8');

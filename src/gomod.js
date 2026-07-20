@@ -47,13 +47,14 @@ function findGoMod(startDir) {
  * directly instead of the module cache.
  *
  * @param {string} text go.mod contents
- * @returns {{versions: Map<string,string>, localReplaces: Map<string,string>}}
+ * @returns {{versions: Map<string,string>, localReplaces: Map<string,string>, moduleReplaces: Map<string,{modulePath:string,version:string}>}}
  *   versions: modulePath -> version (e.g. "github.com/acme/x" -> "v1.3.0")
  *   localReplaces: modulePath -> filesystem path target
  */
 function parseGoMod(text) {
     const versions = new Map();
     const localReplaces = new Map();
+    const moduleReplaces = new Map();
 
     const lines = text.split('\n');
     let inRequireBlock = false;
@@ -94,7 +95,7 @@ function parseGoMod(text) {
         // handles block contents.
         const rep = line.match(/^replace\s+(.*)$/);
         if (rep) {
-            addReplace(rep[1].trim(), versions, localReplaces);
+            addReplace(rep[1].trim(), versions, localReplaces, moduleReplaces);
             continue;
         }
     }
@@ -113,11 +114,11 @@ function parseGoMod(text) {
                 inReplaceBlock = false;
                 continue;
             }
-            addReplace(line, versions, localReplaces);
+            addReplace(line, versions, localReplaces, moduleReplaces);
         }
     }
 
-    return { versions, localReplaces };
+    return { versions, localReplaces, moduleReplaces };
 }
 
 function addRequire(spec, versions) {
@@ -126,7 +127,7 @@ function addRequire(spec, versions) {
     if (m) versions.set(m[1], m[2]);
 }
 
-function addReplace(spec, versions, localReplaces) {
+function addReplace(spec, versions, localReplaces, moduleReplaces) {
     // Forms:
     //   old => new vX
     //   old vX => new vY
@@ -144,9 +145,12 @@ function addReplace(spec, versions, localReplaces) {
 
     if (isLocalPath(target)) {
         localReplaces.set(oldPath, target);
+        moduleReplaces.delete(oldPath);
         // A local replace overrides any cache version.
         versions.delete(oldPath);
     } else if (targetVersion) {
+        localReplaces.delete(oldPath);
+        moduleReplaces.set(oldPath, { modulePath: target, version: targetVersion });
         // Replaced by another module@version.
         versions.set(oldPath, targetVersion);
         versions.set(target, targetVersion);
@@ -236,10 +240,71 @@ function resolveLockedModuleDirs(projectDir, modCacheRoot) {
     return { dirs, goModPath };
 }
 
+function importPathMatchesModule(importPath, modulePath) {
+    return importPath === modulePath || importPath.startsWith(`${modulePath}/`);
+}
+
+/** Resolve one imported package to the source directory selected by go.mod. */
+function resolveModuleImportDirectory(projectDir, importPath, modCacheRoot) {
+    const goModPath = findGoMod(projectDir);
+    if (!goModPath) return null;
+    let parsed;
+    try {
+        parsed = parseGoMod(fs.readFileSync(goModPath, 'utf8'));
+    } catch (_) {
+        return null;
+    }
+
+    const matches = [];
+    for (const [modulePath, target] of parsed.localReplaces) {
+        if (!importPathMatchesModule(importPath, modulePath)) continue;
+        const base = path.isAbsolute(target)
+            ? target
+            : path.resolve(path.dirname(goModPath), target);
+        matches.push({ modulePath, base });
+    }
+    for (const [modulePath, replacement] of parsed.moduleReplaces) {
+        if (!modCacheRoot || !importPathMatchesModule(importPath, modulePath)) continue;
+        const escaped =
+            escapeModulePath(replacement.modulePath) + '@' + escapeModulePath(replacement.version);
+        matches.push({
+            modulePath,
+            base: path.join(modCacheRoot, ...escaped.split('/')),
+        });
+    }
+    for (const [modulePath, version] of parsed.versions) {
+        if (
+            !modCacheRoot ||
+            parsed.localReplaces.has(modulePath) ||
+            parsed.moduleReplaces.has(modulePath) ||
+            !importPathMatchesModule(importPath, modulePath)
+        ) {
+            continue;
+        }
+        const escaped = escapeModulePath(modulePath) + '@' + escapeModulePath(version);
+        matches.push({
+            modulePath,
+            base: path.join(modCacheRoot, ...escaped.split('/')),
+        });
+    }
+    matches.sort((a, b) => b.modulePath.length - a.modulePath.length);
+    for (const match of matches) {
+        const suffix = importPath.slice(match.modulePath.length).replace(/^\//, '');
+        const directory = path.join(match.base, ...suffix.split('/').filter(Boolean));
+        try {
+            if (fs.existsSync(directory) && fs.statSync(directory).isDirectory()) return directory;
+        } catch (_) {
+            // Try the next matching module root.
+        }
+    }
+    return null;
+}
+
 module.exports = {
     findGoMod,
     parseGoMod,
     escapeModulePath,
     resolveLockedModuleDirs,
+    resolveModuleImportDirectory,
     isLocalPath,
 };

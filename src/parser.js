@@ -469,7 +469,7 @@ function splitTopLevel(s, delim) {
  * @param {number} line
  */
 function newTypeEntry(line) {
-    return { line, methods: new Map(), embeds: [], methodLines: new Map() };
+    return { line, methods: new Map(), embeds: [], methodLines: new Map(), struct: false };
 }
 
 function parseFile(text) {
@@ -535,6 +535,7 @@ function parseFile(text) {
             const entry = types.get(name) || newTypeEntry(i);
             if (!types.has(name)) entry.line = i;
             entry.embeds = parsed.embeds;
+            entry.struct = true;
             types.set(name, entry);
             i = parsed.endLine + 1;
             continue;
@@ -943,6 +944,7 @@ module.exports = {
     stripPackageQualifiers,
     stripSelfPackageQualifier,
     looseSignatureEqual,
+    splitNormalizedSignature,
     extractPackageName,
     splitTopLevel,
     extractImportAliases,

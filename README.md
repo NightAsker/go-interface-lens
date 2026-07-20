@@ -1,196 +1,128 @@
 # Go Interface Lens
 
-[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](https://github.com/NightAsker/go-interface-lens)
+[![Version](https://img.shields.io/badge/version-1.1.3-blue.svg)](https://github.com/NightAsker/go-interface-lens)
 [![VSCode](https://img.shields.io/badge/VSCode-1.60+-green.svg)](https://code.visualstudio.com/)
 
-> Show implementation count above Go interfaces with one-click navigation to interface and method implementations.
+一个面向大型 Go 工程的 VS Code / Cursor 接口导航扩展。它在接口、接口方法和具体实现之间提供双向 CodeLens，同时使用轻量候选索引和按需 AST 校验兼顾响应速度与查找准确性。
 
-## ✨ Features
+不依赖 gopls，也不会在启动时构建整个工程的语法树。
 
-- 🔍 **Visual CodeLens** above every Go interface showing "implementations"
-- 🎯 **Method-level CodeLens** - Each method has "→ implementations" for direct navigation
-- 🔙 **Goto Interface** Navigate from implementation methods back to their interface declarations with "← goto interface"
-- 📊 **Click to navigate** - Opens a quick pick with all implementations
-- ⚡ **Fast candidate search** with lazy, worker-based AST validation
-- 🚫 **Smart filtering** - Automatically excludes mock implementations
-- 🏗️ **Multi-package support** - Works perfectly with Go modules
-- 💾 **Persistent AST cache** - Reuses compact declaration data across queries and restarts
+## 工程特色
 
-## 📸 Screenshots
+### 快速启动，按需精确查找
 
-### Interface with CodeLens
+- 启动阶段只建立轻量的方法名候选索引，不扫描依赖目录，也不构建全工程 AST。
+- 点击 CodeLens 后，仅解析接口所在包和可能包含实现的候选包。
+- 优先使用接口中出现频率最低的方法缩小候选范围。
+- 已完成的查询直接使用内存缓存，未变化的文件可从持久化 AST 缓存恢复。
+
+### 自己完成 Go 接口匹配
+
+扩展内置声明级 Go lexer 和 AST，不通过 VS Code LSP API 或 gopls 查询实现。当前支持：
+
+- Go 的隐式接口实现和完整方法签名校验。
+- 值接收者、指针接收者及其不同的方法集。
+- 本地或跨包嵌入的 struct、interface 和类型别名。
+- 标准库接口、`go.mod` 锁定依赖、local replace、module replace 和 GOROOT 源码。
+- import 别名、包内别名、跨包别名链和复合别名。
+- `byte`/`uint8`、`rune`/`int32`、`any`/`interface{}` 等价关系，并尊重包级同名声明遮蔽。
+- 多行声明、分组参数、泛型实例、匿名接口和嵌套函数类型。
+- 指针、切片、数组、map、可变参数、channel、包限定类型和 Unicode 参数名的签名归一化。
+- Go build tags、GOOS/GOARCH 文件约束和未保存编辑内容。
+
+### 双向导航
+
 ```go
-implementations                                    ← Click to see all implementations
+implementations
 type UserRepository interface {
-    → implementations                              ← Click to see FindByID implementations
-    FindByID(id string) (*User, error)
-    → implementations                              ← Click to see Save implementations
-    Save(user *User) error
+    → implementations
+    FindByID(ctx context.Context, id string) (*User, error)
+
+    → implementations
+    Save(ctx context.Context, user *User) error
 }
 ```
 
-### Quick Pick with Interface Implementations
-```
-┌─────────────────────────────────────────────────────┐
-│ Select implementation of UserRepository             │
-├─────────────────────────────────────────────────────┤
-│ ○ PostgresUserRepository                            │
-│    in repository/postgres.go                        │
-│    Implements 2 method(s)                           │
-└─────────────────────────────────────────────────────┘
-Note: Mock implementations are automatically filtered out!
-```
-
-### Quick Pick with Method Implementations
-```
-┌─────────────────────────────────────────────────────┐
-│ 3 implementation(s) of UserRepository.FindByID      │
-├─────────────────────────────────────────────────────┤
-│ ○ PostgresUserRepository.FindByID                   │
-│    repository/postgres.go:45                        │
-│    func (r *PostgresUserRepository) FindByID...     │
-├─────────────────────────────────────────────────────┤
-│ ○ MemoryUserRepository.FindByID                     │
-│    repository/memory.go:23                          │
-│    func (r *MemoryUserRepository) FindByID...       │
-└─────────────────────────────────────────────────────┘
-```
-
-### Goto Interface (Reverse Navigation) ⭐ NEW
 ```go
-// In your implementation file
-← goto interface                                       ← Click to see which interfaces declare FindByID
-func (r *PostgresUserRepository) FindByID(id string) (*User, error) {
-    // implementation
+← goto interface
+func (r *PostgresUserRepository) FindByID(
+    ctx context.Context,
+    id string,
+) (*User, error) {
+    // ...
 }
 ```
 
-## 🚀 Usage
+- `implementations`：查看完整实现该接口的类型，并跳转到类型声明。
+- `→ implementations`：查看某个接口方法的实现，并跳转到具体方法。
+- `← goto interface`：从接收者方法反向查找匹配的接口。
 
-### Method 1: Interface CodeLens (Full Implementation)
-1. Open any Go file with an interface
-2. Look above the `type InterfaceName interface {` declaration
-3. Click on **"implementations"**
-4. Select the implementation from the list
-5. Navigate automatically to the struct declaration!
+### 为大型工程控制开销
 
-### Method 2: Method CodeLens (Direct Method Navigation)
-1. Open any Go file with an interface
-2. Look at each method inside the interface
-3. Click on **"→ implementations"** next to any method
-4. Select the specific implementation you want
-5. Navigate directly to that method implementation!
+- 候选包 AST 使用 1-4 个 Worker Thread 并发解析，默认并发数为 2。
+- 相同文件的并发解析请求会自动合并。
+- 依赖接口只在工作区查找不到结果时按需搜索，不全量索引 module cache。
+- 外部依赖中的 concrete type 不会混入工作区实现结果。
+- 文件监听、未保存 overlay 和查询结果都支持增量失效。
+- 支持 multi-root workspace，并保持同名包、同名接口和同名类型相互隔离。
 
-### Method 3: Goto Interface (Reverse Navigation) ⭐ NEW
-1. Open any Go file with a struct method implementation
-2. Look above the method declaration with receiver (e.g., `func (r *Type) Method()`)
-3. Click on **"← goto interface"**
-4. Select the interface that declares this method
-5. Navigate automatically to the interface declaration!
+## 使用方法
 
-### Method 4: Command Palette
-1. Press `Cmd+Shift+P` (Mac) or `Ctrl+Shift+P` (Windows/Linux)
-2. Type: **"Go: Show Implementations"**, **"Go: Show Method Implementations"**, or **"Go: Goto Interface"**
-3. Enter the interface/method name
-4. Select from the list
+### 查看接口实现
 
-## 📋 Requirements
+1. 打开包含 Go interface 的文件。
+2. 在 `type InterfaceName interface` 上方点击 `implementations`。
+3. 在 Quick Pick 中选择目标实现。
+4. 编辑器会跳转到对应 struct 或类型声明。
 
-- **VSCode/Cursor**: 1.60.0 or higher
-- **Go files**: `.go` extension
-- **Project structure**: Works with Go modules and any project structure
-- **No gopls required**: Parsing and interface matching run inside the extension
+### 查看接口方法实现
 
-## ⚙️ How It Works
+1. 打开包含 Go interface 的文件。
+2. 在目标方法上方点击 `→ implementations`。
+3. 选择具体实现。
+4. 编辑器会直接跳转到该方法的声明位置。
 
-### CodeLens Provider
-The extension registers a CodeLens provider that:
-1. Parses the open document for interface and receiver-method declarations
-2. Shows clickable interface, method, and reverse-navigation lenses
-3. Starts precise implementation matching only after click
+### 从实现跳转到接口
 
-### Search Strategy
-The extension:
-1. Builds a broad method-name candidate index during workspace startup
-2. Chooses the least-common interface methods to narrow candidate packages
-3. Parses only candidate package declarations in a bounded worker pool
-4. Resolves aliases, import paths, embedded interfaces/types, and Go pointer method sets
-5. Validates the complete interface method set using compact declaration IR
-6. Caches file AST summaries and completed queries in memory and on disk
+1. 打开带接收者方法的 Go 文件，例如 `func (s *Service) Run()`。
+2. 点击方法上方的 `← goto interface`。
+3. 选择匹配的接口。
+4. 编辑器会跳转到接口声明。
 
-This pattern matches Go's implicit interface implementation:
-```go
-type UserRepository interface {
-    FindByID(id string) (*User, error)
-    Save(user *User) error
-}
+查找结果会自动排除配置中的 mock、测试、生成文件和其他不需要的类型。
 
-type PostgresUserRepository struct {
-    db *sql.DB
-}
+## 环境要求
 
-// These methods are automatically detected!
-func (r *PostgresUserRepository) FindByID(id string) (*User, error) {
-    // implementation
-}
+- VS Code 1.60+，或兼容 VS Code 扩展的 Cursor 版本。
+- 使用 `.go` 文件；Go module 工程可以获得最完整的跨包和依赖解析能力。
+- 实现匹配不依赖 gopls。解析 GOROOT 或 module cache 中的源码时，需要本机存在相应 Go 源码或依赖缓存。
 
-func (r *PostgresUserRepository) Save(user *User) error {
-    // implementation
-}
-```
+## 配置
 
-### Performance
-- **Startup**: Broad text indexing only; the workspace AST is never built eagerly
-- **First query**: Parses candidate packages in 1-4 worker threads (default: 2)
-- **Cached query**: Returns from the in-memory query cache
-- **Persistent cache**: Restores unchanged candidate files using file metadata
-- **Synthetic baseline**: 402 Go files indexed in ~77ms; a rare-method cold AST query took ~33ms and parsed 2 files on the development machine
+打开 VS Code / Cursor 设置并搜索 `Go Interface Lens`，或直接编辑 `settings.json`。
 
-## 🎨 Configuration
+| 配置项 | 默认值 | 作用 |
+| --- | --- | --- |
+| `goInterfaceLens.astConcurrency` | `2` | 候选包 AST Worker 数量，可设置为 `1-4` |
+| `goInterfaceLens.excludedFolders` | `mocks, mock, testdata, vendor` | 排除指定目录 |
+| `goInterfaceLens.excludedFilePatterns` | `_mock.go, mock_, .pb.go, _test.go` | 排除文件名中包含指定文本的文件 |
+| `goInterfaceLens.excludedTypePatterns` | `Mock, mock, Stub, Fake` | 排除名称中包含指定文本的类型 |
+| `goInterfaceLens.searchDependencies` | `true` | 反向查找无本地结果时，按需搜索依赖接口 |
+| `goInterfaceLens.goModCache` | 空 | 手动指定 Go module cache；为空时自动探测 |
 
-The extension works out-of-the-box with sensible defaults, but you can customize the filtering behavior to match your project structure.
-
-### 🚫 Filtering Configuration
-
-You can configure which folders, files, and types to exclude from the implementation search. This is useful for filtering out mocks, generated code, test files, and vendor dependencies.
-
-#### Settings
-
-Open VS Code/Cursor settings (`Cmd+,` or `Ctrl+,`) and search for "Go Interface Lens" to configure:
-
-**`goInterfaceLens.astConcurrency`**
-- Worker threads used for candidate-package AST parsing
-- Range: `1-4`; default: `2`
-
-**`goInterfaceLens.excludedFolders`**
-- Array of folder names to exclude from search
-- Default: `["mocks", "mock", "testdata", "vendor"]`
-- Example: Add custom folders like `["mocks", "mock", "testdata", "vendor", "generated", "third_party"]`
-
-**`goInterfaceLens.excludedFilePatterns`**
-- Array of file name patterns to exclude
-- Default: `["_mock.go", "mock_", ".pb.go", "_test.go"]`
-- Example: Add proto files like `["_mock.go", "mock_", ".pb.go", "_test.go", ".gen.go"]`
-
-**`goInterfaceLens.excludedTypePatterns`**
-- Array of type name patterns to exclude
-- Default: `["Mock", "mock", "Stub", "Fake"]`
-- Example: Add custom patterns like `["Mock", "mock", "Stub", "Fake", "Test", "Dummy"]`
-
-#### Configuration Example
-
-Add to your `settings.json`:
+示例：
 
 ```json
 {
   "goInterfaceLens.astConcurrency": 2,
+  "goInterfaceLens.searchDependencies": true,
+  "goInterfaceLens.goModCache": "",
   "goInterfaceLens.excludedFolders": [
     "mocks",
     "mock",
     "testdata",
     "vendor",
-    "generated",
-    "proto"
+    "generated"
   ],
   "goInterfaceLens.excludedFilePatterns": [
     "_mock.go",
@@ -203,125 +135,61 @@ Add to your `settings.json`:
     "Mock",
     "mock",
     "Stub",
-    "Fake",
-    "Test"
+    "Fake"
   ]
 }
 ```
 
-#### How Filtering Works
+类型名以 `_` 开头时始终从实现结果中排除。
 
-The extension checks each potential implementation against your configuration:
-1. **Folder Check**: Excludes if file path contains any excluded folder name
-2. **File Pattern Check**: Excludes if file name contains any excluded pattern
-3. **Type Pattern Check**: Excludes if type name contains any excluded pattern
-4. **Underscore Check**: Always excludes types starting with `_` (test helpers)
+## 性能基线
 
-## 🔧 Commands
+开发环境中的合成测试包含 402 个 Go 文件：
 
-| Command | Description |
-|---------|-------------|
-| `Go: Show Implementations` | Manually search for interface implementations |
-| `Go: Show Method Implementations` | Manually search for method implementations |
-| `Go: Goto Interface` | Navigate from method implementation to interface declaration |
-| `Go: Clear Implementation Lens Cache` | Clear cached search results |
+- 启动候选索引约 `38ms`。
+- 首次 AST 查询约 `21ms`。
+- 缓存查询约 `0ms`。
+- 一次稀有方法查询只解析 2 个候选文件。
 
-## 🐛 Troubleshooting
+实际耗时取决于工程规模、磁盘、文件系统类型和候选方法的常见程度。
 
-### CodeLens not showing?
-1. Make sure you're viewing a `.go` file
-2. Check that the file contains `type Name interface {` declarations
-3. Reload window: `Cmd+Shift+P` → "Reload Window"
+## 命令
 
-### "No implementations found"?
-1. Verify the implementation exists
-2. Check that all interface methods are implemented
-3. Ensure the receiver functions follow Go conventions: `func (r *Type) Method()`
-4. Try clearing cache: `Cmd+Shift+P` → "Go: Clear Implementation Lens Cache"
+| 命令 | 作用 |
+| --- | --- |
+| `Go: Show Implementations` | 查看接口的完整实现 |
+| `Go: Show Method Implementations` | 查看接口方法实现 |
+| `Go: Goto Interface` | 从接收者方法跳转到接口 |
+| `Go: Clear Implementation Lens Cache` | 清除索引和查询缓存 |
 
-### Extension not loading?
-1. Check VSCode/Cursor version (must be 1.60+)
-2. View Extension Host logs: `Cmd+Shift+P` → "Developer: Show Logs" → "Extension Host"
-3. Look for errors related to `go-interface-lens`
+前三个命令通常由对应 CodeLens 携带上下文调用。清理缓存命令可以直接从 Command Palette 执行。
 
-## 📦 Installation
+## 常见问题
 
-### From Marketplace (Coming Soon)
-1. Open Extensions: `Cmd+Shift+X`
-2. Search: "Go Interface Lens"
-3. Click "Install"
+### 看不到 CodeLens
 
-### Manual Installation
-1. Download `.vsix` file from [releases](https://github.com/NightAsker/go-interface-lens/releases)
-2. Open Extensions: `Cmd+Shift+X`
-3. Click `...` → "Install from VSIX..."
-4. Select downloaded file
+1. 确认文件语言模式是 Go，且扩展已启用。
+2. 确认接口不是只能用于约束的泛型接口。
+3. 执行 `Developer: Reload Window`。
+4. 查看 `Output -> Go Interface Lens` 和 Extension Host 日志。
 
-### From Source
-```bash
-cd ~/.cursor/extensions/
-git clone https://github.com/NightAsker/go-interface-lens.git
-cd go-interface-lens
-npm install
-```
+VS Code 会合并同一文件上所有扩展提供的 CodeLens。如果 Go 扩展或 gopls 的 CodeLens 请求很慢，本扩展已经生成的 CodeLens 也可能延迟显示。
 
-## 🤝 Contributing
+### 找不到实现
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+1. 确认实现具有接口要求的全部方法及一致的参数、返回值类型。
+2. 检查值接收者和指针接收者的方法集差异。
+3. 检查排除目录、文件和类型配置。
+4. 执行 `Go: Clear Implementation Lens Cache` 后重试。
 
-### Development Setup
-```bash
-# Clone the repository
-git clone https://github.com/NightAsker/go-interface-lens.git
-cd go-interface-lens
+### 依赖中的接口找不到
 
-# Install dependencies (if any)
-npm install
+1. 确认 `goInterfaceLens.searchDependencies` 为 `true`。
+2. 确认依赖出现在 `go.mod` 中，或配置了有效 replace。
+3. 必要时通过 `goInterfaceLens.goModCache` 指定 module cache 的绝对路径。
 
-# Open in VSCode/Cursor
-code .
+## License
 
-# Press F5 to launch Extension Development Host
-```
+[MIT](LICENSE)
 
-## 📝 Changelog
-
-See [CHANGELOG.md](CHANGELOG.md) for release history.
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- Built for the Go community
-- Inspired by VS Code's native implementation lens
-- Includes modifications to MIT-licensed software; required notices are retained in [LICENSE](LICENSE)
-
-## 🔗 Links
-
-- [GitHub Repository](https://github.com/NightAsker/go-interface-lens)
-- [Issue Tracker](https://github.com/NightAsker/go-interface-lens/issues)
-- [VSCode Marketplace](https://marketplace.visualstudio.com/items?itemName=xiaoyao.go-interface-lens)
-
-## 💡 Tips & Tricks
-
-### Keyboard Shortcut
-Add a custom keybinding for quick access:
-```json
-{
-  "key": "cmd+shift+i",
-  "command": "go-interface-lens.showImplementations"
-}
-```
-
-### Works with Interfaces
-The extension understands Go's implicit interface implementation, so you don't need any special syntax or annotations!
-
-## 🌟 Star History
-
-If you find this extension useful, please consider giving it a ⭐ on [GitHub](https://github.com/NightAsker/go-interface-lens)!
-
----
-
-**Maintained by xiaoyao**
+版本记录见 [CHANGELOG.md](CHANGELOG.md)。问题反馈请提交到 [GitHub Issues](https://github.com/NightAsker/go-interface-lens/issues)。
