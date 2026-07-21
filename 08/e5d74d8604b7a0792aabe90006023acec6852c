@@ -1,0 +1,39 @@
+CHANGELOG.md
+  s_c9a8f97458fc41::t_b29262c701410b 5-16
+README.md
+  s_c9a8f97458fc41::t_06e978ff7199fb 3
+extension.js
+  s_c9a8f97458fc41::t_38311a0f9e5b28 60,64-83,104-113,115-119,165,210,490
+package.json
+  s_c9a8f97458fc41::t_7028d9719db1e1 5
+src/ast-cache.js
+  s_c9a8f97458fc41::t_86bc768307bf4d 61-73,76-85,96,109-121,296
+src/ast-worker.js
+  s_c9a8f97458fc41::t_45d0d8b7afa782 7-11
+src/indexer.js
+  s_c9a8f97458fc41::t_10cb2c87b9c6f9 1338,1343-1344,1346-1349,1382,1388-1389,1395,1446,1452-1453,1464,1479,1499,1504,1514,1556,1561,1584-1587
+test/ast-cache.test.js
+  s_c9a8f97458fc41::t_795038fcdbc35a 23-24
+test/gotolens.test.js
+  s_c9a8f97458fc41::t_8ed41d7feca5a9 89,161-162,170-177,179,185-187,190,193
+test/lazy-index.test.js
+  s_c9a8f97458fc41::t_0f7a9612a8c392 197-202,206
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "08e5d74d8604b7a0792aabe90006023acec6852c",
+  "prompts": {},
+  "sessions": {
+    "s_c9a8f97458fc41": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6a98-26c0-7d80-999f-590831706f38",
+        "model": "unknown"
+      },
+      "human_author": "xiaoyao.777 <xiaoyao.777@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
