@@ -168,10 +168,22 @@ func (r *PostgresUserRepository) FindByID(
 
 ### 看不到 CodeLens
 
-1. 确认文件语言模式是 Go，且扩展已启用。
-2. 确认接口不是只能用于约束的泛型接口。
-3. 执行 `Developer: Reload Window`。
-4. 查看 `Output -> Go Interface Lens` 和 Extension Host 日志。
+1. 确认文件语言模式是 Go，且扩展已在当前本地或远程扩展宿主中启用。
+2. 在工作区 `settings.json` 中显式启用 Go 文件的 CodeLens：
+
+   ```json
+   {
+     "[go]": {
+       "editor.codeLens": true
+     }
+   }
+   ```
+
+3. 确认接口不是只能用于约束的泛型接口。
+4. 执行 `Developer: Reload Window`。
+5. 查看 `Output -> Go Interface Lens` 和 Extension Host 日志。
+
+`[go].editor.codeLens` 是 VS Code 兼容编辑器提供的 Go 语言模式设置，控制所有注册到 Go 文件的 CodeLens provider，并不表示本扩展依赖 Go 扩展或 gopls。即使工作区中没有这项配置，Trae、Cursor、远程设置、用户 Profile 或语言级配置也可能改变它的最终生效值；显式设为 `true` 可以避免这些配置层级关闭本扩展的 CodeLens。
 
 VS Code 会合并同一文件上所有扩展提供的 CodeLens。如果 Go 扩展或 gopls 的 CodeLens 请求很慢，本扩展已经生成的 CodeLens 也可能延迟显示。
 
