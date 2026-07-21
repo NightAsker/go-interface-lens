@@ -1335,13 +1335,18 @@ class WorkspaceIndex {
         for (const signatures of signaturesByMethod.values()) {
             for (const importPath of potentialAliasImports(signatures)) imports.add(importPath);
         }
-        return imports;
+        return { imports, view };
     }
 
     async _expandSignatureAliasPackages(astFiles, methodNames, priority) {
         let parsed = new Map(astFiles);
+        let view = null;
+        let viewIsCurrent = false;
         for (let round = 0; round < 10; round++) {
-            const requested = this._potentialSignatureAliasImports(parsed, methodNames);
+            const analysis = this._potentialSignatureAliasImports(parsed, methodNames);
+            const requested = analysis.imports;
+            view = analysis.view;
+            viewIsCurrent = true;
             const representedPackages = new Set();
             const representedImports = new Set();
             for (const [file, info] of parsed) {
@@ -1374,17 +1379,20 @@ class WorkspaceIndex {
                 if (externalPackage.files.size > 0) added = true;
             }
             if (!added) break;
+            viewIsCurrent = false;
 
             const allPackages = new Set([...representedPackages, ...workspaceAdditions]);
             const closure = await this._expandEmbeddedAstPackages(allPackages, parsed, priority);
             parsed = closure.astFiles;
         }
-        return parsed;
+        if (!viewIsCurrent) view = this._createAstView(parsed);
+        return { astFiles: parsed, view };
     }
 
     _createAstView(astFiles) {
         const view = new WorkspaceIndex(this.getConfig, this.log, { disableAst: true });
         view.files = new Map(astFiles);
+        view._importPathByDirectory = this._importPathByDirectory;
         return view;
     }
 
@@ -1435,13 +1443,14 @@ class WorkspaceIndex {
         for (const packageKey of interfaceClosure.packages) candidates.add(packageKey);
         const astFiles = await this._parseAstPackages(candidates, 200);
         const closure = await this._expandEmbeddedAstPackages(candidates, astFiles, 200);
-        const aliasExpandedFiles = await this._expandSignatureAliasPackages(
+        const aliasExpansion = await this._expandSignatureAliasPackages(
             closure.astFiles,
             descriptor.resolved.methods.keys(),
             200
         );
         return {
-            astFiles: aliasExpandedFiles,
+            astFiles: aliasExpansion.astFiles,
+            view: aliasExpansion.view,
             candidatePackages: candidates,
         };
     }
@@ -1452,8 +1461,7 @@ class WorkspaceIndex {
             const started = Date.now();
             const context = await this._implementationAstContext(interfaceName, interfaceFile);
             if (!context) return [];
-            const view = this._createAstView(context.astFiles);
-            const results = view.findImplementations(interfaceName, interfaceFile);
+            const results = context.view.findImplementations(interfaceName, interfaceFile);
             this.log(
                 `AST implementation query ${interfaceName}: ${context.candidatePackages.size} package(s), ` +
                     `${context.astFiles.size} file(s), ${Date.now() - started}ms`
@@ -1468,8 +1476,7 @@ class WorkspaceIndex {
             const started = Date.now();
             const context = await this._implementationAstContext(interfaceName, interfaceFile);
             if (!context) return [];
-            const view = this._createAstView(context.astFiles);
-            const results = view.findMethodImplementations(interfaceName, methodName, interfaceFile);
+            const results = context.view.findMethodImplementations(interfaceName, methodName, interfaceFile);
             this.log(
                 `AST method query ${interfaceName}.${methodName}: ${context.candidatePackages.size} package(s), ` +
                     `${context.astFiles.size} file(s), ${Date.now() - started}ms`
@@ -1489,12 +1496,12 @@ class WorkspaceIndex {
             const started = Date.now();
             const astFiles = await this._parseAstPackages(candidates, 200);
             const closure = await this._expandEmbeddedAstPackages(candidates, astFiles, 200);
-            const aliasExpandedFiles = await this._expandSignatureAliasPackages(
+            const aliasExpansion = await this._expandSignatureAliasPackages(
                 closure.astFiles,
                 [methodName],
                 200
             );
-            const view = this._createAstView(aliasExpandedFiles);
+            const view = aliasExpansion.view;
             const local = view._collectLocalInterfaces(receiverType, methodName, { receiverFile });
             const results = local.results;
             const cfg = this.getConfig();
@@ -1504,7 +1511,7 @@ class WorkspaceIndex {
             }
             this.log(
                 `AST reverse query ${receiverType}.${methodName}: ${candidates.size} package(s), ` +
-                    `${aliasExpandedFiles.size} file(s), ${Date.now() - started}ms`
+                    `${aliasExpansion.astFiles.size} file(s), ${Date.now() - started}ms`
             );
             return results;
         });
@@ -1546,12 +1553,12 @@ class WorkspaceIndex {
             return;
         }
         const closure = await this._expandEmbeddedAstPackages(new Set(), parsed, 200);
-        const aliasExpandedFiles = await this._expandSignatureAliasPackages(
+        const aliasExpansion = await this._expandSignatureAliasPackages(
             closure.astFiles,
             [methodName],
             200
         );
-        const view = this._createAstView(aliasExpandedFiles);
+        const view = aliasExpansion.view;
         const { interfaces } = view._merged();
         for (const interfaceKey of view._interfacesByMethod.get(methodName) || []) {
             const declaration = view._interfaceDecls.get(interfaceKey);
@@ -1572,6 +1579,10 @@ class WorkspaceIndex {
 
     getAstStats() {
         return this.astPool ? { ...this.astPool.stats } : null;
+    }
+
+    warmAstWorkers() {
+        return this.astPool ? this.astPool.warmup() : Promise.resolve(0);
     }
 
     /**

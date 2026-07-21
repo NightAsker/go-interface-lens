@@ -20,6 +20,8 @@ async function main() {
 
     console.log('== concurrent declaration AST cache ==');
     const first = new AstWorkerPool({ concurrency: 2, cacheDir, log: () => {} });
+    eq('worker warmup starts every parser worker', await first.warmup(), 2);
+    eq('worker warmup does not parse workspace files', first.stats.parsed, 0);
     await Promise.all([
         first.parseFile(files[0], undefined, 100),
         first.parseFile(files[0], undefined, 100),

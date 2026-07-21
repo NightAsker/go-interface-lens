@@ -194,9 +194,16 @@ async function main() {
         'legacy receiver regex misses deliberately split declaration',
         !index.findImplementations('Service', interfaceFile).some((result) => result.name === 'Worker')
     );
+    let astViewCreations = 0;
+    const createAstView = index._createAstView.bind(index);
+    index._createAstView = (...args) => {
+        astViewCreations += 1;
+        return createAstView(...args);
+    };
     const implementations = await index.findImplementationsAst('Service', interfaceFile);
     eq('AST finds only the structurally valid implementation', implementations.map((r) => r.name), ['*Worker']);
     assert('AST query parsed candidate files in workers', index.getAstStats().parsed > 0);
+    eq('implementation query reuses its alias-analysis AST view', astViewCreations, 2);
 
     const parsedBeforeCacheHit = index.getAstStats().parsed;
     await index.findImplementationsAst('Service', interfaceFile);

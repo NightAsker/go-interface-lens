@@ -86,6 +86,7 @@ function fakeDocument(filePath) {
     return {
         uri: { fsPath: filePath, scheme: 'file' },
         fileName: filePath,
+        version: 1,
         getText: () => text,
         lineAt: (i) => ({ text: lines[i] || '' }),
     };
@@ -157,7 +158,8 @@ async function main() {
         ['package processengine', 'type Alias = interface { AliasMethod() }', 'type Split interface', '{', 'SplitMethod()', '}'].join('\n')
     );
     const interfaceProvider = new extension._test.GoInterfaceLensProvider();
-    const interfaceLenses = interfaceProvider.provideCodeLenses(fakeDocument(variantsPath));
+    const variantsDocument = fakeDocument(variantsPath);
+    const interfaceLenses = interfaceProvider.provideCodeLenses(variantsDocument);
     const implementationTargets = interfaceLenses
         .filter((lens) => lens.command.command === 'go-interface-lens.showImplementations')
         .map((lens) => lens.command.arguments[0]);
@@ -165,17 +167,30 @@ async function main() {
     assert('interface alias gets a lens', implementationTargets.includes('Alias'));
     assert('next-line interface brace gets a lens', implementationTargets.includes('Split'));
 
+    console.log('\n== shared document AST ==');
+    const firstParse = extension._test.parseDocument(variantsDocument);
+    const cachedParse = extension._test.parseDocument(variantsDocument);
+    assert('same document version reuses its AST', firstParse === cachedParse);
+    variantsDocument.version += 1;
+    const changedParse = extension._test.parseDocument(variantsDocument);
+    assert('new document version invalidates its AST', changedParse !== cachedParse);
+
     let prewarmCalls = 0;
+    let workerWarmupCalls = 0;
     extension._test.setWorkspaceIndex({
         areRootsBuilt: () => false,
         ensureBuilt: async () => {
             prewarmCalls += 1;
         },
+        warmAstWorkers: async () => {
+            workerWarmupCalls += 1;
+        },
     });
     interfaceProvider.provideCodeLenses(fakeDocument(variantsPath));
-    await Promise.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
     console.log('\n== interface-only file prewarming ==');
     assert('interface lens starts one background workspace build', prewarmCalls === 1);
+    assert('interface lens warms AST workers after the workspace build', workerWarmupCalls === 1);
     extension._test.setWorkspaceIndex(idx);
 
     idx.dispose();

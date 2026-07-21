@@ -57,8 +57,29 @@ function shouldExclude(filePath, receiverType) {
 // Shared index instance.
 let workspaceIndex = null;
 const overlayTimers = new Map();
+const documentAstCache = new WeakMap();
 const OVERLAY_DELAY_MS = 150;
 const WORKSPACE_PREWARM_DELAY_MS = 300;
+
+function parseDocument(document) {
+    const cached = documentAstCache.get(document);
+    if (cached && document.version !== undefined && cached.version === document.version) {
+        return cached.parsed;
+    }
+
+    const text = document.getText();
+    if (cached && document.version === undefined && cached.version === undefined && cached.text === text) {
+        return cached.parsed;
+    }
+
+    const parsed = parseGoFile(text);
+    documentAstCache.set(document, {
+        version: document.version,
+        text: document.version === undefined ? text : undefined,
+        parsed,
+    });
+    return parsed;
+}
 
 function resolvePrewarmRoots(documentUri) {
     const roots = new Set();
@@ -80,11 +101,22 @@ function resolvePrewarmRoots(documentUri) {
 
 function prewarmRoots(roots, reason) {
     if (!workspaceIndex || typeof workspaceIndex.ensureBuilt !== 'function' || roots.length === 0) return;
-    if (typeof workspaceIndex.areRootsBuilt === 'function' && workspaceIndex.areRootsBuilt(roots)) return;
+    const warmWorkers = () => {
+        if (typeof workspaceIndex.warmAstWorkers !== 'function') return Promise.resolve();
+        return workspaceIndex.warmAstWorkers().catch((err) => {
+            log(`${reason} AST worker warmup failed: ${err && err.message}`);
+        });
+    };
+    if (typeof workspaceIndex.areRootsBuilt === 'function' && workspaceIndex.areRootsBuilt(roots)) {
+        void warmWorkers();
+        return;
+    }
 
-    Promise.all(roots.map((root) => workspaceIndex.ensureBuilt(root))).catch((err) => {
-        log(`${reason} prewarm failed: ${err && err.message}`);
-    });
+    Promise.all(roots.map((root) => workspaceIndex.ensureBuilt(root)))
+        .then(warmWorkers)
+        .catch((err) => {
+            log(`${reason} prewarm failed: ${err && err.message}`);
+        });
 }
 
 function prewarmWorkspace(documentUri, reason) {
@@ -130,7 +162,7 @@ class GoInterfaceLensProvider {
 
     provideCodeLenses(document) {
         const codeLenses = [];
-        const parsed = parseGoFile(document.getText());
+        const parsed = parseDocument(document);
 
         if (parsed.interfaces.size > 0) {
             // Build the broad candidate index in the background. Exact AST
@@ -175,7 +207,7 @@ class GoGotoInterfaceLensProvider {
     }
 
     provideCodeLenses(document) {
-        const parsed = parseGoFile(document.getText());
+        const parsed = parseDocument(document);
         const codeLenses = [];
         for (const [receiverType, info] of parsed.types) {
             if (shouldExclude(document.fileName, receiverType)) continue;
@@ -455,6 +487,7 @@ module.exports._test = {
     },
     GoGotoInterfaceLensProvider,
     GoInterfaceLensProvider,
+    parseDocument,
     resolvePrewarmRoots,
     prewarmRoots,
 };

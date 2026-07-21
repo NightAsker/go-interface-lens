@@ -2,6 +2,18 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [1.1.5] - 2026-07-21
+
+### Improved
+
+- Prewarm declaration parser workers after the background workspace index is
+  ready, removing worker startup from the first implementation lookup without
+  eagerly parsing workspace files.
+- Reuse alias-analysis AST views and import-path caches during lazy queries to
+  avoid rebuilding the same merged declaration indexes.
+- Share the current document AST between both CodeLens providers until the
+  document version changes.
+
 ## [1.1.4] - 2026-07-20
 
 ### Fixed

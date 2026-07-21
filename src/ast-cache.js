@@ -58,10 +58,31 @@ class AstWorkerPool {
     }
 
     _spawnWorker() {
-        const state = { worker: null, busy: false, job: null, failed: false };
+        let resolveReady;
+        const readyPromise = new Promise((resolve) => {
+            resolveReady = resolve;
+        });
+        const state = {
+            worker: null,
+            busy: false,
+            job: null,
+            failed: false,
+            ready: false,
+            readyPromise,
+            resolveReady,
+        };
         const worker = new Worker(path.join(__dirname, 'ast-worker.js'));
         state.worker = worker;
-        worker.on('message', (message) => this._finishWorkerJob(state, message));
+        worker.on('message', (message) => {
+            if (message && message.type === 'ready') {
+                if (!state.ready) {
+                    state.ready = true;
+                    state.resolveReady(true);
+                }
+                return;
+            }
+            this._finishWorkerJob(state, message);
+        });
         worker.on('error', (err) => this._workerFailed(state, err));
         worker.on('exit', (code) => {
             if (!this.disposed && code !== 0) this._workerFailed(state, new Error(`AST worker exited with code ${code}`));
@@ -72,6 +93,7 @@ class AstWorkerPool {
     _workerFailed(state, err) {
         if (state.failed) return;
         state.failed = true;
+        if (!state.ready) state.resolveReady(false);
         const index = this.workers.indexOf(state);
         if (index >= 0) this.workers.splice(index, 1);
         if (state.job) {
@@ -82,6 +104,19 @@ class AstWorkerPool {
         state.busy = false;
         if (!this.disposed && this.workers.length < this.concurrency) this._spawnWorker();
         this._dispatch();
+    }
+
+    /** Start parser workers and wait until their modules are loaded. */
+    async warmup() {
+        if (this.disposed) return 0;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            this._ensureWorkers();
+            const snapshot = [...this.workers];
+            await Promise.all(snapshot.map((state) => state.readyPromise));
+            const ready = this.workers.filter((state) => state.ready && !state.failed).length;
+            if (ready >= this.concurrency || this.disposed) return ready;
+        }
+        return this.workers.filter((state) => state.ready && !state.failed).length;
     }
 
     _finishWorkerJob(state, message) {
@@ -258,6 +293,7 @@ class AstWorkerPool {
         for (const job of this.queue) job.reject(new Error('AST worker pool disposed'));
         this.queue = [];
         for (const state of this.workers) {
+            if (!state.ready) state.resolveReady(false);
             if (state.job) state.job.reject(new Error('AST worker pool disposed'));
             state.job = null;
             state.worker.terminate();
