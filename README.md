@@ -185,7 +185,21 @@ func (r *PostgresUserRepository) FindByID(
 
 `[go].editor.codeLens` 是 VS Code 兼容编辑器提供的 Go 语言模式设置，控制所有注册到 Go 文件的 CodeLens provider，并不表示本扩展依赖 Go 扩展或 gopls。即使工作区中没有这项配置，Trae、Cursor、远程设置、用户 Profile 或语言级配置也可能改变它的最终生效值；显式设为 `true` 可以避免这些配置层级关闭本扩展的 CodeLens。
 
-VS Code 会合并同一文件上所有扩展提供的 CodeLens。如果 Go 扩展或 gopls 的 CodeLens 请求很慢，本扩展已经生成的 CodeLens 也可能延迟显示。
+### CodeLens 显示较慢
+
+VS Code 会并发请求同一 Go 文件上所有匹配的 CodeLens provider，并在编辑器侧合并结果后统一展示。Go Interface Lens 自己不调用 Go 扩展或 gopls，但官方 Go 扩展也是一个并列的 provider；当它等待 gopls 初始化或分析时，合并阶段可能延迟，本扩展已经生成的 CodeLens 也会稍后才显示或变为可点击。标准 CodeLens API 不提供 provider 优先级或独立渲染能力，因此本扩展无法绕过编辑器的聚合等待。
+
+如果主要使用 Go Interface Lens 完成接口导航，推荐在设置中搜索 `Go: Enable Code Lens`（`go.enableCodeLens`），关闭官方 Go 扩展不需要的 CodeLens 总开关或子项，同时保留：
+
+```json
+{
+  "[go]": {
+    "editor.codeLens": true
+  }
+}
+```
+
+这样只是不再让官方 Go CodeLens 参与聚合，不会关闭本扩展，也不会禁用 gopls 的补全、诊断和普通代码跳转。不同版本的 Go 扩展可能将该设置显示为一个总开关或 references、run test 等多个子项，可以按实际需要全部关闭。
 
 ### 找不到实现
 
