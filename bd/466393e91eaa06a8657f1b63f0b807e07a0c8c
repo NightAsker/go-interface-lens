@@ -1,0 +1,21 @@
+README.md
+  s_c9a8f97458fc41::t_c41b0331e72132 188-202
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "bd466393e91eaa06a8657f1b63f0b807e07a0c8c",
+  "prompts": {},
+  "sessions": {
+    "s_c9a8f97458fc41": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6a98-26c0-7d80-999f-590831706f38",
+        "model": "unknown"
+      },
+      "human_author": "xiaoyao.777 <xiaoyao.777@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
