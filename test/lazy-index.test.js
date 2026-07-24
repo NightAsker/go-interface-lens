@@ -51,6 +51,13 @@ async function main() {
             '}',
             'type Exporter interface { Export() Result }',
             'type ByteConsumer interface { Consume(byte, rune, any) }',
+            'type CompositeResults interface {',
+            '    Empty() interface{}',
+            '    Map() map[string]interface{}',
+            '    Slice() []interface{}',
+            '    PointerMap() *map[string]interface{}',
+            '    Nested() map[string][]interface{}',
+            '}',
             'type Reader interface { Read([]byte) (int, error) }',
             'type DoneWaiter interface { Done() <-chan struct{} }',
             'type Delegated interface { Delegate() error }',
@@ -156,6 +163,12 @@ async function main() {
             'import "context"',
             'type AliasConsumer struct{}',
             'func (AliasConsumer) Consume(uint8, int32, interface{}) {}',
+            'type CompositeResultsImpl struct{}',
+            'func (CompositeResultsImpl) Empty() any { return nil }',
+            'func (CompositeResultsImpl) Map() map[string]any { return nil }',
+            'func (CompositeResultsImpl) Slice() []any { return nil }',
+            'func (CompositeResultsImpl) PointerMap() *map[string]any { return nil }',
+            'func (CompositeResultsImpl) Nested() map[string][]any { return nil }',
             'type ReaderHolder struct { io.Reader }',
             'type ContextHolder struct { context.Context }',
         ].join('\n')
@@ -281,6 +294,15 @@ async function main() {
     eq('predeclared Go aliases normalize to identical method signatures', byteConsumers.map((r) => r.name), [
         'AliasConsumer',
     ]);
+    const compositeResults = await index.findImplementationsAst(
+        'CompositeResults',
+        interfaceFile
+    );
+    eq(
+        'worker-backed query matches any inside unparenthesized composite results',
+        compositeResults.map((result) => result.name),
+        ['CompositeResultsImpl']
+    );
     const readers = await index.findImplementationsAst('Reader', interfaceFile);
     eq('struct embedding a known standard-library interface is found', readers.map((r) => r.name), [
         'ReaderHolder',

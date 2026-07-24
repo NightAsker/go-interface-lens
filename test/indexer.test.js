@@ -79,6 +79,7 @@ async function main() {
     promotedMethodImplementationLocation();
     typeAliasesCanonicalizeSignatures();
     predeclaredAliasesRespectShadowing();
+    predeclaredAliasesCanonicalizeCompositeResults();
     unsavedDocumentOverlay();
     done();
 }
@@ -165,6 +166,45 @@ function predeclaredAliasesRespectShadowing() {
     assert(
         'package-local byte declaration is not rewritten to uint8',
         idx.findImplementations('Consumer', shadowFile).length === 0
+    );
+    idx.dispose();
+}
+
+function predeclaredAliasesCanonicalizeCompositeResults() {
+    const idx = new WorkspaceIndex(cfg, () => {});
+    const source = [
+        'package predeclared',
+        'type CompositeResults interface {',
+        '    Empty() interface{}',
+        '    Map() map[string]interface{}',
+        '    Slice() []interface{}',
+        '    PointerMap() *map[string]interface{}',
+        '    Nested() map[string][]interface{}',
+        '}',
+        'type Impl struct{}',
+        'func (Impl) Empty() any { return nil }',
+        'func (Impl) Map() map[string]any { return nil }',
+        'func (Impl) Slice() []any { return nil }',
+        'func (Impl) PointerMap() *map[string]any { return nil }',
+        'func (Impl) Nested() map[string][]any { return nil }',
+    ].join('\n');
+    const astFile = '/synthetic/predeclared/composite-results-ast.go';
+    const lightweightFile = '/synthetic/predeclared/composite-results-lightweight.go';
+    idx.files.set(astFile, parseGoFile(source));
+
+    console.log('\n== any canonicalizes inside unparenthesized composite results ==');
+    assert(
+        'declaration AST matches interface{} and any recursively inside result types',
+        idx.findImplementations('CompositeResults', astFile).some((result) => result.name === 'Impl')
+    );
+    idx.files.delete(astFile);
+    idx._invalidateMerged();
+    idx.files.set(lightweightFile, parseFile(source));
+    assert(
+        'lightweight index matches interface{} and any recursively inside result types',
+        idx.findImplementations('CompositeResults', lightweightFile).some(
+            (result) => result.name === 'Impl'
+        )
     );
     idx.dispose();
 }

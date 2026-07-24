@@ -159,6 +159,49 @@ assert(
         distinctResults.types.get('SliceWrong').methods.get('List')
 );
 
+console.log('\n== declaration AST: unparenthesized composite result types ==');
+const compositeResultCases = [
+    ['EmptyInterface', 'interface{}'],
+    ['Any', 'any'],
+    ['MapInterface', 'map[string]interface{}'],
+    ['MapAny', 'map[string]any'],
+    ['SliceInterface', '[]interface{}'],
+    ['SliceAny', '[]any'],
+    ['PointerInterface', '*interface{}'],
+    ['PointerMapInterface', '*map[string]interface{}'],
+    ['NestedContainers', 'map[string][]interface{}'],
+    ['ArrayInterface', '[2]interface{}'],
+    ['SendChannel', 'chan<- interface{}'],
+    ['ReceiveChannel', '<-chan interface{}'],
+    ['Callback', 'func() interface{}'],
+    ['AnonymousStruct', 'struct { Value interface{} }'],
+    ['AnonymousInterface', 'interface { Value() interface{} }'],
+    ['GenericComposite', 'Box[map[string]interface{}]'],
+];
+const compositeResults = parse([
+    'package p',
+    'type Box[T any] struct{}',
+    'type CompositeResults interface {',
+    ...compositeResultCases.map(([name, result]) => `    ${name}() ${result}`),
+    '}',
+    'type CompositeImpl struct{}',
+    ...compositeResultCases.map(
+        ([name, result]) =>
+            `func (CompositeImpl) ${name}() ${result} { type MustStayLocal struct{}; panic(\"unused\") }`
+    ),
+]);
+for (const [methodName] of compositeResultCases) {
+    eq(
+        `${methodName} keeps the complete result type before the method body`,
+        compositeResults.types.get('CompositeImpl').methods.get(methodName),
+        compositeResults.interfaces.get('CompositeResults').methods.get(methodName)
+    );
+}
+assert(
+    'method bodies after composite result types remain excluded',
+    !compositeResults.types.has('MustStayLocal')
+);
+
 console.log('\n== declaration AST skips function bodies ==');
 const localDeclarations = parse([
     'package p',

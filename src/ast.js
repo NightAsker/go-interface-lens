@@ -492,31 +492,76 @@ function receiverInfo(tokens, openIndex, closeIndex) {
     return { name: type.value, pointer: false };
 }
 
+function typeExpressionEnd(tokens, startIndex) {
+    const start = significant(tokens, startIndex);
+    const token = tokens[start];
+    if (!token) return start;
+
+    if (token.value === '(') return matching(tokens, start, '(', ')') + 1;
+    if (token.value === '*') return typeExpressionEnd(tokens, start + 1);
+    if (token.value === '[') {
+        const close = matching(tokens, start, '[', ']');
+        return typeExpressionEnd(tokens, close + 1);
+    }
+    if (token.value === 'map') {
+        const open = significant(tokens, start + 1);
+        if (!tokens[open] || tokens[open].value !== '[') return start + 1;
+        return typeExpressionEnd(tokens, matching(tokens, open, '[', ']') + 1);
+    }
+    if (token.value === 'chan') {
+        let element = significant(tokens, start + 1);
+        if (tokens[element] && tokens[element].value === '<-') {
+            element = significant(tokens, element + 1);
+        }
+        return typeExpressionEnd(tokens, element);
+    }
+    if (token.value === '<-') {
+        const channel = significant(tokens, start + 1);
+        if (tokens[channel] && tokens[channel].value === 'chan') {
+            return typeExpressionEnd(tokens, channel + 1);
+        }
+        return start + 1;
+    }
+    if (token.value === 'func') {
+        const open = significant(tokens, start + 1);
+        if (!tokens[open] || tokens[open].value !== '(') return start + 1;
+        const paramsEnd = matching(tokens, open, '(', ')') + 1;
+        const result = significant(tokens, paramsEnd);
+        if (!tokens[result] || ['{', ';', '}'].includes(tokens[result].value)) return paramsEnd;
+        if (tokens[result].value === '(') return matching(tokens, result, '(', ')') + 1;
+        return typeExpressionEnd(tokens, result);
+    }
+    if (token.value === 'interface' || token.value === 'struct') {
+        const open = significant(tokens, start + 1);
+        return tokens[open] && tokens[open].value === '{'
+            ? matching(tokens, open, '{', '}') + 1
+            : start + 1;
+    }
+
+    if (token.kind !== 'identifier') return start + 1;
+    let end = significant(tokens, start + 1);
+    if (
+        tokens[end] && tokens[end].value === '.' &&
+        tokens[significant(tokens, end + 1)] &&
+        tokens[significant(tokens, end + 1)].kind === 'identifier'
+    ) {
+        end = significant(tokens, end + 1) + 1;
+    }
+    end = significant(tokens, end);
+    if (tokens[end] && tokens[end].value === '[') {
+        return matching(tokens, end, '[', ']') + 1;
+    }
+    return end;
+}
+
 function signatureEnd(tokens, openIndex) {
     const paramsClose = matching(tokens, openIndex, '(', ')');
-    let i = significant(tokens, paramsClose + 1);
-    if (tokens[i] && tokens[i].value === '(') return matching(tokens, i, '(', ')') + 1;
-    if (!tokens[i] || ['{', ';', '}'].includes(tokens[i].value)) return paramsClose + 1;
-
-    let paren = 0;
-    let bracket = 0;
-    let brace = 0;
-    for (; i < tokens.length; i++) {
-        const token = tokens[i];
-        if (token.value === '(') paren += 1;
-        else if (token.value === ')') paren -= 1;
-        else if (token.value === '[') bracket += 1;
-        else if (token.value === ']') bracket -= 1;
-        else if (token.value === '{') {
-            if (paren === 0 && bracket === 0 && brace === 0) return i;
-            brace += 1;
-        } else if (token.value === '}') {
-            if (brace === 0) return i;
-            brace -= 1;
-        }
-        if ((token.kind === 'newline' || token.value === ';') && paren === 0 && bracket === 0 && brace === 0) return i;
+    const result = significant(tokens, paramsClose + 1);
+    if (!tokens[result] || ['{', ';', '}'].includes(tokens[result].value)) {
+        return paramsClose + 1;
     }
-    return i;
+    if (tokens[result].value === '(') return matching(tokens, result, '(', ')') + 1;
+    return typeExpressionEnd(tokens, result);
 }
 
 function parseGoFile(text) {

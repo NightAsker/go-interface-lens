@@ -2,6 +2,14 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [1.1.6] - 2026-07-24
+
+### Fixed
+
+- Parse unparenthesized `interface{}`, anonymous `struct`/`interface`, and nested
+  map, slice, pointer, array, channel, function, and generic result types without
+  mistaking their type braces for the start of a method body.
+
 ## [1.1.5] - 2026-07-21
 
 ### Improved

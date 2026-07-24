@@ -673,14 +673,22 @@ function signatureFromLine(code, line, methodName, pkgName, imports) {
 function cutAtTopLevelBrace(s) {
     let paren = 0;
     let bracket = 0;
+    let typeBrace = 0;
     for (let i = 0; i < s.length; i++) {
         const c = s[i];
         if (c === '(') paren += 1;
         else if (c === ')') paren -= 1;
         else if (c === '[') bracket += 1;
         else if (c === ']') bracket -= 1;
-        else if ((c === '{' || c === '}') && paren <= 0 && bracket <= 0) {
-            return s.slice(0, i);
+        else if (c === '{' && paren <= 0 && bracket <= 0) {
+            if (typeBrace > 0 || /\b(?:interface|struct)\s*$/.test(s.slice(0, i))) {
+                typeBrace += 1;
+            } else {
+                return s.slice(0, i);
+            }
+        } else if (c === '}' && paren <= 0 && bracket <= 0) {
+            if (typeBrace > 0) typeBrace -= 1;
+            else return s.slice(0, i);
         }
     }
     return s;

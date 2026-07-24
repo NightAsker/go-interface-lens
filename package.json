@@ -2,7 +2,7 @@
   "name": "go-interface-lens",
   "displayName": "Go Interface Lens",
   "description": "Fast bidirectional CodeLens navigation between Go interfaces and their implementations",
-  "version": "1.1.5",
+  "version": "1.1.6",
   "publisher": "xiaoyao",
   "author": {
     "name": "xiaoyao"

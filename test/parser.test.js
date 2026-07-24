@@ -35,6 +35,54 @@ eq(
 assert('different arg count differs', normalizeSignature('(a int)') !== normalizeSignature('(a int, b int)'));
 assert('no-arg vs arg differ', normalizeSignature('() string') !== normalizeSignature('(x int) string'));
 
+console.log('\n== unparenthesized composite result types ==');
+{
+    const cases = [
+        ['EmptyInterface', 'interface{}'],
+        ['Any', 'any'],
+        ['MapInterface', 'map[string]interface{}'],
+        ['MapAny', 'map[string]any'],
+        ['SliceInterface', '[]interface{}'],
+        ['SliceAny', '[]any'],
+        ['PointerInterface', '*interface{}'],
+        ['PointerMapInterface', '*map[string]interface{}'],
+        ['NestedContainers', 'map[string][]interface{}'],
+        ['ArrayInterface', '[2]interface{}'],
+        ['SendChannel', 'chan<- interface{}'],
+        ['ReceiveChannel', '<-chan interface{}'],
+        ['Callback', 'func() interface{}'],
+        ['AnonymousStruct', 'struct { Value interface{} }'],
+        ['AnonymousInterface', 'interface { Value() interface{} }'],
+        ['GenericComposite', 'Box[map[string]interface{}]'],
+    ];
+    const parsed = parseFile(
+        [
+            'package p',
+            'type Box[T any] struct{}',
+            'type CompositeResults interface {',
+            ...cases.map(([name, result]) => `    ${name}() ${result}`),
+            '}',
+            'type CompositeImpl struct{}',
+            ...cases.map(
+                ([name, result]) =>
+                    `func (CompositeImpl) ${name}() ${result} { panic(\"unused\") }`
+            ),
+        ].join('\n')
+    );
+    for (const [methodName] of cases) {
+        eq(
+            `${methodName} retains braces in its result type`,
+            parsed.types.get('CompositeImpl').methods.get(methodName),
+            parsed.interfaces.get('CompositeResults').methods.get(methodName)
+        );
+    }
+    assert(
+        'different anonymous interface results remain distinguishable',
+        normalizeSignature('() interface { Left() }') !==
+            normalizeSignature('() interface { Right() }')
+    );
+}
+
 console.log('\n== grouped parameters share a type (regression) ==');
 eq(
     'grouped (a, b int) == explicit (a int, b int)',
