@@ -19,6 +19,16 @@ async function main() {
     });
 
     console.log('== concurrent declaration AST cache ==');
+    const defaults = new AstWorkerPool();
+    eq('worker concurrency defaults to 16', defaults.concurrency, 16);
+    defaults.dispose();
+    const maximum = new AstWorkerPool({ concurrency: 100 });
+    eq('worker concurrency is capped at 32', maximum.concurrency, 32);
+    maximum.dispose();
+    const minimum = new AstWorkerPool({ concurrency: 0 });
+    eq('worker concurrency is clamped to at least 1', minimum.concurrency, 1);
+    minimum.dispose();
+
     const first = new AstWorkerPool({ concurrency: 2, cacheDir, log: () => {} });
     eq('worker warmup starts every parser worker', await first.warmup(), 2);
     eq('worker warmup does not parse workspace files', first.stats.parsed, 0);

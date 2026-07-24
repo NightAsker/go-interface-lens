@@ -15,7 +15,7 @@ const {
 const { listGoFiles, resolveGoModCache, grepInterfaceFilesForMethod } = require('./search');
 const { findGoMod, resolveLockedModuleDirs, resolveModuleImportDirectory } = require('./gomod');
 const { currentBuildContext, shouldIncludeGoFile } = require('./build');
-const { AstWorkerPool } = require('./ast-cache');
+const { AstWorkerPool, DEFAULT_AST_CONCURRENCY } = require('./ast-cache');
 
 const NON_METHOD_CALLS = new Set([
     'if',
@@ -312,7 +312,7 @@ class WorkspaceIndex {
         this.astPool = this.options.disableAst
             ? null
             : new AstWorkerPool({
-                  concurrency: cfg.astConcurrency || 2,
+                  concurrency: cfg.astConcurrency ?? DEFAULT_AST_CONCURRENCY,
                   cacheDir: this.options.cacheDir || '',
                   log: this.log,
               });

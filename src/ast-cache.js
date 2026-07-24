@@ -7,11 +7,16 @@ const { Worker } = require('worker_threads');
 const { deserializeParsedFile } = require('./ast');
 
 const CACHE_SCHEMA = 5;
+const DEFAULT_AST_CONCURRENCY = 16;
+const MAX_AST_CONCURRENCY = 32;
 
 class AstWorkerPool {
     constructor(options) {
         const opts = options || {};
-        this.concurrency = Math.max(1, Math.min(4, opts.concurrency || 2));
+        const requested = Number.isFinite(opts.concurrency)
+            ? Math.trunc(opts.concurrency)
+            : DEFAULT_AST_CONCURRENCY;
+        this.concurrency = Math.max(1, Math.min(MAX_AST_CONCURRENCY, requested));
         this.cacheDir = opts.cacheDir || '';
         this.log = opts.log || (() => {});
         this.cacheFile = this.cacheDir ? path.join(this.cacheDir, `ast-cache-v${CACHE_SCHEMA}.json`) : '';
@@ -313,4 +318,9 @@ class AstWorkerPool {
     }
 }
 
-module.exports = { AstWorkerPool, CACHE_SCHEMA };
+module.exports = {
+    AstWorkerPool,
+    CACHE_SCHEMA,
+    DEFAULT_AST_CONCURRENCY,
+    MAX_AST_CONCURRENCY,
+};

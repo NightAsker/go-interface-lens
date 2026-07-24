@@ -2,6 +2,14 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [1.2.2] - 2026-07-24
+
+### Changed
+
+- Increase the default Tree-sitter worker concurrency from 2 to 16.
+- Allow `goInterfaceLens.astConcurrency` values from 1 through 32 and enforce
+  the same upper bound in the worker pool.
+
 ## [1.2.1] - 2026-07-24
 
 ### Changed

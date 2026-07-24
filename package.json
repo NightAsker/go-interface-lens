@@ -2,7 +2,7 @@
   "name": "go-interface-lens",
   "displayName": "Go Interface Lens",
   "description": "Fast bidirectional CodeLens navigation between Go interfaces and their implementations",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "publisher": "xiaoyao",
   "author": {
     "name": "xiaoyao"
@@ -106,9 +106,9 @@
         },
         "goInterfaceLens.astConcurrency": {
           "type": "integer",
-          "default": 2,
+          "default": 16,
           "minimum": 1,
-          "maximum": 4,
+          "maximum": 32,
           "description": "Maximum worker threads used to parse candidate Go packages for precise implementation matching."
         }
       }

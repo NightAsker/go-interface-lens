@@ -6,6 +6,7 @@ const path = require('path');
 const { WorkspaceIndex } = require('./src/indexer');
 const { resolveSearchRoots } = require('./src/search');
 const { parseGoFile } = require('./src/ast');
+const { DEFAULT_AST_CONCURRENCY } = require('./src/ast-cache');
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -26,7 +27,7 @@ function getConfiguration() {
         excludedTypePatterns: config.get('excludedTypePatterns', ['Mock', 'mock', 'Stub', 'Fake']),
         searchDependencies: config.get('searchDependencies', true),
         goModCache: config.get('goModCache', ''),
-        astConcurrency: config.get('astConcurrency', 2),
+        astConcurrency: config.get('astConcurrency', DEFAULT_AST_CONCURRENCY),
     };
 }
 
