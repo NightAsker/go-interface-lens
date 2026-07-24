@@ -2,6 +2,31 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [1.2.1] - 2026-07-24
+
+### Changed
+
+- Replace the handwritten Go tokenizer and parser with Microsoft-maintained
+  `@vscode/tree-sitter-wasm` and the Tree-sitter Go grammar.
+- Require VS Code 1.76 or newer for the Node 16-compatible Tree-sitter runtime.
+- Parse one source file per task and release its syntax tree immediately after
+  extracting compact declaration metadata.
+- Keep startup indexing text-based and parse only the current document,
+  candidate packages, and required embedded or imported dependency packages.
+
+### Fixed
+
+- Use grammar nodes to distinguish unparenthesized composite result types from
+  method bodies, including `interface{}`, `any`, maps, slices, pointers,
+  channels, functions, anonymous structs/interfaces, and generic composites.
+- Normalize Tree-sitter channel and standard-library interface signatures
+  consistently during embedded method-set resolution.
+
+### Packaging
+
+- Vendor only the locked upstream Tree-sitter JavaScript runtime, core runtime
+  WASM, Go grammar WASM, and MIT license; exclude all other grammars.
+
 ## [1.1.6] - 2026-07-24
 
 ### Fixed

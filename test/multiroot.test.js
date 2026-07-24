@@ -29,9 +29,12 @@ async function main() {
     await idx.ensureBuilt(projRoot);
 
     console.log('== interface in dependency, implementation in project ==');
-    const impls = idx.findImplementations('IActionExecutorWithCode').map((r) => r.name).sort();
+    const interfaceFile = path.join(depRoot, 'vendorpkg', 'iface.go');
+    const impls = (await idx.findImplementationsAst('IActionExecutorWithCode', interfaceFile))
+        .map((r) => r.name)
+        .sort();
     console.log('  got:', impls);
-    assert('ProjectExecutor found across roots', impls.includes('ProjectExecutor'));
+    assert('*ProjectExecutor found across roots', impls.includes('*ProjectExecutor'));
 
     idx.dispose();
     done();

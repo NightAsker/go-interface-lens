@@ -160,9 +160,9 @@ class GoInterfaceLensProvider {
         this.onDidChangeCodeLenses = this._onDidChangeCodeLenses.event;
     }
 
-    provideCodeLenses(document) {
+    async provideCodeLenses(document) {
         const codeLenses = [];
-        const parsed = parseDocument(document);
+        const parsed = await parseDocument(document);
 
         if (parsed.interfaces.size > 0) {
             // Build the broad candidate index in the background. Exact AST
@@ -206,8 +206,8 @@ class GoGotoInterfaceLensProvider {
         this.onDidChangeCodeLenses = this._onDidChangeCodeLenses.event;
     }
 
-    provideCodeLenses(document) {
-        const parsed = parseDocument(document);
+    async provideCodeLenses(document) {
+        const parsed = await parseDocument(document);
         const codeLenses = [];
         for (const [receiverType, info] of parsed.types) {
             if (shouldExclude(document.fileName, receiverType)) continue;

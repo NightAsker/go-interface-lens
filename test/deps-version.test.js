@@ -75,7 +75,9 @@ async function main() {
     await idx.ensureBuilt(proj);
 
     console.log('== only go.mod-locked version is returned ==');
-    const found = await idx.findInterfaces('ProjectExecutor', 'Execute');
+    const found = await idx.findInterfacesAst('ProjectExecutor', 'Execute', {
+        receiverFile: path.join(proj, 'executor.go'),
+    });
     console.log(
         '  got files:',
         found.map((r) => r.file.replace(cache + path.sep, ''))

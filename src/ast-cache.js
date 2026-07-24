@@ -6,7 +6,7 @@ const crypto = require('crypto');
 const { Worker } = require('worker_threads');
 const { deserializeParsedFile } = require('./ast');
 
-const CACHE_SCHEMA = 4;
+const CACHE_SCHEMA = 5;
 
 class AstWorkerPool {
     constructor(options) {

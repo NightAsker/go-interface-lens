@@ -1,127 +1,197 @@
 'use strict';
 
-const { extractImportAliases } = require('./parser');
+const { parseGoSyntaxTree } = require('./tree-sitter-runtime');
 
-function isIdentStart(ch) {
-    return ch === '_' || /[A-Za-z]/.test(ch) || (ch && ch.charCodeAt(0) > 127);
+function namedChildren(node) {
+    return node ? node.namedChildren.filter(Boolean) : [];
 }
 
-function isIdentPart(ch) {
-    return isIdentStart(ch) || /[0-9]/.test(ch || '');
+function field(node, name) {
+    return node && node.childForFieldName(name);
 }
 
-function tokenizeGo(text) {
-    const tokens = [];
-    let i = 0;
-    let line = 0;
-    let character = 0;
+function fields(node, name) {
+    return node ? node.childrenForFieldName(name).filter(Boolean) : [];
+}
 
-    const push = (kind, value, start, startLine, startCharacter) => {
-        tokens.push({ kind, value, start, end: i, line: startLine, character: startCharacter });
-    };
-    const advance = () => {
-        const ch = text[i++];
-        if (ch === '\n') {
-            line += 1;
-            character = 0;
-        } else {
-            character += 1;
-        }
-        return ch;
-    };
+function defaultImportAlias(importPath) {
+    const parts = importPath.split('/').filter(Boolean);
+    let alias = parts.pop() || '';
+    if (/^v\d+$/.test(alias) && parts.length > 0) alias = parts.pop();
+    return alias;
+}
 
-    while (i < text.length) {
-        const ch = text[i];
-        if (ch === '\r') {
-            advance();
-            continue;
-        }
-        if (ch === '\n') {
-            const start = i;
-            const startLine = line;
-            const startCharacter = character;
-            advance();
-            push('newline', '\n', start, startLine, startCharacter);
-            continue;
-        }
-        if (/\s/.test(ch)) {
-            advance();
-            continue;
-        }
-        if (ch === '/' && text[i + 1] === '/') {
-            while (i < text.length && text[i] !== '\n') advance();
-            continue;
-        }
-        if (ch === '/' && text[i + 1] === '*') {
-            advance();
-            advance();
-            while (i < text.length) {
-                if (text[i] === '*' && text[i + 1] === '/') {
-                    advance();
-                    advance();
-                    break;
-                }
-                if (text[i] === '\n') {
-                    const start = i;
-                    const startLine = line;
-                    const startCharacter = character;
-                    advance();
-                    push('newline', '\n', start, startLine, startCharacter);
-                } else {
-                    advance();
-                }
-            }
-            continue;
-        }
-
-        const start = i;
-        const startLine = line;
-        const startCharacter = character;
-        if (isIdentStart(ch)) {
-            advance();
-            while (i < text.length && isIdentPart(text[i])) advance();
-            push('identifier', text.slice(start, i), start, startLine, startCharacter);
-            continue;
-        }
-        if (/[0-9]/.test(ch)) {
-            advance();
-            while (i < text.length && /[A-Za-z0-9_.]/.test(text[i])) advance();
-            push('number', text.slice(start, i), start, startLine, startCharacter);
-            continue;
-        }
-        if (ch === '"' || ch === "'" || ch === '`') {
-            const quote = advance();
-            while (i < text.length) {
-                const current = advance();
-                if (quote !== '`' && current === '\\' && i < text.length) {
-                    advance();
-                    continue;
-                }
-                if (current === quote) break;
-            }
-            push('string', text.slice(start, i), start, startLine, startCharacter);
-            continue;
-        }
-
-        const three = text.slice(i, i + 3);
-        const two = text.slice(i, i + 2);
-        if (three === '...') {
-            advance();
-            advance();
-            advance();
-            push('punctuation', three, start, startLine, startCharacter);
-            continue;
-        }
-        if (['<-', ':=', '==', '!=', '<=', '>=', '&&', '||', '<<', '>>', '&^', '++', '--'].includes(two)) {
-            advance();
-            advance();
-            push('punctuation', two, start, startLine, startCharacter);
-            continue;
-        }
-        advance();
-        push('punctuation', ch, start, startLine, startCharacter);
+function decodeImportPath(node) {
+    if (!node) return '';
+    const text = node.text;
+    if (text.startsWith('`')) return text.slice(1, -1);
+    try {
+        return JSON.parse(text);
+    } catch (_) {
+        return text.replace(/^"|"$/g, '');
     }
-    return tokens;
+}
+
+function extractImports(root) {
+    const imports = new Map();
+    for (const declaration of namedChildren(root)) {
+        if (declaration.type !== 'import_declaration') continue;
+        for (const spec of declaration.descendantsOfType('import_spec').filter(Boolean)) {
+            const importPath = decodeImportPath(field(spec, 'path'));
+            if (!importPath) continue;
+            const name = field(spec, 'name');
+            const alias = name ? name.text : defaultImportAlias(importPath);
+            if (alias && alias !== '_' && alias !== '.') imports.set(alias, importPath);
+        }
+    }
+    return imports;
+}
+
+function canonicalQualifiedType(node, packageName, imports) {
+    const qualifier = field(node, 'package');
+    const name = field(node, 'name');
+    if (!qualifier || !name) return node.text.replace(/\s+/g, '');
+    if (qualifier.text === packageName) return name.text;
+    const importPath = imports.get(qualifier.text);
+    return importPath ? `@{${importPath}}.${name.text}` : `${qualifier.text}.${name.text}`;
+}
+
+function normalizeParameterSlots(node, packageName, imports) {
+    if (!node) return [];
+    const slots = [];
+    for (const declaration of namedChildren(node)) {
+        if (
+            declaration.type !== 'parameter_declaration' &&
+            declaration.type !== 'variadic_parameter_declaration'
+        ) {
+            continue;
+        }
+        const type = field(declaration, 'type');
+        if (!type) continue;
+        const normalized =
+            (declaration.type === 'variadic_parameter_declaration' ? '...' : '') +
+            normalizeTypeNode(type, packageName, imports);
+        const count = Math.max(1, fields(declaration, 'name').length);
+        for (let i = 0; i < count; i++) slots.push(normalized);
+    }
+    return slots;
+}
+
+function normalizeMethodSignature(node, packageName, imports) {
+    const parameters = normalizeParameterSlots(field(node, 'parameters'), packageName, imports);
+    const result = field(node, 'result');
+    const results = result
+        ? result.type === 'parameter_list'
+            ? normalizeParameterSlots(result, packageName, imports)
+            : [normalizeTypeNode(result, packageName, imports)]
+        : [];
+    return `(${parameters.join(',')})(${results.join(',')})`;
+}
+
+function normalizeFunctionType(node, packageName, imports) {
+    const parameters = normalizeParameterSlots(field(node, 'parameters'), packageName, imports);
+    const result = field(node, 'result');
+    if (!result) return `func(${parameters.join(',')})`;
+    if (result.type === 'parameter_list') {
+        return `func(${parameters.join(',')})(${normalizeParameterSlots(result, packageName, imports).join(',')})`;
+    }
+    return `func(${parameters.join(',')})${normalizeTypeNode(result, packageName, imports)}`;
+}
+
+function normalizeInterfaceType(node, packageName, imports) {
+    const members = [];
+    for (const member of namedChildren(node)) {
+        if (member.type === 'method_elem') {
+            const name = field(member, 'name');
+            if (name) {
+                members.push(
+                    `${name.text}${normalizeMethodSignature(member, packageName, imports)}`
+                );
+            }
+        } else if (member.type === 'type_elem') {
+            members.push(normalizeTypeNode(member, packageName, imports));
+        }
+    }
+    members.sort();
+    return `interface{${members.join(';')}}`;
+}
+
+function normalizeStructField(node, packageName, imports) {
+    const type = field(node, 'type');
+    if (!type) return [];
+    const normalizedType = normalizeTypeNode(type, packageName, imports);
+    const tag = field(node, 'tag');
+    const suffix = tag ? tag.text : '';
+    const names = fields(node, 'name');
+    if (names.length === 0) return [`${normalizedType}${suffix}`];
+    return names.map((name) => `${name.text} ${normalizedType}${suffix}`);
+}
+
+function normalizeStructType(node, packageName, imports) {
+    const list = namedChildren(node).find((child) => child.type === 'field_declaration_list');
+    const members = [];
+    for (const declaration of namedChildren(list)) {
+        if (declaration.type === 'field_declaration') {
+            members.push(...normalizeStructField(declaration, packageName, imports));
+        }
+    }
+    return `struct{${members.join(';')}}`;
+}
+
+function normalizeTypeNode(node, packageName, imports) {
+    if (!node) return '';
+    if (node.type === 'qualified_type') {
+        return canonicalQualifiedType(node, packageName, imports);
+    }
+    if (node.type === 'function_type') {
+        return normalizeFunctionType(node, packageName, imports);
+    }
+    if (node.type === 'interface_type') {
+        return normalizeInterfaceType(node, packageName, imports);
+    }
+    if (node.type === 'struct_type') {
+        return normalizeStructType(node, packageName, imports);
+    }
+    if (node.childCount === 0) return node.text.replace(/\s+/g, '');
+
+    const parts = [];
+    for (const child of node.children.filter(Boolean)) {
+        if (child.type === 'comment') continue;
+        parts.push(
+            child.isNamed
+                ? normalizeTypeNode(child, packageName, imports)
+                : child.text.replace(/\s+/g, '')
+        );
+    }
+    return parts.join('');
+}
+
+function canonicalNamedReference(node, imports, state) {
+    if (!node) return null;
+    const info = state || { pointer: false, generic: false };
+    if (node.type === 'pointer_type') {
+        info.pointer = true;
+        return canonicalNamedReference(node.firstNamedChild, imports, info);
+    }
+    if (node.type === 'generic_type') {
+        info.generic = true;
+        return canonicalNamedReference(field(node, 'type'), imports, info);
+    }
+    if (node.type === 'parenthesized_type') {
+        return canonicalNamedReference(node.firstNamedChild, imports, info);
+    }
+    if (node.type === 'qualified_type') {
+        const qualifier = field(node, 'package');
+        const name = field(node, 'name');
+        if (!qualifier || !name) return null;
+        const importPath = imports.get(qualifier.text);
+        return {
+            name: importPath ? `@{${importPath}}.${name.text}` : `${qualifier.text}.${name.text}`,
+            ...info,
+        };
+    }
+    if (node.type === 'type_identifier') return { name: node.text, ...info };
+    return null;
 }
 
 function newTypeEntry(line, character) {
@@ -140,338 +210,57 @@ function newTypeEntry(line, character) {
     };
 }
 
-function significant(tokens, index) {
-    let i = index;
-    while (i < tokens.length && tokens[i].kind === 'newline') i += 1;
-    return i;
-}
-
-function matching(tokens, openIndex, open, close) {
-    let depth = 0;
-    for (let i = openIndex; i < tokens.length; i++) {
-        if (tokens[i].value === open) depth += 1;
-        else if (tokens[i].value === close) {
-            depth -= 1;
-            if (depth === 0) return i;
-        }
-    }
-    return tokens.length - 1;
-}
-
-const TYPE_PREFIX_KEYWORDS = new Set(['chan', 'map', 'func', 'struct', 'interface']);
-
-function splitTopLevelTokens(tokens, delimiter) {
-    const parts = [];
-    let start = 0;
-    let paren = 0;
-    let bracket = 0;
-    let brace = 0;
-    for (let i = 0; i < tokens.length; i++) {
-        const value = tokens[i].value;
-        if (value === '(') paren += 1;
-        else if (value === ')') paren -= 1;
-        else if (value === '[') bracket += 1;
-        else if (value === ']') bracket -= 1;
-        else if (value === '{') brace += 1;
-        else if (value === '}') brace -= 1;
-        else if (value === delimiter && paren === 0 && bracket === 0 && brace === 0) {
-            parts.push(tokens.slice(start, i));
-            start = i + 1;
-        }
-    }
-    parts.push(tokens.slice(start));
-    return parts.map((part) => part.filter((token) => token.kind !== 'newline'));
-}
-
-function classifyField(tokens) {
-    if (tokens.length === 1 && tokens[0].kind === 'identifier') return { kind: 'bare', tokens };
-    const first = tokens[0];
-    const second = tokens[1];
-    if (!first || first.kind !== 'identifier' || !second || TYPE_PREFIX_KEYWORDS.has(first.value)) {
-        return { kind: 'type', tokens };
-    }
-
-    // A selector or a complete generic instantiation starts with an unnamed
-    // type. Every other valid token after an identifier starts the type of a
-    // named field: x *T, x []T, x <-chan T, x q.T, x Box[T], and so on.
-    if (second.value === '.') return { kind: 'type', tokens };
-    if (second.value === '[') {
-        const close = matching(tokens, 1, '[', ']');
-        if (close === tokens.length - 1) return { kind: 'type', tokens };
-    }
-    return { kind: 'named', tokens: tokens.slice(1) };
-}
-
-function appendCanonical(out, state, text, startsWord, endsWord) {
-    if (state.word && startsWord) out.push(' ');
-    out.push(text);
-    state.word = endsWord;
-}
-
-function normalizeInterfaceTokens(tokens, openIndex, closeIndex, packageName, imports) {
-    const members = [];
-    for (const member of splitMembers(tokens, openIndex + 1, closeIndex)) {
-        if (member[0] && member[0].kind === 'identifier' && member[1] && member[1].value === '(') {
-            members.push(
-                member[0].value +
-                    normalizeSignatureTokens(member, 1, member.length, packageName, imports)
-            );
-        } else {
-            members.push(normalizeTypeTokens(member, packageName, imports));
-        }
-    }
-    // Method and embedded-type order does not participate in interface type
-    // identity. Sorting also makes differently formatted literals compare.
-    members.sort();
-    return `interface{${members.join(';')}}`;
-}
-
-function normalizeTypeTokens(tokens, packageName, imports) {
-    const out = [];
-    const state = { word: false };
-    for (let i = 0; i < tokens.length;) {
-        const token = tokens[i];
-        if (token.kind === 'newline') {
-            i += 1;
-            continue;
-        }
-
-        if (token.value === 'func') {
-            const open = significant(tokens, i + 1);
-            if (tokens[open] && tokens[open].value === '(') {
-                const close = matching(tokens, open, '(', ')');
-                appendCanonical(out, state, 'func', true, true);
-                appendCanonical(
-                    out,
-                    state,
-                    `(${normalizeFieldList(tokens.slice(open + 1, close), packageName, imports)})`,
-                    false,
-                    false
-                );
-                i = close + 1;
-                const result = significant(tokens, i);
-                if (tokens[result] && tokens[result].value === '(') {
-                    const resultClose = matching(tokens, result, '(', ')');
-                    appendCanonical(
-                        out,
-                        state,
-                        `(${normalizeFieldList(tokens.slice(result + 1, resultClose), packageName, imports)})`,
-                        false,
-                        false
-                    );
-                    i = resultClose + 1;
-                }
-                continue;
-            }
-        }
-
-        if (token.value === 'interface') {
-            const open = significant(tokens, i + 1);
-            if (tokens[open] && tokens[open].value === '{') {
-                const close = matching(tokens, open, '{', '}');
-                appendCanonical(
-                    out,
-                    state,
-                    normalizeInterfaceTokens(tokens, open, close, packageName, imports),
-                    true,
-                    false
-                );
-                i = close + 1;
-                continue;
-            }
-        }
-
-        if (
-            token.kind === 'identifier' &&
-            tokens[i + 1] && tokens[i + 1].value === '.' &&
-            tokens[i + 2] && tokens[i + 2].kind === 'identifier'
-        ) {
-            const target = tokens[i + 2].value;
-            const importPath = imports && imports.get(token.value);
-            const qualified = token.value === packageName
-                ? target
-                : importPath
-                    ? `@{${importPath}}.${target}`
-                    : `${token.value}.${target}`;
-            appendCanonical(out, state, qualified, true, true);
-            i += 3;
-            continue;
-        }
-
-        const word = token.kind === 'identifier' || token.kind === 'number' || token.kind === 'string';
-        appendCanonical(out, state, token.value, word, word);
-        i += 1;
-    }
-    return out.join('');
-}
-
-function normalizeFieldList(tokens, packageName, imports) {
-    const fields = splitTopLevelTokens(tokens, ',').filter((field) => field.length > 0);
-    if (fields.length === 0) return '';
-    const classified = fields.map(classifyField);
-    const usesNames = classified.some((field) => field.kind === 'named');
-    const types = new Array(classified.length);
-    let sharedType = null;
-    for (let i = classified.length - 1; i >= 0; i--) {
-        const field = classified[i];
-        if (field.kind === 'named') {
-            sharedType = normalizeTypeTokens(field.tokens, packageName, imports);
-            types[i] = sharedType;
-        } else if (usesNames && field.kind === 'bare' && sharedType !== null) {
-            types[i] = sharedType;
-        } else {
-            types[i] = normalizeTypeTokens(field.tokens, packageName, imports);
-        }
-    }
-    return types.join(',');
-}
-
-function normalizeSignatureTokens(tokens, openIndex, endIndex, packageName, imports) {
-    const paramsClose = matching(tokens, openIndex, '(', ')');
-    const params = normalizeFieldList(tokens.slice(openIndex + 1, paramsClose), packageName, imports);
-    const resultIndex = significant(tokens, paramsClose + 1);
-    if (resultIndex >= endIndex) return `(${params})()`;
-    if (tokens[resultIndex] && tokens[resultIndex].value === '(') {
-        const resultClose = matching(tokens, resultIndex, '(', ')');
-        return `(${params})(${normalizeFieldList(tokens.slice(resultIndex + 1, resultClose), packageName, imports)})`;
-    }
-    return `(${params})(${normalizeTypeTokens(tokens.slice(resultIndex, endIndex), packageName, imports)})`;
-}
-
-function canonicalReference(parts, imports) {
-    const significantParts = parts.filter((token) => token.kind !== 'newline');
-    let pointer = false;
-    while (
-        significantParts[0] &&
-        (significantParts[0].value === '*' || significantParts[0].value === '(')
-    ) {
-        if (significantParts.shift().value === '*') pointer = true;
-    }
-    const values = significantParts.map((token) => token.value);
-    const identifiers = [];
-    for (let i = 0; i < values.length; i++) {
-        if (significantParts[i] && significantParts[i].kind === 'identifier') {
-            identifiers.push({ value: values[i], index: i });
-        }
-        if (values[i] === '[') break;
-    }
-    if (identifiers.length === 0) return null;
-    let name;
-    if (
-        identifiers.length >= 2 &&
-        values[identifiers[0].index + 1] === '.' &&
-        identifiers[1].index === identifiers[0].index + 2
-    ) {
-        const qualifier = identifiers[0].value;
-        const importPath = imports.get(qualifier);
-        name = importPath ? `@{${importPath}}.${identifiers[1].value}` : `${qualifier}.${identifiers[1].value}`;
-    } else {
-        name = identifiers[0].value;
-    }
-    return { name, pointer, generic: values.includes('[') };
-}
-
-function canonicalNamedReference(parts, imports) {
-    const tokens = parts.filter((token) => token.kind !== 'newline');
-    let start = 0;
-    let end = tokens.length;
-    while (tokens[start] && tokens[start].value === '(' && tokens[end - 1] && tokens[end - 1].value === ')') {
-        const close = matching(tokens, start, '(', ')');
-        if (close !== end - 1) break;
-        start += 1;
-        end -= 1;
-    }
-    if (tokens[start] && tokens[start].value === '*') start += 1;
-    if (!tokens[start] || tokens[start].kind !== 'identifier') return null;
-    let cursor = start + 1;
-    if (
-        tokens[cursor] && tokens[cursor].value === '.' &&
-        tokens[cursor + 1] && tokens[cursor + 1].kind === 'identifier'
-    ) {
-        cursor += 2;
-    }
-    if (tokens[cursor] && tokens[cursor].value === '[') {
-        cursor = matching(tokens, cursor, '[', ']') + 1;
-    }
-    if (cursor !== end) return null;
-    return canonicalReference(tokens.slice(0, end), imports);
-}
-
-function splitMembers(tokens, start, end) {
-    const members = [];
-    let memberStart = start;
-    let paren = 0;
-    let bracket = 0;
-    let brace = 0;
-    for (let i = start; i < end; i++) {
-        const value = tokens[i].value;
-        if (value === '(') paren += 1;
-        else if (value === ')') paren -= 1;
-        else if (value === '[') bracket += 1;
-        else if (value === ']') bracket -= 1;
-        else if (value === '{') brace += 1;
-        else if (value === '}') brace -= 1;
-        const separator = (tokens[i].kind === 'newline' || value === ';') && paren === 0 && bracket === 0 && brace === 0;
-        if (separator) {
-            if (memberStart < i) members.push(tokens.slice(memberStart, i));
-            memberStart = i + 1;
-        }
-    }
-    if (memberStart < end) members.push(tokens.slice(memberStart, end));
-    return members.map((member) => member.filter((token) => token.kind !== 'newline')).filter((member) => member.length > 0);
-}
-
-function normalizedMethodSignature(tokens, openIndex, endIndex, packageName, imports) {
-    return normalizeSignatureTokens(tokens, openIndex, endIndex, packageName, imports);
-}
-
-function parseInterfaceBody(tokens, openIndex, closeIndex, packageName, imports) {
+function parseInterfaceType(typeNode, generic, packageName, imports) {
     const methods = new Map();
     const methodLines = new Map();
     const methodCharacters = new Map();
     const embeds = [];
     const genericEmbeds = new Set();
     let constraint = false;
-    for (const member of splitMembers(tokens, openIndex + 1, closeIndex)) {
-        const first = member[0];
-        if (!first) continue;
-        if (member.some((token) => token.value === '|' || token.value === '~')) constraint = true;
-        if (first.kind === 'identifier' && member[1] && member[1].value === '(') {
-            methods.set(
-                first.value,
-                normalizedMethodSignature(member, 1, member.length, packageName, imports)
-            );
-            methodLines.set(first.value, first.line);
-            methodCharacters.set(first.value, first.character);
+
+    for (const member of namedChildren(typeNode)) {
+        if (member.type === 'method_elem') {
+            const name = field(member, 'name');
+            if (!name) continue;
+            methods.set(name.text, normalizeMethodSignature(member, packageName, imports));
+            methodLines.set(name.text, name.startPosition.row);
+            methodCharacters.set(name.text, name.startPosition.column);
             continue;
         }
-        const reference = canonicalReference(member, imports);
-        if (reference) {
-            embeds.push(reference.name);
-            if (reference.generic) genericEmbeds.add(reference.name);
+        if (member.type !== 'type_elem') continue;
+        if (member.text.includes('|') || member.descendantsOfType('negated_type').length > 0) {
+            constraint = true;
         }
+        const type = member.firstNamedChild;
+        const reference = canonicalNamedReference(type, imports);
+        if (!reference) continue;
+        embeds.push(reference.name);
+        if (reference.generic) genericEmbeds.add(reference.name);
     }
-    return { methods, methodLines, methodCharacters, embeds, genericEmbeds, constraint };
+
+    return {
+        generic,
+        methods,
+        methodLines,
+        methodCharacters,
+        embeds,
+        genericEmbeds,
+        constraint,
+    };
 }
 
-function parseStructBody(tokens, openIndex, closeIndex, imports) {
+function parseStructType(typeNode, imports) {
     const embeds = [];
     const pointerEmbeds = new Set();
     const genericEmbeds = new Set();
-    for (const member of splitMembers(tokens, openIndex + 1, closeIndex)) {
-        const withoutTag = member.filter((token) => token.kind !== 'string');
-        if (withoutTag.length === 0) continue;
-        const reference = canonicalReference(withoutTag, imports);
+    const list = namedChildren(typeNode).find((child) => child.type === 'field_declaration_list');
+    for (const declaration of namedChildren(list)) {
+        if (declaration.type !== 'field_declaration' || fields(declaration, 'name').length > 0) {
+            continue;
+        }
+        const reference = canonicalNamedReference(field(declaration, 'type'), imports);
         if (!reference) continue;
-
-        const identifiersBeforeTypeArgs = withoutTag.filter(
-            (token, index) =>
-                token.kind === 'identifier' &&
-                withoutTag.slice(0, index).every((previous) => previous.value !== '[')
-        );
-        const qualified = withoutTag.some((token) => token.value === '.');
-        const expectedIdentifiers = qualified ? 2 : 1;
-        if (identifiersBeforeTypeArgs.length !== expectedIdentifiers) continue;
+        if (declaration.text.trimStart().startsWith('*')) reference.pointer = true;
         embeds.push(reference.name);
         if (reference.pointer) pointerEmbeds.add(reference.name);
         if (reference.generic) genericEmbeds.add(reference.name);
@@ -479,264 +268,101 @@ function parseStructBody(tokens, openIndex, closeIndex, imports) {
     return { embeds, pointerEmbeds, genericEmbeds };
 }
 
-function receiverInfo(tokens, openIndex, closeIndex) {
-    const receiver = tokens.slice(openIndex + 1, closeIndex).filter((token) => token.kind !== 'newline');
-    const star = receiver.findIndex((token) => token.value === '*');
-    if (star >= 0) {
-        const type = receiver.slice(star + 1).find((token) => token.kind === 'identifier');
-        return type ? { name: type.value, pointer: true } : null;
-    }
-    const identifiers = receiver.filter((token) => token.kind === 'identifier');
-    if (identifiers.length === 0) return null;
-    const type = identifiers.length > 1 ? identifiers[1] : identifiers[0];
-    return { name: type.value, pointer: false };
+function packageNameFromRoot(root) {
+    const clause = namedChildren(root).find((node) => node.type === 'package_clause');
+    const name = clause && clause.firstNamedChild;
+    return name ? name.text : null;
 }
 
-function typeExpressionEnd(tokens, startIndex) {
-    const start = significant(tokens, startIndex);
-    const token = tokens[start];
-    if (!token) return start;
-
-    if (token.value === '(') return matching(tokens, start, '(', ')') + 1;
-    if (token.value === '*') return typeExpressionEnd(tokens, start + 1);
-    if (token.value === '[') {
-        const close = matching(tokens, start, '[', ']');
-        return typeExpressionEnd(tokens, close + 1);
-    }
-    if (token.value === 'map') {
-        const open = significant(tokens, start + 1);
-        if (!tokens[open] || tokens[open].value !== '[') return start + 1;
-        return typeExpressionEnd(tokens, matching(tokens, open, '[', ']') + 1);
-    }
-    if (token.value === 'chan') {
-        let element = significant(tokens, start + 1);
-        if (tokens[element] && tokens[element].value === '<-') {
-            element = significant(tokens, element + 1);
-        }
-        return typeExpressionEnd(tokens, element);
-    }
-    if (token.value === '<-') {
-        const channel = significant(tokens, start + 1);
-        if (tokens[channel] && tokens[channel].value === 'chan') {
-            return typeExpressionEnd(tokens, channel + 1);
-        }
-        return start + 1;
-    }
-    if (token.value === 'func') {
-        const open = significant(tokens, start + 1);
-        if (!tokens[open] || tokens[open].value !== '(') return start + 1;
-        const paramsEnd = matching(tokens, open, '(', ')') + 1;
-        const result = significant(tokens, paramsEnd);
-        if (!tokens[result] || ['{', ';', '}'].includes(tokens[result].value)) return paramsEnd;
-        if (tokens[result].value === '(') return matching(tokens, result, '(', ')') + 1;
-        return typeExpressionEnd(tokens, result);
-    }
-    if (token.value === 'interface' || token.value === 'struct') {
-        const open = significant(tokens, start + 1);
-        return tokens[open] && tokens[open].value === '{'
-            ? matching(tokens, open, '{', '}') + 1
-            : start + 1;
-    }
-
-    if (token.kind !== 'identifier') return start + 1;
-    let end = significant(tokens, start + 1);
-    if (
-        tokens[end] && tokens[end].value === '.' &&
-        tokens[significant(tokens, end + 1)] &&
-        tokens[significant(tokens, end + 1)].kind === 'identifier'
-    ) {
-        end = significant(tokens, end + 1) + 1;
-    }
-    end = significant(tokens, end);
-    if (tokens[end] && tokens[end].value === '[') {
-        return matching(tokens, end, '[', ']') + 1;
-    }
-    return end;
-}
-
-function signatureEnd(tokens, openIndex) {
-    const paramsClose = matching(tokens, openIndex, '(', ')');
-    const result = significant(tokens, paramsClose + 1);
-    if (!tokens[result] || ['{', ';', '}'].includes(tokens[result].value)) {
-        return paramsClose + 1;
-    }
-    if (tokens[result].value === '(') return matching(tokens, result, '(', ')') + 1;
-    return typeExpressionEnd(tokens, result);
-}
-
-function parseGoFile(text) {
-    const tokens = tokenizeGo(text);
-    const imports = extractImportAliases(text);
+function buildDeclarationIR(root) {
+    const packageName = packageNameFromRoot(root);
+    const imports = extractImports(root);
     const interfaces = new Map();
     const types = new Map();
     const aliases = new Map();
-    let packageName = null;
 
-    const ensureType = (name, token) => {
-        if (!types.has(name)) types.set(name, newTypeEntry(token.line, token.character));
+    const ensureType = (name, location) => {
+        if (!types.has(name)) {
+            types.set(name, newTypeEntry(location.startPosition.row, location.startPosition.column));
+        }
         return types.get(name);
     };
 
-    const parseTypeSpec = (start, grouped) => {
-        let i = significant(tokens, start);
-        const nameToken = tokens[i];
-        if (!nameToken || nameToken.kind !== 'identifier') return i + 1;
-        const name = nameToken.value;
-        i = significant(tokens, i + 1);
-        let generic = false;
-        if (tokens[i] && tokens[i].value === '[') {
-            generic = true;
-            i = significant(tokens, matching(tokens, i, '[', ']') + 1);
-        }
-        let alias = false;
-        if (tokens[i] && tokens[i].value === '=') {
-            alias = true;
-            i = significant(tokens, i + 1);
-        }
-        const kind = tokens[i] && tokens[i].value;
-        if (kind === 'interface') {
-            const open = significant(tokens, i + 1);
-            if (!tokens[open] || tokens[open].value !== '{') return open;
-            const close = matching(tokens, open, '{', '}');
-            const body = parseInterfaceBody(tokens, open, close, packageName, imports);
-            interfaces.set(name, {
-                line: nameToken.line,
-                character: nameToken.character,
-                generic,
-                ...body,
-            });
-            return close + 1;
-        }
-        if (kind === 'struct') {
-            const open = significant(tokens, i + 1);
-            const entry = ensureType(name, nameToken);
-            entry.declared = true;
-            entry.struct = true;
-            entry.line = nameToken.line;
-            entry.character = nameToken.character;
-            if (tokens[open] && tokens[open].value === '{') {
-                const close = matching(tokens, open, '{', '}');
-                const body = parseStructBody(tokens, open, close, imports);
-                entry.embeds = body.embeds;
-                entry.pointerEmbeds = body.pointerEmbeds;
-                entry.genericEmbeds = body.genericEmbeds;
-                return close + 1;
+    for (const declaration of namedChildren(root)) {
+        if (declaration.type === 'type_declaration') {
+            for (const spec of namedChildren(declaration)) {
+                if (spec.type !== 'type_spec' && spec.type !== 'type_alias') continue;
+                const nameNode = field(spec, 'name');
+                const typeNode = field(spec, 'type');
+                if (!nameNode || !typeNode) continue;
+                const generic = !!field(spec, 'type_parameters');
+
+                if (typeNode.type === 'interface_type') {
+                    interfaces.set(nameNode.text, {
+                        line: nameNode.startPosition.row,
+                        character: nameNode.startPosition.column,
+                        ...parseInterfaceType(typeNode, generic, packageName, imports),
+                    });
+                    continue;
+                }
+
+                const entry = ensureType(nameNode.text, nameNode);
+                entry.declared = true;
+                entry.line = nameNode.startPosition.row;
+                entry.character = nameNode.startPosition.column;
+                if (typeNode.type === 'struct_type') {
+                    entry.struct = true;
+                    Object.assign(entry, parseStructType(typeNode, imports));
+                }
+                if (spec.type === 'type_alias') {
+                    aliases.set(nameNode.text, normalizeTypeNode(typeNode, packageName, imports));
+                    const reference = canonicalNamedReference(typeNode, imports);
+                    if (reference) {
+                        entry.embeds = [reference.name];
+                        if (reference.pointer) entry.pointerEmbeds.add(reference.name);
+                        if (reference.generic) entry.genericEmbeds.add(reference.name);
+                    }
+                }
             }
-            return open;
+            continue;
         }
 
-        const entry = ensureType(name, nameToken);
-        entry.declared = true;
-        entry.line = nameToken.line;
-        entry.character = nameToken.character;
-        let end = i;
-        let paren = 0;
-        let bracket = 0;
-        let brace = 0;
-        for (; end < tokens.length; end++) {
-            if (tokens[end].value === '(') paren += 1;
-            else if (tokens[end].value === ')') {
-                if (grouped && paren === 0 && bracket === 0 && brace === 0) break;
-                paren -= 1;
-            } else if (tokens[end].value === '[') bracket += 1;
-            else if (tokens[end].value === ']') bracket -= 1;
-            else if (tokens[end].value === '{') brace += 1;
-            else if (tokens[end].value === '}') brace -= 1;
-            if (
-                paren === 0 && bracket === 0 && brace === 0 &&
-                (tokens[end].kind === 'newline' || tokens[end].value === ';')
-            ) {
-                break;
-            }
-        }
-        if (alias) {
-            const aliasTokens = tokens.slice(i, end);
-            const reference = canonicalNamedReference(aliasTokens, imports);
-            aliases.set(name, normalizeTypeTokens(aliasTokens, packageName, imports));
-            if (reference) {
-                entry.embeds = [reference.name];
-                if (reference.pointer) entry.pointerEmbeds.add(reference.name);
-                if (reference.generic) entry.genericEmbeds.add(reference.name);
-            }
-        }
-        return end;
-    };
-
-    let i = 0;
-    while (i < tokens.length) {
-        i = significant(tokens, i);
-        const token = tokens[i];
-        if (!token) break;
-        if (token.value === 'package') {
-            const name = tokens[significant(tokens, i + 1)];
-            if (name && name.kind === 'identifier') packageName = name.value;
-            i += 2;
-            continue;
-        }
-        if (token.value === 'type') {
-            let next = significant(tokens, i + 1);
-            if (tokens[next] && tokens[next].value === '(') {
-                const close = matching(tokens, next, '(', ')');
-                next += 1;
-                while (next < close) next = parseTypeSpec(next, true);
-                i = close + 1;
-            } else {
-                i = parseTypeSpec(next, false);
-            }
-            continue;
-        }
-        if (token.value === 'func') {
-            let next = significant(tokens, i + 1);
-            if (!tokens[next] || tokens[next].value !== '(') {
-                const nameIndex = next;
-                let open = significant(tokens, nameIndex + 1);
-                if (tokens[open] && tokens[open].value === '[') {
-                    open = significant(tokens, matching(tokens, open, '[', ']') + 1);
-                }
-                if (tokens[open] && tokens[open].value === '(') {
-                    const end = signatureEnd(tokens, open);
-                    const body = significant(tokens, end);
-                    i = tokens[body] && tokens[body].value === '{'
-                        ? matching(tokens, body, '{', '}') + 1
-                        : end;
-                } else {
-                    i += 1;
-                }
-                continue;
-            }
-            const receiverClose = matching(tokens, next, '(', ')');
-            const receiver = receiverInfo(tokens, next, receiverClose);
-            const methodIndex = significant(tokens, receiverClose + 1);
-            const methodToken = tokens[methodIndex];
-            if (!receiver || !methodToken || methodToken.kind !== 'identifier') {
-                i = receiverClose + 1;
-                continue;
-            }
-            let open = significant(tokens, methodIndex + 1);
-            if (tokens[open] && tokens[open].value === '[') open = significant(tokens, matching(tokens, open, '[', ']') + 1);
-            if (!tokens[open] || tokens[open].value !== '(') {
-                i = methodIndex + 1;
-                continue;
-            }
-            const end = signatureEnd(tokens, open);
-            const entry = ensureType(receiver.name, methodToken);
-            entry.methods.set(
-                methodToken.value,
-                normalizedMethodSignature(tokens, open, end, packageName, imports)
-            );
-            entry.methodLines.set(methodToken.value, methodToken.line);
-            entry.methodCharacters.set(methodToken.value, methodToken.character);
-            if (receiver.pointer) entry.pointerMethods.add(methodToken.value);
-            const body = significant(tokens, end);
-            i = tokens[body] && tokens[body].value === '{'
-                ? matching(tokens, body, '{', '}') + 1
-                : end;
-            continue;
-        }
-        i += 1;
+        if (declaration.type !== 'method_declaration') continue;
+        const receiver = field(declaration, 'receiver');
+        const receiverDeclaration = namedChildren(receiver)[0];
+        const receiverType = receiverDeclaration && field(receiverDeclaration, 'type');
+        const receiverInfo = canonicalNamedReference(receiverType, imports);
+        const methodName = field(declaration, 'name');
+        if (!receiverInfo || !methodName || receiverInfo.name.includes('.')) continue;
+        const entry = ensureType(receiverInfo.name, methodName);
+        entry.methods.set(
+            methodName.text,
+            normalizeMethodSignature(declaration, packageName, imports)
+        );
+        entry.methodLines.set(methodName.text, methodName.startPosition.row);
+        entry.methodCharacters.set(methodName.text, methodName.startPosition.column);
+        if (receiverInfo.pointer) entry.pointerMethods.add(methodName.text);
     }
 
-    return { syntax: 'declaration-ast-v1', packageName, imports, aliases, interfaces, types };
+    return {
+        syntax: 'declaration-ast-v1',
+        parser: 'tree-sitter-go-wasm',
+        hasSyntaxError: root.hasError,
+        packageName,
+        imports,
+        aliases,
+        interfaces,
+        types,
+    };
+}
+
+async function parseGoFile(text) {
+    const tree = await parseGoSyntaxTree(text);
+    try {
+        return buildDeclarationIR(tree.rootNode);
+    } finally {
+        tree.delete();
+    }
 }
 
 function mapToEntries(map, valueMapper) {
@@ -755,6 +381,8 @@ function serializeParsedFile(parsed) {
     });
     return {
         syntax: parsed.syntax,
+        parser: parsed.parser,
+        hasSyntaxError: !!parsed.hasSyntaxError,
         packageName: parsed.packageName,
         imports: mapToEntries(parsed.imports),
         aliases: mapToEntries(parsed.aliases),
@@ -775,6 +403,8 @@ function deserializeParsedFile(serialized) {
     });
     return {
         syntax: serialized.syntax,
+        parser: serialized.parser,
+        hasSyntaxError: !!serialized.hasSyntaxError,
         packageName: serialized.packageName,
         imports: new Map(serialized.imports || []),
         aliases: new Map(serialized.aliases || []),
@@ -784,8 +414,8 @@ function deserializeParsedFile(serialized) {
 }
 
 module.exports = {
-    tokenizeGo,
     parseGoFile,
+    buildDeclarationIR,
     serializeParsedFile,
     deserializeParsedFile,
 };

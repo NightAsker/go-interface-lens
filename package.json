@@ -2,7 +2,7 @@
   "name": "go-interface-lens",
   "displayName": "Go Interface Lens",
   "description": "Fast bidirectional CodeLens navigation between Go interfaces and their implementations",
-  "version": "1.1.6",
+  "version": "1.2.1",
   "publisher": "xiaoyao",
   "author": {
     "name": "xiaoyao"
@@ -10,7 +10,7 @@
   "license": "MIT",
   "icon": "icon.png",
   "engines": {
-    "vscode": "^1.60.0"
+    "vscode": "^1.76.0"
   },
   "categories": [
     "Programming Languages",
@@ -115,9 +115,9 @@
     }
   },
   "scripts": {
-    "test": "node test/parser.test.js && node test/ast.test.js && node test/ast-cache.test.js && node test/indexer.test.js && node test/lazy-index.test.js && node test/lazy-deps.test.js && node test/performance.test.js && node test/build.test.js && node test/search.test.js && node test/multiroot.test.js && node test/deps.test.js && node test/gomod.test.js && node test/deps-version.test.js && node test/deps-crosspkg.test.js && node test/progress.test.js && node test/gotolens.test.js",
-    "package": "vsce package",
-    "publish": "vsce publish"
+    "test": "node test/tree-sitter.test.js && node test/ast.test.js && node test/signatures.test.js && node test/ast-cache.test.js && node test/indexer.test.js && node test/lazy-index.test.js && node test/lazy-deps.test.js && node test/performance.test.js && node test/build.test.js && node test/search.test.js && node test/multiroot.test.js && node test/deps.test.js && node test/gomod.test.js && node test/deps-version.test.js && node test/deps-crosspkg.test.js && node test/progress.test.js && node test/gotolens.test.js",
+    "package": "vsce package --no-dependencies",
+    "publish": "vsce publish --no-dependencies"
   },
   "repository": {
     "type": "git",
@@ -138,5 +138,8 @@
   "galleryBanner": {
     "color": "#00ADD8",
     "theme": "dark"
+  },
+  "devDependencies": {
+    "@vscode/tree-sitter-wasm": "0.3.1"
   }
 }

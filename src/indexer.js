@@ -6,13 +6,12 @@ const path = require('path');
 const { execFile } = require('child_process');
 
 const {
-    parseFile,
     resolveInterfaceMethods,
     satisfies,
     looseSignatureEqual,
     splitNormalizedSignature,
     BUILTIN_INTERFACES,
-} = require('./parser');
+} = require('./signatures');
 const { listGoFiles, resolveGoModCache, grepInterfaceFilesForMethod } = require('./search');
 const { findGoMod, resolveLockedModuleDirs, resolveModuleImportDirectory } = require('./gomod');
 const { currentBuildContext, shouldIncludeGoFile } = require('./build');
@@ -55,6 +54,38 @@ function scanCandidateMethodNames(text) {
         if (!NON_METHOD_CALLS.has(match[1])) names.add(match[1]);
     }
     return names;
+}
+
+const CANDIDATE_TYPE_REFERENCE =
+    String.raw`\*?(?:[A-Z_a-z]\w*\.)?[A-Z_a-z]\w*(?:\s*\[[^\]\n]*\])?`;
+const EMBED_ONLY_LINE_RE = new RegExp(
+    String.raw`^\s*${CANDIDATE_TYPE_REFERENCE}\s*(?:\x60[^\x60\n]*\x60)?\s*;?\s*$`,
+    'm'
+);
+const INLINE_EMBED_RE = new RegExp(
+    String.raw`(?:\{|;)\s*${CANDIDATE_TYPE_REFERENCE}\s*(?=;|\})`
+);
+
+function scanPackageName(text) {
+    const match = text.match(/^\s*package\s+([A-Z_a-z]\w*)/m);
+    return match ? match[1] : null;
+}
+
+function mayContainEmbeddedType(text) {
+    if (!/\b(?:struct|interface)\b/.test(text)) return false;
+    return EMBED_ONLY_LINE_RE.test(text) || INLINE_EMBED_RE.test(text);
+}
+
+function scanFileMetadata(text) {
+    return {
+        syntax: 'candidate-index-v1',
+        packageName: scanPackageName(text),
+        imports: new Map(),
+        aliases: new Map(),
+        interfaces: new Map(),
+        types: new Map(),
+        hasEmbeds: mayContainEmbeddedType(text),
+    };
 }
 
 // A Go package is identified by its directory plus declared package name. The
@@ -233,7 +264,8 @@ class WorkspaceIndex {
         this.log = log || (() => {});
         this.options = options || {};
 
-        // Per-file parse results: absPath -> { packageName, interfaces, types }
+        // Startup files contain lightweight candidate metadata only. Precise
+        // declaration IR is produced lazily by Tree-sitter for selected files.
         this.files = new Map();
         // Unsaved editor buffers override the corresponding on-disk parse result
         // in merged views without forcing a workspace rebuild.
@@ -456,10 +488,7 @@ class WorkspaceIndex {
         this._packageKeysByDirectory.get(directory).add(packageKey);
         if (!this._packageFiles.has(packageKey)) this._packageFiles.set(packageKey, new Set());
         this._packageFiles.get(packageKey).add(normalized);
-        const hasEmbeds =
-            [...parsed.interfaces.values()].some((info) => info.embeds && info.embeds.length > 0) ||
-            [...parsed.types.values()].some((info) => info.embeds && info.embeds.length > 0);
-        if (hasEmbeds) this._embeddedFiles.add(normalized);
+        if (parsed.hasEmbeds) this._embeddedFiles.add(normalized);
     }
 
     _indexText(absPath, text, invalidateAst) {
@@ -470,7 +499,7 @@ class WorkspaceIndex {
                 if (invalidateAst && this.astPool) this.astPool.invalidate(absPath);
                 return;
             }
-            const parsed = parseFile(text);
+            const parsed = scanFileMetadata(text);
             this.files.set(absPath, parsed);
             this._recordCandidateFile(absPath, text, parsed);
             if (invalidateAst && this.astPool) this.astPool.invalidate(absPath);
@@ -504,7 +533,7 @@ class WorkspaceIndex {
             if (notify !== false) this._emitChange();
             return;
         }
-        this.overlays.set(absPath, parseFile(text));
+        this.overlays.set(absPath, scanFileMetadata(text));
         this.overlayTexts.set(absPath, text);
         this._recordCandidateFile(absPath, text, this.overlays.get(absPath));
         this._invalidateMerged();
@@ -517,7 +546,7 @@ class WorkspaceIndex {
         if (this.astPool) this.astPool.clearOverlay(absPath);
         try {
             const text = fs.readFileSync(absPath, 'utf8');
-            const parsed = this.files.get(absPath) || parseFile(text);
+            const parsed = this.files.get(absPath) || scanFileMetadata(text);
             this._recordCandidateFile(absPath, text, parsed);
         } catch (_) {
             this._removeCandidateFile(absPath);
@@ -1876,7 +1905,7 @@ class WorkspaceIndex {
                 if (!shouldIncludeGoFile(file, '', this._buildContext)) continue;
                 const source = fs.readFileSync(file, 'utf8');
                 if (!shouldIncludeGoFile(file, source, this._buildContext)) continue;
-                parsed = this.files.get(file) || parseFile(source);
+                parsed = await this.astPool.parseFile(file, source, 200);
             } catch (_) {
                 continue;
             }

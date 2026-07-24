@@ -13,14 +13,14 @@ Module._resolveFilename = function (request, ...rest) {
 };
 
 const { WorkspaceIndex } = require(path.join(__dirname, '..', 'src', 'indexer'));
-const { stripPackageQualifiers, normalizeSignature } = require(path.join(__dirname, '..', 'src', 'parser'));
+const { stripPackageQualifiers } = require(path.join(__dirname, '..', 'src', 'signatures'));
 const { assert, eq, done } = require(path.join(__dirname, 'harness'));
 
 console.log('== stripPackageQualifiers ==');
 eq(
     'qualified type stripped to match local type',
-    stripPackageQualifiers(normalizeSignature('(ctx context.Context) (acme.Result, error)')),
-    stripPackageQualifiers(normalizeSignature('(ctx context.Context) (Result, error)'))
+    stripPackageQualifiers('(@{context}.Context)(acme.Result,error)'),
+    stripPackageQualifiers('(@{context}.Context)(Result,error)')
 );
 eq('plain type unchanged', stripPackageQualifiers('(int)(string)'), '(int)(string)');
 
@@ -37,8 +37,9 @@ async function main() {
         path.join(proj, 'go.mod'),
         ['module example.com/proj', 'go 1.21', 'require github.com/acme/iface v1.3.0'].join('\n')
     );
+    const execFile = path.join(proj, 'exec.go');
     fs.writeFileSync(
-        path.join(proj, 'exec.go'),
+        execFile,
         [
             'package impl',
             'import "context"',
@@ -74,7 +75,7 @@ async function main() {
     await idx.ensureBuilt(proj);
 
     console.log('\n== goto interface across package boundary (qualifier mismatch) ==');
-    const found = await idx.findInterfaces('Exec', 'Execute');
+    const found = await idx.findInterfacesAst('Exec', 'Execute', { receiverFile: execFile });
     console.log('  got:', found.map((r) => r.name));
     assert(
         'finds dependency interface despite Result vs acme.Result',
@@ -101,8 +102,9 @@ async function looseNotShadowedByStrict() {
     fs.mkdirSync(exp, { recursive: true });
 
     // Interface + a same-package implementation using the bare type name.
+    const interfaceFile = path.join(eng, 'engine.go');
     fs.writeFileSync(
-        path.join(eng, 'engine.go'),
+        interfaceFile,
         [
             'package processengine',
             'type FlowContext struct{}',
@@ -136,15 +138,21 @@ async function looseNotShadowedByStrict() {
     await idx.ensureBuilt(exp);
 
     console.log('\n== loose (cross-package) impl is not shadowed by a strict (same-package) impl ==');
-    const impls = idx.findImplementations('Action').map((r) => r.name).sort();
+    const impls = (await idx.findImplementationsAst('Action', interfaceFile))
+        .map((r) => r.name)
+        .sort();
     console.log('  got:', impls);
-    assert('same-package Runner is found (strict)', impls.includes('Runner'));
-    assert('cross-package Exporter is found (loose, not shadowed)', impls.includes('Exporter'));
+    assert('same-package *Runner is found (strict)', impls.includes('*Runner'));
+    assert('cross-package *Exporter is found (loose, not shadowed)', impls.includes('*Exporter'));
 
-    const methodImpls = idx.findMethodImplementations('Action', 'ExecuteAction').map((r) => r.name).sort();
+    const methodImpls = (
+        await idx.findMethodImplementationsAst('Action', 'ExecuteAction', interfaceFile)
+    )
+        .map((r) => r.name)
+        .sort();
     console.log('  method impls:', methodImpls);
-    assert('method search finds Runner', methodImpls.includes('Runner'));
-    assert('method search finds Exporter (not shadowed)', methodImpls.includes('Exporter'));
+    assert('method search finds *Runner', methodImpls.includes('*Runner'));
+    assert('method search finds *Exporter (not shadowed)', methodImpls.includes('*Exporter'));
 
     idx.dispose();
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -161,8 +169,9 @@ async function crossPkgImplementations() {
     fs.mkdirSync(proj, { recursive: true });
     fs.mkdirSync(dep, { recursive: true });
 
+    const interfaceFile = path.join(dep, 'iface.go');
     fs.writeFileSync(
-        path.join(dep, 'iface.go'),
+        interfaceFile,
         [
             'package acme',
             'import "context"',
@@ -205,8 +214,9 @@ async function crossPkgImplementations() {
             'func (w *WrongPkg) Do(ctx context.Context) (other.Result, error) { return other.Result{}, nil }',
         ].join('\n')
     );
+    const doerFile = path.join(dep, 'iface2.go');
     fs.writeFileSync(
-        path.join(dep, 'iface2.go'),
+        doerFile,
         [
             'package acme',
             'import "context"',
@@ -233,23 +243,38 @@ async function crossPkgImplementations() {
     await idx.ensureBuilt(dep);
 
     console.log('\n== find implementations across package boundary ==');
-    const impls = idx.findImplementations('IActionExecutorWithCode').map((r) => r.name).sort();
+    const impls = (await idx.findImplementationsAst('IActionExecutorWithCode', interfaceFile))
+        .map((r) => r.name)
+        .sort();
     console.log('  got:', impls);
-    assert('finds Exec despite Result vs acme.Result', impls.includes('Exec'));
-    assert('does NOT falsely match Unrelated', !impls.includes('Unrelated'));
+    assert('finds *Exec despite Result vs acme.Result', impls.includes('*Exec'));
+    assert('does NOT falsely match Unrelated', !impls.some((name) => name.endsWith('Unrelated')));
 
     console.log('\n== find METHOD implementations across package boundary ==');
-    const methodImpls = idx.findMethodImplementations('IActionExecutorWithCode', 'Execute').map((r) => r.name).sort();
+    const methodImpls = (
+        await idx.findMethodImplementationsAst(
+            'IActionExecutorWithCode',
+            'Execute',
+            interfaceFile
+        )
+    )
+        .map((r) => r.name)
+        .sort();
     console.log('  got:', methodImpls);
-    assert('finds Exec.Execute despite Result vs acme.Result', methodImpls.includes('Exec'));
-    assert('method search does NOT falsely match Unrelated', !methodImpls.includes('Unrelated'));
+    assert('finds *Exec.Execute despite Result vs acme.Result', methodImpls.includes('*Exec'));
+    assert(
+        'method search does NOT falsely match Unrelated',
+        !methodImpls.some((name) => name.endsWith('Unrelated'))
+    );
 
     console.log('\n== same-slot DIFFERENT-package types are not confused (no false positive) ==');
-    const doers = idx.findImplementations('Doer').map((r) => r.name).sort();
+    const doers = (await idx.findImplementationsAst('Doer', doerFile))
+        .map((r) => r.name)
+        .sort();
     console.log('  got:', doers);
     assert(
         'WrongPkg (other.Result) does NOT match Doer (acme.Result)',
-        !doers.includes('WrongPkg')
+        !doers.some((name) => name.endsWith('WrongPkg'))
     );
 
     idx.dispose();

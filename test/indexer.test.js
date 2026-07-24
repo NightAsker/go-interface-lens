@@ -12,7 +12,6 @@ Module._resolveFilename = function (request, ...rest) {
 };
 
 const { WorkspaceIndex } = require(path.join(__dirname, '..', 'src', 'indexer'));
-const { parseFile } = require(path.join(__dirname, '..', 'src', 'parser'));
 const { parseGoFile } = require(path.join(__dirname, '..', 'src', 'ast'));
 const { assert, done } = require(path.join(__dirname, 'harness'));
 
@@ -27,43 +26,70 @@ const cfg = () => ({
 async function main() {
     const idx = new WorkspaceIndex(cfg, () => {});
     const root = path.join(__dirname, 'fixtures');
+    const storeFile = path.join(root, 'pkg', 'store.go');
+    const customFile = path.join(root, 'pkg', 'embed.go');
     await idx.ensureBuilt(root);
 
     console.log('== findImplementations(Store) ==');
-    const impls = idx.findImplementations('Store').map((r) => r.name).sort();
+    const impls = (await idx.findImplementationsAst('Store', storeFile)).map((r) => r.name).sort();
     console.log('  got:', impls);
-    assert('includes PostgresStore', impls.includes('PostgresStore'));
-    assert('includes MemStore (cross-dir)', impls.includes('MemStore'));
-    assert('excludes PartialStore (missing Put)', !impls.includes('PartialStore'));
-    assert('excludes WrongSigStore (wrong signatures)', !impls.includes('WrongSigStore'));
+    assert('includes pointer implementation *PostgresStore', impls.includes('*PostgresStore'));
+    assert('includes pointer implementation *MemStore (cross-dir)', impls.includes('*MemStore'));
+    assert('excludes PartialStore (missing Put)', !impls.some((name) => name.endsWith('PartialStore')));
+    assert('excludes WrongSigStore (wrong signatures)', !impls.some((name) => name.endsWith('WrongSigStore')));
 
     console.log('\n== findMethodImplementations(Store, Put) ==');
-    const puts = idx.findMethodImplementations('Store', 'Put').map((r) => r.name).sort();
+    const puts = (await idx.findMethodImplementationsAst('Store', 'Put', storeFile))
+        .map((r) => r.name)
+        .sort();
     console.log('  got:', puts);
-    assert('Put impls include PostgresStore', puts.includes('PostgresStore'));
-    assert('Put impls exclude PartialStore', !puts.includes('PartialStore'));
-    assert('Put impls exclude WrongSigStore', !puts.includes('WrongSigStore'));
+    assert('Put impls include *PostgresStore', puts.includes('*PostgresStore'));
+    assert('Put impls exclude PartialStore', !puts.some((name) => name.endsWith('PartialStore')));
+    assert('Put impls exclude WrongSigStore', !puts.some((name) => name.endsWith('WrongSigStore')));
 
     console.log('\n== findInterfaces(PostgresStore, Get) ==');
-    const ifaces = (await idx.findInterfaces('PostgresStore', 'Get')).map((r) => r.name).sort();
+    const ifaces = (
+        await idx.findInterfacesAst('PostgresStore', 'Get', { receiverFile: storeFile })
+    )
+        .map((r) => r.name)
+        .sort();
     console.log('  got:', ifaces);
     assert('finds Store interface', ifaces.includes('Store'));
 
     console.log('\n== embedded stdlib interface: full impl found, partial rejected ==');
-    const customImpls = idx.findImplementations('Custom').map((r) => r.name).sort();
+    const customImpls = (await idx.findImplementationsAst('Custom', customFile))
+        .map((r) => r.name)
+        .sort();
     console.log('  got:', customImpls);
-    assert('PartialCustom NOT reported as implementing Custom', !customImpls.includes('PartialCustom'));
-    assert('FullCustom (Read+Extra) reported as implementing Custom', customImpls.includes('FullCustom'));
+    assert(
+        'PartialCustom NOT reported as implementing Custom',
+        !customImpls.some((name) => name.endsWith('PartialCustom'))
+    );
+    assert(
+        '*FullCustom (Read+Extra) reported as implementing Custom',
+        customImpls.includes('*FullCustom')
+    );
 
     console.log('\n== interface method inverted index ==');
-    const readCandidates = (idx._interfacesByMethod.get('Read') || []).map(
-        (key) => idx._interfaceDecls.get(key).name
+    const packageFiles = await idx._parseAstPackages(
+        new Set([idx._packageForFile(storeFile)]),
+        200
+    );
+    const preciseView = idx._createAstView(packageFiles);
+    preciseView._merged();
+    const readCandidates = (preciseView._interfacesByMethod.get('Read') || []).map(
+        (key) => preciseView._interfaceDecls.get(key).name
     );
     assert('embedded io.Reader method indexes Custom', readCandidates.includes('Custom'));
-    assert('goto-interface lookup finds inherited Read method', idx.hasLocalInterface('FullCustom', 'Read'));
+    assert(
+        'goto-interface lookup finds inherited Read method',
+        preciseView.hasLocalInterface('FullCustom', 'Read', customFile)
+    );
 
     console.log('\n== method location resolution ==');
-    const one = idx.findMethodImplementations('Store', 'Get').find((r) => r.name === 'PostgresStore');
+    const one = (await idx.findMethodImplementationsAst('Store', 'Get', storeFile)).find(
+        (r) => r.name === '*PostgresStore'
+    );
     assert('PostgresStore.Get has a valid line', one && one.line >= 0);
     assert('PostgresStore.Get points at store.go', one && one.file.endsWith('store.go'));
 
@@ -76,20 +102,19 @@ async function main() {
     await sameNameTypesKeepIndependentSignatures();
     await packageScopedEmbedsResolveLocally();
     await gotoInterfaceCrossPackage();
-    promotedMethodImplementationLocation();
-    typeAliasesCanonicalizeSignatures();
-    predeclaredAliasesRespectShadowing();
-    predeclaredAliasesCanonicalizeCompositeResults();
-    unsavedDocumentOverlay();
+    await promotedMethodImplementationLocation();
+    await typeAliasesCanonicalizeSignatures();
+    await predeclaredAliasesRespectShadowing();
+    await predeclaredAliasesCanonicalizeCompositeResults();
     done();
 }
 
-function promotedMethodImplementationLocation() {
+async function promotedMethodImplementationLocation() {
     const idx = new WorkspaceIndex(cfg, () => {});
     const file = '/synthetic/promoted/service.go';
     idx.files.set(
         file,
-        parseFile(
+        await parseGoFile(
             [
                 'package promoted',
                 'type Service interface { Run() }',
@@ -108,12 +133,12 @@ function promotedMethodImplementationLocation() {
     idx.dispose();
 }
 
-function typeAliasesCanonicalizeSignatures() {
+async function typeAliasesCanonicalizeSignatures() {
     const idx = new WorkspaceIndex(cfg, () => {});
     const file = '/synthetic/aliases/service.go';
     idx.files.set(
         file,
-        parseFile(
+        await parseGoFile(
             [
                 'package aliases',
                 'type ID = string',
@@ -130,13 +155,13 @@ function typeAliasesCanonicalizeSignatures() {
     idx.dispose();
 }
 
-function predeclaredAliasesRespectShadowing() {
+async function predeclaredAliasesRespectShadowing() {
     const idx = new WorkspaceIndex(cfg, () => {});
     const builtinFile = '/synthetic/predeclared/builtin.go';
     const shadowFile = '/synthetic/shadow/shadow.go';
     idx.files.set(
         builtinFile,
-        parseGoFile(
+        await parseGoFile(
             [
                 'package predeclared',
                 'type Consumer interface { Use(byte, rune, any) }',
@@ -147,7 +172,7 @@ function predeclaredAliasesRespectShadowing() {
     );
     idx.files.set(
         shadowFile,
-        parseGoFile(
+        await parseGoFile(
             [
                 'package shadow',
                 'type byte string',
@@ -170,7 +195,7 @@ function predeclaredAliasesRespectShadowing() {
     idx.dispose();
 }
 
-function predeclaredAliasesCanonicalizeCompositeResults() {
+async function predeclaredAliasesCanonicalizeCompositeResults() {
     const idx = new WorkspaceIndex(cfg, () => {});
     const source = [
         'package predeclared',
@@ -189,43 +214,13 @@ function predeclaredAliasesCanonicalizeCompositeResults() {
         'func (Impl) Nested() map[string][]any { return nil }',
     ].join('\n');
     const astFile = '/synthetic/predeclared/composite-results-ast.go';
-    const lightweightFile = '/synthetic/predeclared/composite-results-lightweight.go';
-    idx.files.set(astFile, parseGoFile(source));
+    idx.files.set(astFile, await parseGoFile(source));
 
     console.log('\n== any canonicalizes inside unparenthesized composite results ==');
     assert(
         'declaration AST matches interface{} and any recursively inside result types',
         idx.findImplementations('CompositeResults', astFile).some((result) => result.name === 'Impl')
     );
-    idx.files.delete(astFile);
-    idx._invalidateMerged();
-    idx.files.set(lightweightFile, parseFile(source));
-    assert(
-        'lightweight index matches interface{} and any recursively inside result types',
-        idx.findImplementations('CompositeResults', lightweightFile).some(
-            (result) => result.name === 'Impl'
-        )
-    );
-    idx.dispose();
-}
-
-function unsavedDocumentOverlay() {
-    const idx = new WorkspaceIndex(cfg, () => {});
-    const file = '/synthetic/overlay/service.go';
-    idx.files.set(
-        file,
-        parseFile(['package overlay', 'type Service interface { Run() }', 'type Impl struct{}'].join('\n'))
-    );
-
-    console.log('\n== unsaved document overlay ==');
-    assert('disk snapshot has no implementation', idx.findImplementations('Service', file).length === 0);
-    idx.updateOverlay(
-        file,
-        ['package overlay', 'type Service interface { Run() }', 'type Impl struct{}', 'func (Impl) Run() {}'].join('\n')
-    );
-    assert('overlay makes unsaved method searchable', idx.findImplementations('Service', file).some((r) => r.name === 'Impl'));
-    idx.clearOverlay(file);
-    assert('clearing overlay restores disk snapshot', idx.findImplementations('Service', file).length === 0);
     idx.dispose();
 }
 
@@ -256,7 +251,7 @@ async function invertedIndexStopsAfterFirstMatch() {
     const idx = new WorkspaceIndex(cfg, () => {});
     idx.files.set(
         '/synthetic/interfaces.go',
-        parseFile(
+        await parseGoFile(
             [
                 'package synthetic',
                 'type First interface { Run() }',
@@ -329,7 +324,14 @@ async function gotoInterfaceCrossPackage() {
     await idx.ensureBuilt(root);
 
     console.log('\n== goto interface finds a cross-package (in-workspace) interface ==');
-    const ifaces = (await idx.findInterfaces('PenaltyPushBackboneActionV2', 'ExecuteAction')).map((r) => r.name).sort();
+    const receiverFile = path.join(root, 'penalty', 'p.go');
+    const ifaces = (
+        await idx.findInterfacesAst('PenaltyPushBackboneActionV2', 'ExecuteAction', {
+            receiverFile,
+        })
+    )
+        .map((r) => r.name)
+        .sort();
     console.log('  got:', ifaces);
     assert('finds Action in another package (bare vs qualified type)', ifaces.includes('Action'));
     assert('does NOT link Doer (different-package type in same slot)', !ifaces.includes('Doer'));
@@ -381,13 +383,18 @@ async function sameNameDifferentPackages() {
     await idx.ensureBuilt(root);
 
     console.log('\n== same-named types in different packages are each counted ==');
-    const impls = idx.findImplementations('Action');
+    const interfaceFile = path.join(root, 'iface.go');
+    const impls = await idx.findImplementationsAst('Action', interfaceFile);
     const files = impls.map((r) => r.file).sort();
     console.log('  got:', impls.length, 'impls');
     assert('two Handler implementations reported (one per package)', impls.length === 2);
     assert('both distinct files present', files.some((f) => f.endsWith(path.join('a', 'h.go'))) && files.some((f) => f.endsWith(path.join('b', 'h.go'))));
 
-    const methodImpls = idx.findMethodImplementations('Action', 'ExecuteAction');
+    const methodImpls = await idx.findMethodImplementationsAst(
+        'Action',
+        'ExecuteAction',
+        interfaceFile
+    );
     assert('method search also reports both', methodImpls.length === 2);
 
     idx.dispose();
@@ -403,7 +410,7 @@ async function sameNameInterfacesStayPackageScoped() {
     const bFile = '/synthetic/b/service.go';
     idx.files.set(
         aFile,
-        parseFile(
+        await parseGoFile(
             [
                 'package a',
                 'type Service interface { A() }',
@@ -414,7 +421,7 @@ async function sameNameInterfacesStayPackageScoped() {
     );
     idx.files.set(
         bFile,
-        parseFile(
+        await parseGoFile(
             [
                 'package b',
                 'type Service interface { B() }',
@@ -446,14 +453,17 @@ async function sameNameTypesKeepIndependentSignatures() {
     const ifaceFile = '/synthetic/contracts/iface.go';
     const goodFile = '/synthetic/a/handler.go';
     const wrongFile = '/synthetic/b/handler.go';
-    idx.files.set(ifaceFile, parseFile('package contracts\ntype IntHandler interface { Handle(int) }'));
+    idx.files.set(
+        ifaceFile,
+        await parseGoFile('package contracts\ntype IntHandler interface { Handle(int) }')
+    );
     idx.files.set(
         goodFile,
-        parseFile('package a\ntype Handler struct{}\nfunc (Handler) Handle(v int) {}')
+        await parseGoFile('package a\ntype Handler struct{}\nfunc (Handler) Handle(v int) {}')
     );
     idx.files.set(
         wrongFile,
-        parseFile('package b\ntype Handler struct{}\nfunc (Handler) Handle(v string) {}')
+        await parseGoFile('package b\ntype Handler struct{}\nfunc (Handler) Handle(v string) {}')
     );
 
     console.log('\n== same-named types retain package-specific signatures ==');
@@ -474,7 +484,7 @@ async function packageScopedEmbedsResolveLocally() {
     const bFile = '/synthetic/b/embed.go';
     idx.files.set(
         aFile,
-        parseFile(
+        await parseGoFile(
             [
                 'package a',
                 'type Parent interface { A() }',
@@ -488,7 +498,7 @@ async function packageScopedEmbedsResolveLocally() {
     );
     idx.files.set(
         bFile,
-        parseFile(
+        await parseGoFile(
             [
                 'package b',
                 'type Parent interface { X() }',

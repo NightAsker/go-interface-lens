@@ -159,7 +159,7 @@ async function main() {
     );
     const interfaceProvider = new extension._test.GoInterfaceLensProvider();
     const variantsDocument = fakeDocument(variantsPath);
-    const interfaceLenses = interfaceProvider.provideCodeLenses(variantsDocument);
+    const interfaceLenses = await interfaceProvider.provideCodeLenses(variantsDocument);
     const implementationTargets = interfaceLenses
         .filter((lens) => lens.command.command === 'go-interface-lens.showImplementations')
         .map((lens) => lens.command.arguments[0]);
@@ -168,11 +168,14 @@ async function main() {
     assert('next-line interface brace gets a lens', implementationTargets.includes('Split'));
 
     console.log('\n== shared document AST ==');
-    const firstParse = extension._test.parseDocument(variantsDocument);
-    const cachedParse = extension._test.parseDocument(variantsDocument);
+    const firstParsePromise = extension._test.parseDocument(variantsDocument);
+    const cachedParsePromise = extension._test.parseDocument(variantsDocument);
+    const firstParse = await firstParsePromise;
+    const cachedParse = await cachedParsePromise;
     assert('same document version reuses its AST', firstParse === cachedParse);
+    assert('same document version reuses its in-flight parse', firstParsePromise === cachedParsePromise);
     variantsDocument.version += 1;
-    const changedParse = extension._test.parseDocument(variantsDocument);
+    const changedParse = await extension._test.parseDocument(variantsDocument);
     assert('new document version invalidates its AST', changedParse !== cachedParse);
 
     let prewarmCalls = 0;
@@ -186,7 +189,7 @@ async function main() {
             workerWarmupCalls += 1;
         },
     });
-    interfaceProvider.provideCodeLenses(fakeDocument(variantsPath));
+    await interfaceProvider.provideCodeLenses(fakeDocument(variantsPath));
     await new Promise((resolve) => setImmediate(resolve));
     console.log('\n== interface-only file prewarming ==');
     assert('interface lens starts one background workspace build', prewarmCalls === 1);

@@ -7,8 +7,9 @@ function parse(lines) {
     return parseGoFile(lines.join('\n'));
 }
 
+async function main() {
 console.log('== declaration AST: multiline and pointer method sets ==');
-const service = parse([
+const service = await parse([
     'package service',
     'import ctx "context"',
     'type Runner interface {',
@@ -42,7 +43,7 @@ assert(
 );
 
 console.log('\n== declaration AST: grouped types, aliases, and embedding ==');
-const grouped = parse([
+const grouped = await parse([
     'package p',
     'type (',
     '    Base struct{}',
@@ -62,7 +63,7 @@ assert('value receiver retained', !grouped.types.get('Base').pointerMethods.has(
 assert('pointer receiver distinguished', grouped.types.get('Base').pointerMethods.has('Close'));
 
 console.log('\n== declaration AST: import identity and constraints ==');
-const imports = parse([
+const imports = await parse([
     'package p',
     'import model "example.com/acme/model"',
     'type Store interface { Save(model.User) error }',
@@ -78,7 +79,7 @@ eq(
 assert('constraint interface marked non-basic', imports.interfaces.get('Number').constraint);
 
 console.log('\n== declaration AST: complete field normalization ==');
-const normalized = parse([
+const normalized = await parse([
     'package p',
     'import q "example.com/model"',
     'type T struct{}',
@@ -129,7 +130,7 @@ for (const methodName of normalized.interfaces.get('Shape').methods.keys()) {
     );
 }
 
-const distinctResults = parse([
+const distinctResults = await parse([
     'package p',
     'type ResponseA struct{}',
     'type ResponseB struct{}',
@@ -178,7 +179,7 @@ const compositeResultCases = [
     ['AnonymousInterface', 'interface { Value() interface{} }'],
     ['GenericComposite', 'Box[map[string]interface{}]'],
 ];
-const compositeResults = parse([
+const compositeResults = await parse([
     'package p',
     'type Box[T any] struct{}',
     'type CompositeResults interface {',
@@ -203,7 +204,7 @@ assert(
 );
 
 console.log('\n== declaration AST skips function bodies ==');
-const localDeclarations = parse([
+const localDeclarations = await parse([
     'package p',
     'type PackageType struct{}',
     'func Build() any {',
@@ -227,3 +228,9 @@ assert('serialized pointer metadata restored', restored.types.get('Worker').poin
 assert('serialized struct metadata restored', restored.types.get('Worker').struct);
 
 done();
+}
+
+main().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+});

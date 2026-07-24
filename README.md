@@ -1,7 +1,7 @@
 # Go Interface Lens
 
-[![Version](https://img.shields.io/badge/version-1.1.5-blue.svg)](https://github.com/NightAsker/go-interface-lens)
-[![VSCode](https://img.shields.io/badge/VSCode-1.60+-green.svg)](https://code.visualstudio.com/)
+[![Version](https://img.shields.io/badge/version-1.2.1-blue.svg)](https://github.com/NightAsker/go-interface-lens)
+[![VSCode](https://img.shields.io/badge/VSCode-1.76+-green.svg)](https://code.visualstudio.com/)
 
 一个面向大型 Go 工程的 VS Code / Cursor 接口导航扩展。它在接口、接口方法和具体实现之间提供双向 CodeLens，同时使用轻量候选索引和按需 AST 校验兼顾响应速度与查找准确性。
 
@@ -16,9 +16,12 @@
 - 优先使用接口中出现频率最低的方法缩小候选范围。
 - 已完成的查询直接使用内存缓存，未变化的文件可从持久化 AST 缓存恢复。
 
-### 自己完成 Go 接口匹配
+### Tree-sitter Go WASM 精确解析
 
-扩展内置声明级 Go lexer 和 AST，不通过 VS Code LSP API 或 gopls 查询实现。当前支持：
+扩展使用 Microsoft 维护的 `@vscode/tree-sitter-wasm` 0.3.1 和 Tree-sitter Go grammar，
+不再包含自写 Go lexer 或语法解析器，也不通过 VS Code LSP API 或 gopls 查询实现。
+每次解析都以单个 `.go` 文件为输入，提取紧凑的声明 IR 后立即释放 Tree-sitter Tree。
+当前支持：
 
 - Go 的隐式接口实现和完整方法签名校验。
 - 值接收者、指针接收者及其不同的方法集。
@@ -66,6 +69,9 @@ func (r *PostgresUserRepository) FindByID(
 - 文件监听、未保存 overlay 和查询结果都支持增量失效。
 - 支持 multi-root workspace，并保持同名包、同名接口和同名类型相互隔离。
 
+VSIX 从锁定的上游版本原样携带 Tree-sitter JavaScript runtime、核心 runtime
+WASM、Go grammar WASM 和 MIT 许可证；依赖包里的其他语言 grammar 不会打进扩展。
+
 ## 使用方法
 
 ### 查看接口实现
@@ -93,7 +99,7 @@ func (r *PostgresUserRepository) FindByID(
 
 ## 环境要求
 
-- VS Code 1.60+，或兼容 VS Code 扩展的 Cursor 版本。
+- VS Code 1.76+，或兼容 VS Code 扩展的 Cursor 版本。
 - 使用 `.go` 文件；Go module 工程可以获得最完整的跨包和依赖解析能力。
 - 实现匹配不依赖 gopls。解析 GOROOT 或 module cache 中的源码时，需要本机存在相应 Go 源码或依赖缓存。
 
@@ -146,8 +152,8 @@ func (r *PostgresUserRepository) FindByID(
 
 开发环境中的合成测试包含 402 个 Go 文件：
 
-- 启动候选索引约 `38ms`。
-- 首次 AST 查询约 `21ms`。
+- 启动候选索引约 `47ms`，Tree-sitter WASM 解析文件数为 `0`。
+- 首次 AST 查询约 `37ms`。
 - 缓存查询约 `0ms`。
 - 一次稀有方法查询只解析 2 个候选文件。
 

@@ -52,6 +52,7 @@ async function main() {
     const buildStarted = process.hrtime.bigint();
     await index.ensureBuilt(root);
     const buildMs = Number(process.hrtime.bigint() - buildStarted) / 1e6;
+    const parsedAfterStartup = index.getAstStats().parsed;
 
     const legacyStarted = process.hrtime.bigint();
     index.findImplementations('Rare', interfaceFile);
@@ -75,6 +76,7 @@ async function main() {
     assert('cold AST query finds implementation', cold.length === 1 && cold[0].name === 'Impl');
     assert('cached AST query preserves result', warm.length === 1 && warm[0].name === 'Impl');
     assert('startup regex indexing stays within broad budget', buildMs < 5000);
+    assert('startup candidate indexing does not parse any file with WASM', parsedAfterStartup === 0);
     assert('cold candidate AST query stays within broad budget', coldMs < 2000);
     assert('cached query stays responsive', warmMs < 100);
     assert('query parses candidates instead of the whole workspace', index.getAstStats().parsed <= 4);

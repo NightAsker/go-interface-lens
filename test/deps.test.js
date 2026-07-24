@@ -30,9 +30,10 @@ async function main() {
     // which is intentionally NOT indexed — it must be found on demand).
     const idx = new WorkspaceIndex(cfg, () => {});
     await idx.ensureBuilt(projRoot);
+    const receiverFile = path.join(projRoot, 'executor.go');
 
     console.log('== goto interface: interface in module cache, impl in project ==');
-    const found = await idx.findInterfaces('ProjectExecutor', 'Execute');
+    const found = await idx.findInterfacesAst('ProjectExecutor', 'Execute', { receiverFile });
     const names = found.map((r) => r.name).sort();
     console.log('  got:', names);
     assert('finds IActionExecutorWithCode from module cache', names.includes('IActionExecutorWithCode'));
@@ -41,14 +42,14 @@ async function main() {
     assert('external file path is in module cache', ext && ext.file.startsWith(modCache));
 
     console.log('\n== signature-aware: Code() string must not match Coder.Code() int ==');
-    const byCode = await idx.findInterfaces('ProjectExecutor', 'Code');
+    const byCode = await idx.findInterfacesAst('ProjectExecutor', 'Code', { receiverFile });
     const codeNames = byCode.map((r) => r.name).sort();
     console.log('  got:', codeNames);
     assert('matches IActionExecutorWithCode (Code() string)', codeNames.includes('IActionExecutorWithCode'));
     assert('does NOT match Coder (Code() int)', !codeNames.includes('Coder'));
 
     console.log('\n== dependency search finds a single-line interface ==');
-    const byInline = await idx.findInterfaces('ProjectExecutor', 'Inline');
+    const byInline = await idx.findInterfacesAst('ProjectExecutor', 'Inline', { receiverFile });
     assert('finds InlineExecutor declared on one line', byInline.some((r) => r.name === 'InlineExecutor'));
     assert(
         'finds same-file interface inheriting the method',
@@ -61,7 +62,7 @@ async function main() {
         () => {}
     );
     await idx2.ensureBuilt(projRoot);
-    const none = await idx2.findInterfaces('ProjectExecutor', 'Execute');
+    const none = await idx2.findInterfacesAst('ProjectExecutor', 'Execute', { receiverFile });
     eq('no interfaces when dep search off', none.map((r) => r.name), []);
 
     idx.dispose();

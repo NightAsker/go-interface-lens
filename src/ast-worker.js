@@ -3,16 +3,21 @@
 const fs = require('fs');
 const { parentPort } = require('worker_threads');
 const { parseGoFile, serializeParsedFile } = require('./ast');
+const { initializeGoParser } = require('./tree-sitter-runtime');
 
-// Sent only after this worker has loaded the parser and all of its modules.
-// The extension can hide worker startup cost during idle prewarming without
-// parsing any workspace source.
-parentPort.postMessage({ type: 'ready' });
+const ready = initializeGoParser();
+ready.then(() => parentPort.postMessage({ type: 'ready' })).catch((error) => {
+    setImmediate(() => {
+        throw error;
+    });
+});
 
-parentPort.on('message', (job) => {
+parentPort.on('message', async (job) => {
     try {
+        await ready;
         const text = job.text === undefined ? fs.readFileSync(job.file, 'utf8') : job.text;
-        parentPort.postMessage({ id: job.id, parsed: serializeParsedFile(parseGoFile(text)) });
+        const parsed = await parseGoFile(text);
+        parentPort.postMessage({ id: job.id, parsed: serializeParsedFile(parsed) });
     } catch (err) {
         parentPort.postMessage({
             id: job.id,
