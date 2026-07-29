@@ -29,7 +29,8 @@ async function main() {
     for (let i = 0; i < 400; i++) {
         fs.writeFileSync(
             path.join(noiseDir, `noise${i}.go`),
-            `package noise\ntype Noise${i} struct{}\nfunc (Noise${i}) Method${i}(value int) int { return value }\n`
+            `package noise\ntype Noise${i} struct{}\ntype Holder${i} struct { Noise${i} }\n` +
+                `func (Noise${i}) Method${i}(value int) int { return value }\n`
         );
     }
     const interfaceFile = path.join(apiDir, 'rare.go');
@@ -53,6 +54,7 @@ async function main() {
     await index.ensureBuilt(root);
     const buildMs = Number(process.hrtime.bigint() - buildStarted) / 1e6;
     const parsedAfterStartup = index.getAstStats().parsed;
+    const rareCandidates = index._candidatePackagesForMethods(['RareMethod']);
 
     const legacyStarted = process.hrtime.bigint();
     index.findImplementations('Rare', interfaceFile);
@@ -80,6 +82,7 @@ async function main() {
     assert('cold candidate AST query stays within broad budget', coldMs < 2000);
     assert('cached query stays responsive', warmMs < 100);
     assert('query parses candidates instead of the whole workspace', index.getAstStats().parsed <= 4);
+    assert('unrelated local embeds do not inflate candidates', rareCandidates.size <= 2);
 
     index.dispose();
     fs.rmSync(tmp, { recursive: true, force: true });

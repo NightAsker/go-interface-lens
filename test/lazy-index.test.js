@@ -222,9 +222,17 @@ async function main() {
     await index.findImplementationsAst('Service', interfaceFile);
     eq('second implementation query uses query cache', index.getAstStats().parsed, parsedBeforeCacheHit);
 
+    const viewsBeforeMethodQuery = astViewCreations;
+    const memoryHitsBeforeMethodQuery = index.getAstStats().memoryHits;
     const methods = await index.findMethodImplementationsAst('Service', 'Run', interfaceFile);
     eq('method query navigates to split receiver declaration', methods.map((r) => r.name), ['*Worker']);
     assert('method result points at implementation file', methods[0].file === implementationFile);
+    eq('method query shares the interface AST context', astViewCreations, viewsBeforeMethodQuery);
+    eq(
+        'shared interface context avoids repeated AST cache reads',
+        index.getAstStats().memoryHits,
+        memoryHitsBeforeMethodQuery
+    );
 
     const reverse = await index.findInterfacesAst('Worker', 'Run', { receiverFile: implementationFile });
     eq('reverse AST lookup finds the interface', reverse.map((r) => r.name), ['Service']);

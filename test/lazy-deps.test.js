@@ -93,6 +93,18 @@ async function main() {
     eq('module-cache interface found through AST filtering', interfaces.map((result) => result.name), ['External']);
     assert('dependency result marked external', interfaces[0].external);
     assert('dependency navigation points at locked module version', interfaces[0].file === dependencyFile);
+    const lockedDirs = index._resolveLockedDirs(modCache);
+    const cachedCandidates = index._dependencyInterfaceCandidates(
+        modCache,
+        'ExternalOnly',
+        lockedDirs
+    );
+    assert(
+        'dependency candidate grep is shared across receiver queries',
+        cachedCandidates ===
+            index._dependencyInterfaceCandidates(modCache, 'ExternalOnly', lockedDirs)
+    );
+    await cachedCandidates;
 
     const localInterfaceFile = path.join(root, 'local.go');
     const localSource = [

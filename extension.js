@@ -7,6 +7,7 @@ const { WorkspaceIndex } = require('./src/indexer');
 const { resolveSearchRoots } = require('./src/search');
 const { parseGoFile } = require('./src/ast');
 const { DEFAULT_AST_CONCURRENCY } = require('./src/ast-cache');
+const { initializeGoParser } = require('./src/tree-sitter-runtime');
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -155,7 +156,7 @@ function syncOpenDocument(documentUri) {
 // ---------------------------------------------------------------------------
 // CodeLens providers
 // ---------------------------------------------------------------------------
-class GoInterfaceLensProvider {
+class GoCodeLensProvider {
     constructor() {
         this._onDidChangeCodeLenses = new vscode.EventEmitter();
         this.onDidChangeCodeLenses = this._onDidChangeCodeLenses.event;
@@ -171,7 +172,8 @@ class GoInterfaceLensProvider {
             prewarmWorkspace(document.uri, 'interface lens');
         }
 
-        const lineRange = (index) => new vscode.Range(index, 0, index, document.lineAt(index).text.length);
+        const lineRange = (index) =>
+            new vscode.Range(index, 0, index, document.lineAt(index).text.length);
 
         for (const [interfaceName, info] of parsed.interfaces) {
             if (info.constraint || info.generic) continue;
@@ -192,24 +194,6 @@ class GoInterfaceLensProvider {
                 );
             }
         }
-
-        return codeLenses;
-    }
-
-    resolveCodeLens(codeLens) {
-        return codeLens;
-    }
-}
-
-class GoGotoInterfaceLensProvider {
-    constructor() {
-        this._onDidChangeCodeLenses = new vscode.EventEmitter();
-        this.onDidChangeCodeLenses = this._onDidChangeCodeLenses.event;
-    }
-
-    async provideCodeLenses(document) {
-        const parsed = await parseDocument(document);
-        const codeLenses = [];
         for (const [receiverType, info] of parsed.types) {
             if (shouldExclude(document.fileName, receiverType)) continue;
             for (const methodName of info.methods.keys()) {
@@ -226,10 +210,6 @@ class GoGotoInterfaceLensProvider {
             }
         }
         return codeLenses;
-    }
-
-    resolveCodeLens(codeLens) {
-        return codeLens;
     }
 }
 
@@ -398,14 +378,16 @@ function activate(context) {
     output = vscode.window.createOutputChannel('Go Interface Lens');
     context.subscriptions.push(output);
     log('Go Interface Lens activated');
+    void initializeGoParser().catch((err) => {
+        log(`Document parser warmup failed: ${err && err.message}`);
+    });
 
     workspaceIndex = new WorkspaceIndex(getConfiguration, log, {
         cacheDir: context.globalStorageUri && context.globalStorageUri.fsPath,
     });
     context.subscriptions.push({ dispose: () => workspaceIndex.dispose() });
 
-    const provider = new GoInterfaceLensProvider();
-    const gotoInterfaceProvider = new GoGotoInterfaceLensProvider();
+    const provider = new GoCodeLensProvider();
     // Match Go documents regardless of URI scheme. Restricting to `scheme: 'file'`
     // meant the CodeLens providers were never invoked in remote environments
     // (Remote-SSH, dev containers, WSL), where editor documents use the
@@ -425,7 +407,6 @@ function activate(context) {
 
     context.subscriptions.push(
         vscode.languages.registerCodeLensProvider(selector, provider),
-        vscode.languages.registerCodeLensProvider(selector, gotoInterfaceProvider),
         vscode.commands.registerCommand('go-interface-lens.showImplementations', showImplementations),
         vscode.commands.registerCommand(
             'go-interface-lens.showMethodImplementations',
@@ -435,7 +416,6 @@ function activate(context) {
         vscode.commands.registerCommand('go-interface-lens.clearCache', () => {
             workspaceIndex.clear();
             provider._onDidChangeCodeLenses.fire();
-            gotoInterfaceProvider._onDidChangeCodeLenses.fire();
             vscode.window.showInformationMessage('Go Interface Lens: index cleared');
         }),
         // When the index is invalidated by background Go file changes, recompute
@@ -444,7 +424,6 @@ function activate(context) {
         // reflected without requiring the file to be reopened.
         workspaceIndex.onDidChange(() => {
             provider._onDidChangeCodeLenses.fire();
-            gotoInterfaceProvider._onDidChangeCodeLenses.fire();
         }),
         vscode.workspace.onDidChangeTextDocument((event) => scheduleDocumentOverlay(event.document)),
         vscode.workspace.onDidSaveTextDocument((document) => {
@@ -486,8 +465,9 @@ module.exports._test = {
     setWorkspaceIndex: (idx) => {
         workspaceIndex = idx;
     },
-    GoGotoInterfaceLensProvider,
-    GoInterfaceLensProvider,
+    GoCodeLensProvider,
+    GoGotoInterfaceLensProvider: GoCodeLensProvider,
+    GoInterfaceLensProvider: GoCodeLensProvider,
     parseDocument,
     resolvePrewarmRoots,
     prewarmRoots,

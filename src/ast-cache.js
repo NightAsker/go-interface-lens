@@ -9,6 +9,7 @@ const { deserializeParsedFile } = require('./ast');
 const CACHE_SCHEMA = 5;
 const DEFAULT_AST_CONCURRENCY = 16;
 const MAX_AST_CONCURRENCY = 32;
+const DEFAULT_WARM_CONCURRENCY = 4;
 
 class AstWorkerPool {
     constructor(options) {
@@ -17,6 +18,13 @@ class AstWorkerPool {
             ? Math.trunc(opts.concurrency)
             : DEFAULT_AST_CONCURRENCY;
         this.concurrency = Math.max(1, Math.min(MAX_AST_CONCURRENCY, requested));
+        const requestedWarmConcurrency = Number.isFinite(opts.warmConcurrency)
+            ? Math.trunc(opts.warmConcurrency)
+            : DEFAULT_WARM_CONCURRENCY;
+        this.warmConcurrency = Math.max(
+            1,
+            Math.min(this.concurrency, requestedWarmConcurrency)
+        );
         this.cacheDir = opts.cacheDir || '';
         this.log = opts.log || (() => {});
         this.cacheFile = this.cacheDir ? path.join(this.cacheDir, `ast-cache-v${CACHE_SCHEMA}.json`) : '';
@@ -33,7 +41,14 @@ class AstWorkerPool {
         this.generation = 1;
         this.writeTimer = null;
         this.disposed = false;
-        this.stats = { parsed: 0, memoryHits: 0, diskHits: 0, active: 0, maxActive: 0 };
+        this.stats = {
+            parsed: 0,
+            memoryHits: 0,
+            diskHits: 0,
+            active: 0,
+            maxActive: 0,
+            maxWorkers: 0,
+        };
     }
 
     async _load() {
@@ -57,9 +72,20 @@ class AstWorkerPool {
         return this.loadPromise;
     }
 
-    _ensureWorkers() {
-        if (this.workers.length > 0 || this.disposed) return;
-        for (let i = 0; i < this.concurrency; i++) this._spawnWorker();
+    _ensureWorkers(target) {
+        if (this.disposed) return;
+        const desired = Math.max(
+            0,
+            Math.min(this.concurrency, target === undefined ? this.warmConcurrency : target)
+        );
+        while (this.workers.length < desired) this._spawnWorker();
+    }
+
+    _desiredWorkerCount() {
+        return Math.min(
+            this.concurrency,
+            Math.max(this.warmConcurrency, this.stats.active + this.queue.length)
+        );
     }
 
     _spawnWorker() {
@@ -93,6 +119,7 @@ class AstWorkerPool {
             if (!this.disposed && code !== 0) this._workerFailed(state, new Error(`AST worker exited with code ${code}`));
         });
         this.workers.push(state);
+        this.stats.maxWorkers = Math.max(this.stats.maxWorkers, this.workers.length);
     }
 
     _workerFailed(state, err) {
@@ -107,7 +134,7 @@ class AstWorkerPool {
         }
         state.job = null;
         state.busy = false;
-        if (!this.disposed && this.workers.length < this.concurrency) this._spawnWorker();
+        if (!this.disposed) this._ensureWorkers(this._desiredWorkerCount());
         this._dispatch();
     }
 
@@ -115,13 +142,63 @@ class AstWorkerPool {
     async warmup() {
         if (this.disposed) return 0;
         for (let attempt = 0; attempt < 3; attempt++) {
-            this._ensureWorkers();
+            const target = Math.max(this.warmConcurrency, this.workers.length);
+            this._ensureWorkers(target);
             const snapshot = [...this.workers];
             await Promise.all(snapshot.map((state) => state.readyPromise));
             const ready = this.workers.filter((state) => state.ready && !state.failed).length;
-            if (ready >= this.concurrency || this.disposed) return ready;
+            if (ready >= Math.min(this.concurrency, target) || this.disposed) return ready;
         }
         return this.workers.filter((state) => state.ready && !state.failed).length;
+    }
+
+    _jobPrecedes(left, right) {
+        return (
+            left.priority > right.priority ||
+            (left.priority === right.priority && left.sequence < right.sequence)
+        );
+    }
+
+    _enqueue(job) {
+        this.queue.push(job);
+        let index = this.queue.length - 1;
+        while (index > 0) {
+            const parent = Math.floor((index - 1) / 2);
+            if (this._jobPrecedes(this.queue[parent], this.queue[index])) break;
+            [this.queue[parent], this.queue[index]] = [this.queue[index], this.queue[parent]];
+            index = parent;
+        }
+    }
+
+    _dequeue() {
+        if (this.queue.length === 0) return null;
+        const first = this.queue[0];
+        const last = this.queue.pop();
+        if (this.queue.length > 0) {
+            this.queue[0] = last;
+            let index = 0;
+            while (true) {
+                const left = index * 2 + 1;
+                const right = left + 1;
+                let best = index;
+                if (
+                    left < this.queue.length &&
+                    this._jobPrecedes(this.queue[left], this.queue[best])
+                ) {
+                    best = left;
+                }
+                if (
+                    right < this.queue.length &&
+                    this._jobPrecedes(this.queue[right], this.queue[best])
+                ) {
+                    best = right;
+                }
+                if (best === index) break;
+                [this.queue[index], this.queue[best]] = [this.queue[best], this.queue[index]];
+                index = best;
+            }
+        }
+        return first;
     }
 
     _finishWorkerJob(state, message) {
@@ -142,10 +219,9 @@ class AstWorkerPool {
 
     _dispatch() {
         if (this.disposed) return;
-        this.queue.sort((a, b) => b.priority - a.priority || a.sequence - b.sequence);
         for (const state of this.workers) {
             if (state.busy || this.queue.length === 0) continue;
-            const job = this.queue.shift();
+            const job = this._dequeue();
             state.busy = true;
             state.job = job;
             this.stats.active += 1;
@@ -156,9 +232,8 @@ class AstWorkerPool {
 
     _run(file, text, priority) {
         if (this.disposed) return Promise.reject(new Error('AST worker pool is disposed'));
-        this._ensureWorkers();
         return new Promise((resolve, reject) => {
-            this.queue.push({
+            this._enqueue({
                 id: this.nextJobID++,
                 sequence: this.nextSequence++,
                 priority: priority || 0,
@@ -167,6 +242,7 @@ class AstWorkerPool {
                 resolve,
                 reject,
             });
+            this._ensureWorkers(this._desiredWorkerCount());
             this._dispatch();
         });
     }
@@ -323,4 +399,5 @@ module.exports = {
     CACHE_SCHEMA,
     DEFAULT_AST_CONCURRENCY,
     MAX_AST_CONCURRENCY,
+    DEFAULT_WARM_CONCURRENCY,
 };

@@ -155,9 +155,18 @@ async function main() {
     const variantsPath = path.join(root, 'variants.go');
     fs.writeFileSync(
         variantsPath,
-        ['package processengine', 'type Alias = interface { AliasMethod() }', 'type Split interface', '{', 'SplitMethod()', '}'].join('\n')
+        [
+            'package processengine',
+            'type Alias = interface { AliasMethod() }',
+            'type Split interface',
+            '{',
+            'SplitMethod()',
+            '}',
+            'type Mixed struct{}',
+            'func (Mixed) AliasMethod() {}',
+        ].join('\n')
     );
-    const interfaceProvider = new extension._test.GoInterfaceLensProvider();
+    const interfaceProvider = new extension._test.GoCodeLensProvider();
     const variantsDocument = fakeDocument(variantsPath);
     const interfaceLenses = await interfaceProvider.provideCodeLenses(variantsDocument);
     const implementationTargets = interfaceLenses
@@ -166,6 +175,24 @@ async function main() {
     console.log('\n== interface declaration variant lenses ==');
     assert('interface alias gets a lens', implementationTargets.includes('Alias'));
     assert('next-line interface brace gets a lens', implementationTargets.includes('Split'));
+    assert(
+        'one provider emits interface-method lenses from the shared AST',
+        interfaceLenses.some(
+            (lens) =>
+                lens.command.command === 'go-interface-lens.showMethodImplementations' &&
+                lens.command.arguments[0] === 'Alias' &&
+                lens.command.arguments[1] === 'AliasMethod'
+        )
+    );
+    assert(
+        'one provider also emits receiver-method lenses from the shared AST',
+        interfaceLenses.some(
+            (lens) =>
+                lens.command.command === 'go-interface-lens.gotoInterface' &&
+                lens.command.arguments[0] === 'Mixed' &&
+                lens.command.arguments[1] === 'AliasMethod'
+        )
+    );
 
     console.log('\n== shared document AST ==');
     const firstParsePromise = extension._test.parseDocument(variantsDocument);

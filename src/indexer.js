@@ -65,6 +65,24 @@ const EMBED_ONLY_LINE_RE = new RegExp(
 const INLINE_EMBED_RE = new RegExp(
     String.raw`(?:\{|;)\s*${CANDIDATE_TYPE_REFERENCE}\s*(?=;|\})`
 );
+const CAPTURED_TYPE_REFERENCE =
+    String.raw`\*?(?:([A-Z_a-z]\w*)\.)?([A-Z_a-z]\w*)(?:\s*\[[^\]\n]*\])?`;
+const EMBED_ONLY_LINE_CAPTURE_RE = new RegExp(
+    String.raw`^\s*${CAPTURED_TYPE_REFERENCE}\s*(?:\x60[^\x60\n]*\x60)?\s*;?\s*(?://.*)?$`,
+    'gm'
+);
+const INLINE_EMBED_CAPTURE_RE = new RegExp(
+    String.raw`(?:\{|;)\s*${CAPTURED_TYPE_REFERENCE}\s*(?=;|\})`,
+    'g'
+);
+const TYPE_ALIAS_RE = new RegExp(
+    String.raw`^\s*type\s+([A-Z_a-z]\w*)(?:\s*\[[^\]\n]*\])?\s*=\s*(${CANDIDATE_TYPE_REFERENCE})`,
+    'gm'
+);
+const GROUPED_TYPE_ALIAS_RE = new RegExp(
+    String.raw`^\s*([A-Z_a-z]\w*)(?:\s*\[[^\]\n]*\])?\s*=\s*(${CANDIDATE_TYPE_REFERENCE})`,
+    'gm'
+);
 
 function scanPackageName(text) {
     const match = text.match(/^\s*package\s+([A-Z_a-z]\w*)/m);
@@ -76,15 +94,84 @@ function mayContainEmbeddedType(text) {
     return EMBED_ONLY_LINE_RE.test(text) || INLINE_EMBED_RE.test(text);
 }
 
+function defaultImportAlias(importPath) {
+    const parts = importPath.split('/').filter(Boolean);
+    let alias = parts.pop() || '';
+    if (/^v\d+$/.test(alias) && parts.length > 0) alias = parts.pop();
+    return alias;
+}
+
+function scanImports(text) {
+    const imports = new Map();
+    const record = (alias, importPath) => {
+        const effectiveAlias = alias || defaultImportAlias(importPath);
+        if (effectiveAlias && effectiveAlias !== '_') imports.set(effectiveAlias, importPath);
+    };
+    const single = /^\s*import\s+(?:([A-Z_a-z]\w*|[._])\s+)?(["`])([^"`\n]+)\2/gm;
+    let match;
+    while ((match = single.exec(text))) record(match[1], match[3]);
+
+    const blocks = /^\s*import\s*\(([\s\S]*?)^\s*\)/gm;
+    while ((match = blocks.exec(text))) {
+        const specs = /^\s*(?:([A-Z_a-z]\w*|[._])\s+)?(["`])([^"`\n]+)\2/gm;
+        let spec;
+        while ((spec = specs.exec(match[1]))) record(spec[1], spec[3]);
+    }
+    return imports;
+}
+
+function normalizedCandidateReference(reference) {
+    return reference.replace(/^\s*\*\s*/, '').replace(/\s*\[[^\]\n]*\]\s*$/, '');
+}
+
+function scanTypeAliases(text) {
+    const aliases = new Map();
+    let match;
+    TYPE_ALIAS_RE.lastIndex = 0;
+    while ((match = TYPE_ALIAS_RE.exec(text))) {
+        aliases.set(match[1], normalizedCandidateReference(match[2]));
+    }
+    const blocks = /^\s*type\s*\(([\s\S]*?)^\s*\)/gm;
+    while ((match = blocks.exec(text))) {
+        GROUPED_TYPE_ALIAS_RE.lastIndex = 0;
+        let alias;
+        while ((alias = GROUPED_TYPE_ALIAS_RE.exec(match[1]))) {
+            aliases.set(alias[1], normalizedCandidateReference(alias[2]));
+        }
+    }
+    return aliases;
+}
+
+function scanEmbeddedReferences(text) {
+    const references = new Set();
+    const collect = (matcher) => {
+        matcher.lastIndex = 0;
+        let match;
+        while ((match = matcher.exec(text))) {
+            references.add(match[1] ? `${match[1]}.${match[2]}` : match[2]);
+        }
+    };
+    collect(EMBED_ONLY_LINE_CAPTURE_RE);
+    collect(INLINE_EMBED_CAPTURE_RE);
+    return references;
+}
+
 function scanFileMetadata(text) {
+    const hasEmbeds = mayContainEmbeddedType(text);
+    const embeddedReferences = hasEmbeds ? scanEmbeddedReferences(text) : new Set();
+    const aliases = scanTypeAliases(text);
+    const imports = hasEmbeds || aliases.size > 0 ? scanImports(text) : new Map();
     return {
         syntax: 'candidate-index-v1',
         packageName: scanPackageName(text),
-        imports: new Map(),
-        aliases: new Map(),
+        imports,
+        aliases,
         interfaces: new Map(),
         types: new Map(),
-        hasEmbeds: mayContainEmbeddedType(text),
+        hasEmbeds,
+        embeddedReferences,
+        unresolvedEmbeds: hasEmbeds && embeddedReferences.size === 0,
+        hasDotImport: imports.has('.'),
     };
 }
 
@@ -300,6 +387,8 @@ class WorkspaceIndex {
         this._packageKeyByFile = new Map();
         this._packageKeysByDirectory = new Map();
         this._embeddedFiles = new Set();
+        this._candidateMetadataByFile = new Map();
+        this._embeddedPackageGraph = null;
         this._astQueryCache = new Map();
         this._astInflight = new Map();
         this._astGeneration = 1;
@@ -307,6 +396,7 @@ class WorkspaceIndex {
         this._packageKeyByImportPath = new Map();
         this._externalImportDirectoryCache = new Map();
         this._externalPackageCache = new Map();
+        this._dependencyCandidateCache = new Map();
         this._goRootPromise = null;
         const cfg = this.getConfig();
         this.astPool = this.options.disableAst
@@ -467,6 +557,8 @@ class WorkspaceIndex {
         }
         this._packageKeyByFile.delete(normalized);
         this._embeddedFiles.delete(normalized);
+        this._candidateMetadataByFile.delete(normalized);
+        this._embeddedPackageGraph = null;
     }
 
     _recordCandidateFile(absPath, text, parsed) {
@@ -480,7 +572,9 @@ class WorkspaceIndex {
         }
         const packageKey = packageKeyFor(normalized, parsed.packageName);
         this._packageKeyByImportPath.clear();
+        this._embeddedPackageGraph = null;
         this._packageKeyByFile.set(normalized, packageKey);
+        this._candidateMetadataByFile.set(normalized, parsed);
         const directory = path.dirname(normalized);
         if (!this._packageKeysByDirectory.has(directory)) {
             this._packageKeysByDirectory.set(directory, new Set());
@@ -1124,19 +1218,129 @@ class WorkspaceIndex {
         return this._packageKeyByFile.get(path.normalize(file)) || null;
     }
 
-    _candidatePackagesForMethods(methodNames) {
-        const embeddedPackages = new Set();
-        for (const file of this._embeddedFiles) {
+    _buildEmbeddedPackageGraph() {
+        if (this._embeddedPackageGraph) return this._embeddedPackageGraph;
+
+        const reverse = new Map();
+        const external = new Set();
+        const builtinByMethod = new Map();
+        const aliasesByPackage = new Map();
+
+        for (const [file, metadata] of this._candidateMetadataByFile) {
             const packageKey = this._packageKeyByFile.get(file);
-            if (packageKey) embeddedPackages.add(packageKey);
+            if (!packageKey) continue;
+            if (!aliasesByPackage.has(packageKey)) aliasesByPackage.set(packageKey, new Map());
+            const aliases = aliasesByPackage.get(packageKey);
+            for (const [name, reference] of metadata.aliases || []) {
+                aliases.set(name, {
+                    reference,
+                    imports: metadata.imports || new Map(),
+                    hasDotImport: !!metadata.hasDotImport,
+                });
+            }
         }
+
+        const resolveReference = (packageKey, reference, imports, hasDotImport, seen) => {
+            const imported = reference.match(/^([A-Z_a-z]\w*)\.([A-Z_a-z]\w*)$/);
+            if (imported) {
+                const importPath = imports && imports.get(imported[1]);
+                if (!importPath) return { kind: 'external' };
+                const targetPackage = this._packageForImportPath(importPath);
+                return targetPackage
+                    ? { kind: 'workspace', packageKey: targetPackage }
+                    : { kind: 'external' };
+            }
+            if (BUILTIN_INTERFACES.has(reference)) {
+                return { kind: 'builtin', name: reference };
+            }
+            const alias = aliasesByPackage.get(packageKey) && aliasesByPackage.get(packageKey).get(reference);
+            if (alias) {
+                const aliasKey = `${packageKey}\0${reference}`;
+                if (seen && seen.has(aliasKey)) return { kind: 'external' };
+                const nextSeen = new Set(seen || []);
+                nextSeen.add(aliasKey);
+                return resolveReference(
+                    packageKey,
+                    alias.reference,
+                    alias.imports,
+                    alias.hasDotImport,
+                    nextSeen
+                );
+            }
+            if (hasDotImport) return { kind: 'external' };
+            return { kind: 'workspace', packageKey };
+        };
+
+        const addResolvedTarget = (ownerPackage, resolved) => {
+            if (!resolved) return;
+            if (resolved.kind === 'external') {
+                external.add(ownerPackage);
+                return;
+            }
+            if (resolved.kind === 'builtin') {
+                for (const methodName of BUILTIN_INTERFACES.get(resolved.name).keys()) {
+                    if (!builtinByMethod.has(methodName)) builtinByMethod.set(methodName, new Set());
+                    builtinByMethod.get(methodName).add(ownerPackage);
+                }
+                return;
+            }
+            if (resolved.packageKey === ownerPackage) return;
+            if (!reverse.has(resolved.packageKey)) reverse.set(resolved.packageKey, new Set());
+            reverse.get(resolved.packageKey).add(ownerPackage);
+        };
+
+        for (const [file, metadata] of this._candidateMetadataByFile) {
+            const packageKey = this._packageKeyByFile.get(file);
+            if (!packageKey) continue;
+            if (metadata.unresolvedEmbeds) external.add(packageKey);
+            for (const reference of metadata.embeddedReferences || []) {
+                addResolvedTarget(
+                    packageKey,
+                    resolveReference(
+                        packageKey,
+                        reference,
+                        metadata.imports || new Map(),
+                        !!metadata.hasDotImport
+                    )
+                );
+            }
+            for (const [name] of metadata.aliases || []) {
+                addResolvedTarget(
+                    packageKey,
+                    resolveReference(
+                        packageKey,
+                        name,
+                        metadata.imports || new Map(),
+                        !!metadata.hasDotImport
+                    )
+                );
+            }
+        }
+
+        this._embeddedPackageGraph = { reverse, external, builtinByMethod };
+        return this._embeddedPackageGraph;
+    }
+
+    _candidatePackagesForMethods(methodNames) {
+        const embeddedGraph = this._buildEmbeddedPackageGraph();
 
         const sets = [];
         for (const methodName of methodNames) {
-            const packages = new Set(embeddedPackages);
+            const packages = new Set(embeddedGraph.external);
+            for (const packageKey of embeddedGraph.builtinByMethod.get(methodName) || []) {
+                packages.add(packageKey);
+            }
             for (const file of this._candidateFilesByMethod.get(methodName) || []) {
                 const packageKey = this._packageKeyByFile.get(file);
                 if (packageKey) packages.add(packageKey);
+            }
+            const pending = [...packages];
+            for (let index = 0; index < pending.length; index++) {
+                for (const embeddingPackage of embeddedGraph.reverse.get(pending[index]) || []) {
+                    if (packages.has(embeddingPackage)) continue;
+                    packages.add(embeddingPackage);
+                    pending.push(embeddingPackage);
+                }
             }
             sets.push(packages);
         }
@@ -1455,7 +1659,14 @@ class WorkspaceIndex {
         return request;
     }
 
-    async _implementationAstContext(interfaceName, interfaceFile) {
+    _implementationAstContext(interfaceName, interfaceFile) {
+        const key = `context\0${interfaceFile}\0${interfaceName}`;
+        return this._cachedAstQuery(key, () =>
+            this._buildImplementationAstContext(interfaceName, interfaceFile)
+        );
+    }
+
+    async _buildImplementationAstContext(interfaceName, interfaceFile) {
         const interfacePackage = this._packageForFile(interfaceFile);
         if (!interfacePackage) return null;
         const interfaceFiles = await this._parseAstPackages(new Set([interfacePackage]), 200);
@@ -1470,7 +1681,11 @@ class WorkspaceIndex {
         const candidates = this._candidatePackagesForMethods(descriptor.resolved.methods.keys());
         candidates.add(interfacePackage);
         for (const packageKey of interfaceClosure.packages) candidates.add(packageKey);
-        const astFiles = await this._parseAstPackages(candidates, 200);
+        const remainingCandidates = new Set(candidates);
+        for (const packageKey of interfaceClosure.packages) remainingCandidates.delete(packageKey);
+        const candidateFiles = await this._parseAstPackages(remainingCandidates, 200);
+        const astFiles = new Map(interfaceClosure.astFiles);
+        for (const [file, info] of candidateFiles) astFiles.set(file, info);
         const closure = await this._expandEmbeddedAstPackages(candidates, astFiles, 200);
         const aliasExpansion = await this._expandSignatureAliasPackages(
             closure.astFiles,
@@ -1550,10 +1765,9 @@ class WorkspaceIndex {
         const lockedDirs = this._resolveLockedDirs(cacheRoot);
         let candidates;
         try {
-            candidates = await grepInterfaceFilesForMethod(
+            candidates = await this._dependencyInterfaceCandidates(
                 cacheRoot,
                 methodName,
-                undefined,
                 lockedDirs
             );
         } catch (err) {
@@ -1604,6 +1818,28 @@ class WorkspaceIndex {
             `AST dependency query ${methodName}: ${candidates.length} candidate file(s), ` +
                 `${parsed.size} parsed file(s)`
         );
+    }
+
+    _dependencyInterfaceCandidates(cacheRoot, methodName, lockedDirs) {
+        const normalizedDirs = [...(lockedDirs || [])].map(path.normalize).sort();
+        const key = `${path.normalize(cacheRoot)}\0${methodName}\0${normalizedDirs.join('\0')}`;
+        if (this._dependencyCandidateCache.has(key)) {
+            return this._dependencyCandidateCache.get(key);
+        }
+        let request;
+        request = grepInterfaceFilesForMethod(
+            cacheRoot,
+            methodName,
+            undefined,
+            normalizedDirs
+        ).catch((error) => {
+            if (this._dependencyCandidateCache.get(key) === request) {
+                this._dependencyCandidateCache.delete(key);
+            }
+            throw error;
+        });
+        this._dependencyCandidateCache.set(key, request);
+        return request;
     }
 
     getAstStats() {
@@ -1887,7 +2123,11 @@ class WorkspaceIndex {
 
         let candidates;
         try {
-            candidates = await grepInterfaceFilesForMethod(cacheRoot, methodName, undefined, lockedDirs);
+            candidates = await this._dependencyInterfaceCandidates(
+                cacheRoot,
+                methodName,
+                lockedDirs
+            );
         } catch (err) {
             this.log(`Dependency search failed: ${err.message}`);
             return;
@@ -2048,9 +2288,12 @@ class WorkspaceIndex {
         this._packageKeyByFile.clear();
         this._packageKeysByDirectory.clear();
         this._embeddedFiles.clear();
+        this._candidateMetadataByFile.clear();
+        this._embeddedPackageGraph = null;
         this._packageKeyByImportPath.clear();
         this._externalImportDirectoryCache.clear();
         this._externalPackageCache.clear();
+        this._dependencyCandidateCache.clear();
         if (this.astPool) this.astPool.clear();
         this._invalidateMerged();
         this._builds.clear();
@@ -2079,9 +2322,12 @@ class WorkspaceIndex {
         this._packageKeyByFile.clear();
         this._packageKeysByDirectory.clear();
         this._embeddedFiles.clear();
+        this._candidateMetadataByFile.clear();
+        this._embeddedPackageGraph = null;
         this._packageKeyByImportPath.clear();
         this._externalImportDirectoryCache.clear();
         this._externalPackageCache.clear();
+        this._dependencyCandidateCache.clear();
         this._builds.clear();
         this._builtRoots.clear();
     }
