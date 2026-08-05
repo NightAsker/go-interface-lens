@@ -2,6 +2,26 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [1.2.4] - 2026-08-05
+
+### Performance
+
+- Persist the lightweight workspace candidate index and validate unchanged Go
+  files with metadata only, so extension restarts read source text only for
+  files that changed.
+- Keep the configured AST concurrency as a hard limit while choosing a
+  CPU-aware worker limit, and retire burst workers back to the warm baseline
+  after they become idle.
+- Replace the monolithic AST cache with lazy per-file shards, bounded by an
+  in-memory LRU and a 256 MB / 4096-entry disk limit.
+- Write only changed AST shards in the background instead of serializing the
+  complete cache on every update or synchronously during extension shutdown.
+
+### Fixed
+
+- Reparse only the affected Go file when a persisted AST shard is missing or
+  corrupt, without failing the implementation query.
+
 ## [1.2.2] - 2026-07-24
 
 ### Changed

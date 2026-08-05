@@ -55,7 +55,13 @@ async function main() {
     eq('worker concurrency is bounded', first.stats.maxActive, 2);
     assert('pointer metadata survives worker serialization', parsed.get(files[0]).types.get('Type0').pointerMethods.has('Run'));
 
-    const adaptive = new AstWorkerPool({ concurrency: 16, warmConcurrency: 2 });
+    const adaptive = new AstWorkerPool({
+        concurrency: 16,
+        warmConcurrency: 2,
+        parallelism: 12,
+        idleTimeoutMs: 20,
+    });
+    eq('adaptive pool leaves CPU headroom', adaptive.effectiveConcurrency, 8);
     eq('adaptive pool prewarms only its baseline', await adaptive.warmup(), 2);
     await adaptive.parseFiles(
         files.map((file, index) => ({
@@ -65,12 +71,18 @@ async function main() {
         100
     );
     assert('adaptive pool grows beyond its warm baseline for a burst', adaptive.stats.maxWorkers > 2);
-    assert('adaptive pool never exceeds configured concurrency', adaptive.stats.maxWorkers <= 16);
+    assert('adaptive pool respects its CPU-aware soft limit', adaptive.stats.maxWorkers <= 8);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    eq('idle adaptive workers shrink back to the warm baseline', adaptive.workers.length, 2);
     adaptive.dispose();
 
     await first.parseFile(files[0], undefined, 100);
     assert('second query hits memory cache', first.stats.memoryHits >= 1);
     await first.flush();
+    const shardFiles = fs
+        .readdirSync(first.astCacheDir)
+        .filter((file) => file.endsWith('.json') && file !== 'index.json');
+    eq('persistent AST cache writes one shard per parsed file', shardFiles.length, files.length);
     first.dispose();
 
     const second = new AstWorkerPool({ concurrency: 2, cacheDir, log: () => {} });
@@ -83,6 +95,35 @@ async function main() {
     second.clearOverlay(files[0]);
     const disk = await second.parseFile(files[0], undefined, 100);
     assert('closing overlay restores disk AST', disk.types.get('Type0').methods.has('Run'));
+
+    const corruptEntry = second.persisted.get(files[1]);
+    fs.writeFileSync(second._cacheShardFile(corruptEntry.key), '{broken');
+    const parsedBeforeRecovery = second.stats.parsed;
+    const recovered = await second.parseFile(files[1], undefined, 100);
+    assert('a corrupt AST shard is reparsed without failing the query', recovered.types.has('Type1'));
+    eq('corrupt shard recovery reparses only that file', second.stats.parsed, parsedBeforeRecovery + 1);
+    await second.flush();
+
+    const boundedCacheDir = path.join(tmp, 'bounded-cache');
+    const bounded = new AstWorkerPool({
+        concurrency: 1,
+        cacheDir: boundedCacheDir,
+        maxMemoryEntries: 2,
+        maxDiskEntries: 2,
+    });
+    await bounded.parseFiles(files.slice(0, 3).map((file) => ({ file })), 100);
+    eq('memory AST cache evicts its least-recently-used entry', bounded.memory.size, 2);
+    eq('disk AST manifest evicts its oldest entry', bounded.persisted.size, 2);
+    await bounded.flush();
+    const boundedManifest = JSON.parse(fs.readFileSync(bounded.cacheFile, 'utf8'));
+    eq('bounded disk manifest persists only retained entries', boundedManifest.files.length, 2);
+    const boundedShards = fs
+        .readdirSync(bounded.astCacheDir)
+        .filter((file) => file.endsWith('.json') && file !== 'index.json');
+    eq('bounded disk cache keeps only retained shards', boundedShards.length, 2);
+    bounded.clear();
+    assert('clear removes the sharded AST cache directory', !fs.existsSync(bounded.astCacheDir));
+    bounded.dispose();
 
     second.dispose();
     fs.rmSync(tmp, { recursive: true, force: true });

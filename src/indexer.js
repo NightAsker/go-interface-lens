@@ -3,6 +3,7 @@
 const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { execFile } = require('child_process');
 
 const {
@@ -16,6 +17,9 @@ const { listGoFiles, resolveGoModCache, grepInterfaceFilesForMethod } = require(
 const { findGoMod, resolveLockedModuleDirs, resolveModuleImportDirectory } = require('./gomod');
 const { currentBuildContext, shouldIncludeGoFile } = require('./build');
 const { AstWorkerPool, DEFAULT_AST_CONCURRENCY } = require('./ast-cache');
+
+const CANDIDATE_CACHE_SCHEMA = 1;
+const CANDIDATE_CACHE_WRITE_DELAY_MS = 500;
 
 const NON_METHOD_CALLS = new Set([
     'if',
@@ -172,6 +176,35 @@ function scanFileMetadata(text) {
         embeddedReferences,
         unresolvedEmbeds: hasEmbeds && embeddedReferences.size === 0,
         hasDotImport: imports.has('.'),
+    };
+}
+
+function serializeCandidateMetadata(metadata) {
+    return {
+        syntax: metadata.syntax,
+        packageName: metadata.packageName,
+        imports: [...(metadata.imports || new Map())],
+        aliases: [...(metadata.aliases || new Map())],
+        hasEmbeds: !!metadata.hasEmbeds,
+        embeddedReferences: [...(metadata.embeddedReferences || new Set())],
+        unresolvedEmbeds: !!metadata.unresolvedEmbeds,
+        hasDotImport: !!metadata.hasDotImport,
+    };
+}
+
+function deserializeCandidateMetadata(metadata) {
+    if (!metadata || metadata.syntax !== 'candidate-index-v1') return null;
+    return {
+        syntax: metadata.syntax,
+        packageName: metadata.packageName || null,
+        imports: new Map(metadata.imports || []),
+        aliases: new Map(metadata.aliases || []),
+        interfaces: new Map(),
+        types: new Map(),
+        hasEmbeds: !!metadata.hasEmbeds,
+        embeddedReferences: new Set(metadata.embeddedReferences || []),
+        unresolvedEmbeds: !!metadata.unresolvedEmbeds,
+        hasDotImport: !!metadata.hasDotImport,
     };
 }
 
@@ -398,6 +431,8 @@ class WorkspaceIndex {
         this._externalPackageCache = new Map();
         this._dependencyCandidateCache = new Map();
         this._goRootPromise = null;
+        this._candidateCacheDir = this.options.cacheDir || '';
+        this._candidateCacheStates = new Map();
         const cfg = this.getConfig();
         this.astPool = this.options.disableAst
             ? null
@@ -461,6 +496,178 @@ class WorkspaceIndex {
         return roots.length > 0;
     }
 
+    _candidateCacheFingerprint(cfg) {
+        return JSON.stringify({
+            goos: this._buildContext.goos,
+            goarch: this._buildContext.goarch,
+            tags: [...this._buildContext.tags].sort(),
+            excludedFolders: [...(cfg.excludedFolders || [])].sort(),
+        });
+    }
+
+    _candidateCacheFile(root) {
+        if (!this._candidateCacheDir) return '';
+        const key = crypto
+            .createHash('sha1')
+            .update(path.normalize(root))
+            .digest('hex')
+            .slice(0, 16);
+        return path.join(
+            this._candidateCacheDir,
+            `candidate-index-v${CANDIDATE_CACHE_SCHEMA}-${key}.json`
+        );
+    }
+
+    async _loadCandidateCache(root, cfg) {
+        const normalizedRoot = path.normalize(root);
+        if (this._candidateCacheStates.has(normalizedRoot)) {
+            return this._candidateCacheStates.get(normalizedRoot);
+        }
+        const state = {
+            root: normalizedRoot,
+            cacheFile: this._candidateCacheFile(normalizedRoot),
+            fingerprint: this._candidateCacheFingerprint(cfg),
+            entries: new Map(),
+            dirty: false,
+            writeTimer: null,
+            writePromise: null,
+        };
+        this._candidateCacheStates.set(normalizedRoot, state);
+        if (!state.cacheFile) return state;
+        try {
+            const payload = JSON.parse(await fs.promises.readFile(state.cacheFile, 'utf8'));
+            if (
+                payload.schema === CANDIDATE_CACHE_SCHEMA &&
+                path.normalize(payload.root || '') === normalizedRoot &&
+                payload.fingerprint === state.fingerprint &&
+                Array.isArray(payload.files)
+            ) {
+                for (const item of payload.files) {
+                    if (!Array.isArray(item) || typeof item[0] !== 'string' || !item[1]) continue;
+                    const entry = item[1];
+                    if (entry.included !== false && !deserializeCandidateMetadata(entry.metadata)) {
+                        continue;
+                    }
+                    state.entries.set(path.normalize(item[0]), entry);
+                }
+            }
+        } catch (err) {
+            if (err.code !== 'ENOENT') this.log(`Candidate index cache load failed: ${err.message}`);
+        }
+        return state;
+    }
+
+    _candidateCacheEntry(file, stat, included) {
+        if (!included) {
+            return { mtimeMs: stat.mtimeMs, size: stat.size, included: false };
+        }
+        const metadata = this._candidateMetadataByFile.get(path.normalize(file));
+        if (!metadata) return null;
+        return {
+            mtimeMs: stat.mtimeMs,
+            size: stat.size,
+            included: true,
+            methods: [...(this._candidateMethodsByFile.get(path.normalize(file)) || [])],
+            metadata: serializeCandidateMetadata(metadata),
+        };
+    }
+
+    _restoreCandidateFile(file, entry) {
+        if (!entry || entry.included === false) return true;
+        const metadata = deserializeCandidateMetadata(entry.metadata);
+        if (!metadata) return false;
+        const normalized = path.normalize(file);
+        this.files.set(normalized, metadata);
+        this._recordCandidateFile(normalized, '', metadata, new Set(entry.methods || []));
+        return true;
+    }
+
+    _markCandidateCacheDirty(state) {
+        if (!state || !state.cacheFile) return;
+        state.dirty = true;
+    }
+
+    _scheduleCandidateCacheWrite(state) {
+        if (!state || !state.cacheFile || state.writeTimer) return;
+        state.writeTimer = setTimeout(() => {
+            state.writeTimer = null;
+            this._flushCandidateCache(state).catch((err) => {
+                this.log(`Candidate index cache write failed: ${err.message}`);
+            });
+        }, CANDIDATE_CACHE_WRITE_DELAY_MS);
+        if (typeof state.writeTimer.unref === 'function') state.writeTimer.unref();
+    }
+
+    async _flushCandidateCache(state) {
+        if (!state || !state.cacheFile) return;
+        if (state.writePromise) {
+            await state.writePromise;
+            if (state.dirty) return this._flushCandidateCache(state);
+            return;
+        }
+        if (!state.dirty) return;
+        state.dirty = false;
+        const payload = JSON.stringify({
+            schema: CANDIDATE_CACHE_SCHEMA,
+            root: state.root,
+            fingerprint: state.fingerprint,
+            files: [...state.entries],
+        });
+        const temporary = `${state.cacheFile}.${process.pid}.tmp`;
+        state.writePromise = (async () => {
+            await fs.promises.mkdir(this._candidateCacheDir, { recursive: true });
+            await fs.promises.writeFile(temporary, payload);
+            await fs.promises.rename(temporary, state.cacheFile);
+        })();
+        try {
+            await state.writePromise;
+        } catch (err) {
+            state.dirty = true;
+            this._scheduleCandidateCacheWrite(state);
+            throw err;
+        } finally {
+            state.writePromise = null;
+        }
+        if (state.dirty) this._scheduleCandidateCacheWrite(state);
+    }
+
+    _isFileInCandidateCache(state, file) {
+        const relative = path.relative(state.root, path.normalize(file));
+        return (
+            relative === '' ||
+            (!path.isAbsolute(relative) &&
+                relative !== '..' &&
+                !relative.startsWith(`..${path.sep}`))
+        );
+    }
+
+    _updateCandidateCachesForFile(file) {
+        const normalized = path.normalize(file);
+        let stat;
+        try {
+            stat = fs.statSync(normalized);
+        } catch (_) {
+            return;
+        }
+        for (const state of this._candidateCacheStates.values()) {
+            if (!this._isFileInCandidateCache(state, normalized)) continue;
+            const entry = this._candidateCacheEntry(normalized, stat, this.files.has(normalized));
+            if (!entry) continue;
+            state.entries.set(normalized, entry);
+            this._markCandidateCacheDirty(state);
+            this._scheduleCandidateCacheWrite(state);
+        }
+    }
+
+    _removeFromCandidateCaches(file) {
+        const normalized = path.normalize(file);
+        for (const state of this._candidateCacheStates.values()) {
+            if (!state.entries.delete(normalized)) continue;
+            this._markCandidateCacheDirty(state);
+            this._scheduleCandidateCacheWrite(state);
+        }
+    }
+
     async _build(root) {
         const cfg = this.getConfig();
         const t0 = Date.now();
@@ -470,9 +677,23 @@ class WorkspaceIndex {
         );
         this.log(`Indexing ${goFiles.length} Go files under ${root}`);
 
-        await this._indexFilesInChunks(goFiles);
+        const candidateState = await this._loadCandidateCache(root, cfg);
+        const persistedState = candidateState.cacheFile ? candidateState : null;
+        const cacheStats = await this._indexFilesInChunks(goFiles, persistedState);
+        if (persistedState) {
+            const liveFiles = new Set(goFiles.map((file) => path.normalize(file)));
+            for (const cachedFile of [...persistedState.entries.keys()]) {
+                if (liveFiles.has(cachedFile)) continue;
+                persistedState.entries.delete(cachedFile);
+                this._markCandidateCacheDirty(persistedState);
+            }
+            await this._flushCandidateCache(persistedState);
+        }
         this._invalidateMerged();
-        this.log(`Index built in ${Date.now() - t0}ms`);
+        this.log(
+            `Index built in ${Date.now() - t0}ms ` +
+                `(${cacheStats.restored} cached, ${cacheStats.indexed} read)`
+        );
         this._installWatcher();
     }
 
@@ -486,16 +707,38 @@ class WorkspaceIndex {
      *
      * @param {string[]} goFiles absolute file paths
      */
-    async _indexFilesInChunks(goFiles) {
+    async _indexFilesInChunks(goFiles, candidateState) {
         const concurrency = Math.max(1, WorkspaceIndex.INDEX_READ_CONCURRENCY);
         const timeSliceMs = Math.max(0, WorkspaceIndex.INDEX_TIME_SLICE_MS);
         let sliceStarted = Date.now();
+        let restored = 0;
+        let indexed = 0;
 
         for (let start = 0; start < goFiles.length; start += concurrency) {
             const batch = goFiles.slice(start, start + concurrency);
             const sources = await Promise.all(
                 batch.map(async (file) => {
                     try {
+                        const normalized = path.normalize(file);
+                        const cached = candidateState && candidateState.entries.get(normalized);
+                        if (candidateState) {
+                            if (cached) {
+                                const stat = await fs.promises.stat(normalized);
+                                if (cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+                                    return { file: normalized, cached, stat };
+                                }
+                                const text = await fs.promises.readFile(normalized, 'utf8');
+                                return { file: normalized, text, stat };
+                            }
+                            const handle = await fs.promises.open(normalized, 'r');
+                            try {
+                                const stat = await handle.stat();
+                                const text = await handle.readFile('utf8');
+                                return { file: normalized, text, stat };
+                            } finally {
+                                await handle.close();
+                            }
+                        }
                         const text = await fs.promises.readFile(file, 'utf8');
                         if (!shouldIncludeGoFile(file, text, this._buildContext)) return null;
                         return { file, text };
@@ -508,7 +751,30 @@ class WorkspaceIndex {
 
             for (const source of sources) {
                 if (!source) continue;
+                if (source.cached) {
+                    if (this._restoreCandidateFile(source.file, source.cached)) {
+                        restored += 1;
+                        continue;
+                    }
+                }
+                if (!shouldIncludeGoFile(source.file, source.text, this._buildContext)) {
+                    if (candidateState) {
+                        candidateState.entries.set(
+                            source.file,
+                            this._candidateCacheEntry(source.file, source.stat, false)
+                        );
+                        this._markCandidateCacheDirty(candidateState);
+                    }
+                    indexed += 1;
+                    continue;
+                }
                 this._indexText(source.file, source.text);
+                if (candidateState) {
+                    const entry = this._candidateCacheEntry(source.file, source.stat, true);
+                    if (entry) candidateState.entries.set(source.file, entry);
+                    this._markCandidateCacheDirty(candidateState);
+                }
+                indexed += 1;
 
                 if (Date.now() - sliceStarted >= timeSliceMs) {
                     await this._yieldToEventLoop();
@@ -516,6 +782,7 @@ class WorkspaceIndex {
                 }
             }
         }
+        return { restored, indexed };
     }
 
     _yieldToEventLoop() {
@@ -561,10 +828,10 @@ class WorkspaceIndex {
         this._embeddedPackageGraph = null;
     }
 
-    _recordCandidateFile(absPath, text, parsed) {
+    _recordCandidateFile(absPath, text, parsed, candidateNames) {
         const normalized = path.normalize(absPath);
         this._removeCandidateFile(normalized);
-        const names = scanCandidateMethodNames(text);
+        const names = candidateNames === undefined ? scanCandidateMethodNames(text) : candidateNames;
         this._candidateMethodsByFile.set(normalized, names);
         for (const name of names) {
             if (!this._candidateFilesByMethod.has(name)) this._candidateFilesByMethod.set(name, new Set());
@@ -606,6 +873,7 @@ class WorkspaceIndex {
         try {
             const text = fs.readFileSync(absPath, 'utf8');
             this._indexText(absPath, text, true);
+            this._updateCandidateCachesForFile(absPath);
         } catch (err) {
             this.log(`Failed to index ${absPath}: ${err.message}`);
         }
@@ -617,6 +885,7 @@ class WorkspaceIndex {
         this.overlayTexts.delete(absPath);
         this._removeCandidateFile(absPath);
         if (this.astPool) this.astPool.invalidate(absPath);
+        this._removeFromCandidateCaches(absPath);
     }
 
     updateOverlay(absPath, text, notify) {
@@ -653,6 +922,7 @@ class WorkspaceIndex {
         this.overlays.delete(absPath);
         this.overlayTexts.delete(absPath);
         this._indexText(absPath, text, true);
+        this._updateCandidateCachesForFile(absPath);
         this._invalidateMerged();
         this._emitChange();
     }
@@ -2294,6 +2564,21 @@ class WorkspaceIndex {
         this._externalImportDirectoryCache.clear();
         this._externalPackageCache.clear();
         this._dependencyCandidateCache.clear();
+        for (const state of this._candidateCacheStates.values()) {
+            if (state.writeTimer) clearTimeout(state.writeTimer);
+            state.writeTimer = null;
+            state.entries.clear();
+            state.dirty = false;
+            if (!state.cacheFile) continue;
+            try {
+                fs.unlinkSync(state.cacheFile);
+            } catch (err) {
+                if (err.code !== 'ENOENT') {
+                    this.log(`Candidate index cache clear failed: ${err.message}`);
+                }
+            }
+        }
+        this._candidateCacheStates.clear();
         if (this.astPool) this.astPool.clear();
         this._invalidateMerged();
         this._builds.clear();
@@ -2313,6 +2598,11 @@ class WorkspaceIndex {
             this.astPool.dispose();
             this.astPool = null;
         }
+        for (const state of this._candidateCacheStates.values()) {
+            if (state.writeTimer) clearTimeout(state.writeTimer);
+            state.writeTimer = null;
+        }
+        this._candidateCacheStates.clear();
         this.files.clear();
         this.overlays.clear();
         this.overlayTexts.clear();

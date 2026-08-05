@@ -3,13 +3,24 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const os = require('os');
 const { Worker } = require('worker_threads');
 const { deserializeParsedFile } = require('./ast');
 
-const CACHE_SCHEMA = 5;
+const CACHE_SCHEMA = 6;
 const DEFAULT_AST_CONCURRENCY = 16;
 const MAX_AST_CONCURRENCY = 32;
 const DEFAULT_WARM_CONCURRENCY = 4;
+const DEFAULT_IDLE_TIMEOUT_MS = 30_000;
+const DEFAULT_MEMORY_CACHE_ENTRIES = 512;
+const DEFAULT_DISK_CACHE_ENTRIES = 4096;
+const DEFAULT_DISK_CACHE_BYTES = 256 * 1024 * 1024;
+const CACHE_WRITE_CONCURRENCY = 8;
+
+function availableParallelism() {
+    if (typeof os.availableParallelism === 'function') return os.availableParallelism();
+    return Math.max(1, (os.cpus() || []).length);
+}
 
 class AstWorkerPool {
     constructor(options) {
@@ -25,12 +36,42 @@ class AstWorkerPool {
             1,
             Math.min(this.concurrency, requestedWarmConcurrency)
         );
+        const parallelism = Number.isFinite(opts.parallelism)
+            ? Math.max(1, Math.trunc(opts.parallelism))
+            : availableParallelism();
+        // WASM workers each own a parser runtime. Leaving headroom for the
+        // extension host and OS is faster than saturating every logical CPU,
+        // especially while new workers are compiling their WASM modules.
+        this.effectiveConcurrency = Math.max(
+            this.warmConcurrency,
+            Math.min(this.concurrency, Math.max(1, Math.floor((parallelism * 2) / 3)))
+        );
+        this.idleTimeoutMs = Number.isFinite(opts.idleTimeoutMs)
+            ? Math.max(0, Math.trunc(opts.idleTimeoutMs))
+            : DEFAULT_IDLE_TIMEOUT_MS;
+        this.maxMemoryEntries = Number.isFinite(opts.maxMemoryEntries)
+            ? Math.max(1, Math.trunc(opts.maxMemoryEntries))
+            : DEFAULT_MEMORY_CACHE_ENTRIES;
+        this.maxDiskEntries = Number.isFinite(opts.maxDiskEntries)
+            ? Math.max(1, Math.trunc(opts.maxDiskEntries))
+            : DEFAULT_DISK_CACHE_ENTRIES;
+        this.maxDiskBytes = Number.isFinite(opts.maxDiskBytes)
+            ? Math.max(1, Math.trunc(opts.maxDiskBytes))
+            : DEFAULT_DISK_CACHE_BYTES;
         this.cacheDir = opts.cacheDir || '';
         this.log = opts.log || (() => {});
-        this.cacheFile = this.cacheDir ? path.join(this.cacheDir, `ast-cache-v${CACHE_SCHEMA}.json`) : '';
+        this.astCacheDir = this.cacheDir
+            ? path.join(this.cacheDir, `ast-cache-v${CACHE_SCHEMA}`)
+            : '';
+        this.cacheFile = this.astCacheDir ? path.join(this.astCacheDir, 'index.json') : '';
         this.memory = new Map();
         this.overlays = new Map();
         this.persisted = new Map();
+        this.persistedBytes = 0;
+        this.pendingWrites = new Map();
+        this.pendingDeletes = new Set();
+        this.manifestDirty = false;
+        this.flushPromise = null;
         this.inflight = new Map();
         this.loaded = false;
         this.loadPromise = null;
@@ -40,6 +81,7 @@ class AstWorkerPool {
         this.nextSequence = 1;
         this.generation = 1;
         this.writeTimer = null;
+        this.shrinkTimer = null;
         this.disposed = false;
         this.stats = {
             parsed: 0,
@@ -61,15 +103,108 @@ class AstWorkerPool {
             }
             try {
                 const payload = JSON.parse(await fs.promises.readFile(this.cacheFile, 'utf8'));
-                if (payload.schema === CACHE_SCHEMA) {
-                    this.persisted = new Map(Object.entries(payload.files || {}));
+                if (payload.schema === CACHE_SCHEMA && Array.isArray(payload.files)) {
+                    this.persisted = new Map(
+                        payload.files.filter(
+                            (item) =>
+                                Array.isArray(item) &&
+                                typeof item[0] === 'string' &&
+                                item[1] &&
+                                typeof item[1].key === 'string'
+                        )
+                    );
+                    this.persistedBytes = [...this.persisted.values()].reduce(
+                        (total, entry) => total + (Number.isFinite(entry.bytes) ? entry.bytes : 0),
+                        0
+                    );
+                    this._trimPersisted();
                 }
             } catch (err) {
                 if (err.code !== 'ENOENT') this.log(`AST cache load failed: ${err.message}`);
             }
             this.loaded = true;
+            if (this.manifestDirty) this._scheduleWrite();
         })();
         return this.loadPromise;
+    }
+
+    _cacheKey(file) {
+        return crypto.createHash('sha1').update(path.normalize(file)).digest('hex');
+    }
+
+    _cacheShardFile(key) {
+        return path.join(this.astCacheDir, `${key}.json`);
+    }
+
+    _rememberMemory(file, value) {
+        this.memory.delete(file);
+        this.memory.set(file, value);
+        while (this.memory.size > this.maxMemoryEntries) {
+            this.memory.delete(this.memory.keys().next().value);
+        }
+    }
+
+    _deletePersisted(file) {
+        const entry = this.persisted.get(file);
+        if (!entry) return false;
+        this.persisted.delete(file);
+        this.persistedBytes = Math.max(0, this.persistedBytes - (entry.bytes || 0));
+        this.pendingWrites.delete(file);
+        this.pendingDeletes.add(entry.key);
+        this.manifestDirty = true;
+        return true;
+    }
+
+    _trimPersisted() {
+        while (
+            this.persisted.size > this.maxDiskEntries ||
+            this.persistedBytes > this.maxDiskBytes
+        ) {
+            const oldest = this.persisted.keys().next().value;
+            if (oldest === undefined) break;
+            this._deletePersisted(oldest);
+        }
+    }
+
+    _setPersisted(file, stat, serialized) {
+        const normalized = path.normalize(file);
+        const existing = this.persisted.get(normalized);
+        if (existing) {
+            this.persisted.delete(normalized);
+            this.persistedBytes = Math.max(0, this.persistedBytes - (existing.bytes || 0));
+        }
+        const entry = {
+            key: existing ? existing.key : this._cacheKey(normalized),
+            mtimeMs: stat.mtimeMs,
+            size: stat.size,
+            bytes: Buffer.byteLength(JSON.stringify(serialized)),
+        };
+        this.persisted.set(normalized, entry);
+        this.persistedBytes += entry.bytes;
+        this.pendingDeletes.delete(entry.key);
+        this.pendingWrites.set(normalized, { entry, parsed: serialized });
+        this.manifestDirty = true;
+        this._trimPersisted();
+    }
+
+    async _readPersisted(file, entry) {
+        try {
+            const payload = JSON.parse(await fs.promises.readFile(this._cacheShardFile(entry.key), 'utf8'));
+            if (
+                payload.schema !== CACHE_SCHEMA ||
+                path.normalize(payload.file || '') !== path.normalize(file) ||
+                payload.mtimeMs !== entry.mtimeMs ||
+                payload.size !== entry.size
+            ) {
+                throw new Error('AST cache shard metadata mismatch');
+            }
+            return payload.parsed;
+        } catch (err) {
+            this._deletePersisted(path.normalize(file));
+            this._scheduleWrite();
+            if (err.code !== 'ENOENT') this.log(`AST cache shard load failed: ${err.message}`);
+            return null;
+        }
     }
 
     _ensureWorkers(target) {
@@ -83,9 +218,43 @@ class AstWorkerPool {
 
     _desiredWorkerCount() {
         return Math.min(
-            this.concurrency,
+            this.effectiveConcurrency,
             Math.max(this.warmConcurrency, this.stats.active + this.queue.length)
         );
+    }
+
+    _cancelShrink() {
+        if (!this.shrinkTimer) return;
+        clearTimeout(this.shrinkTimer);
+        this.shrinkTimer = null;
+    }
+
+    _scheduleShrink() {
+        if (
+            this.disposed ||
+            this.shrinkTimer ||
+            this.stats.active !== 0 ||
+            this.queue.length !== 0 ||
+            this.workers.length <= this.warmConcurrency
+        ) {
+            return;
+        }
+        this.shrinkTimer = setTimeout(() => {
+            this.shrinkTimer = null;
+            this._shrinkIdleWorkers();
+        }, this.idleTimeoutMs);
+        if (typeof this.shrinkTimer.unref === 'function') this.shrinkTimer.unref();
+    }
+
+    _shrinkIdleWorkers() {
+        if (this.disposed || this.stats.active !== 0 || this.queue.length !== 0) return;
+        const retiring = this.workers.slice(this.warmConcurrency);
+        this.workers = this.workers.slice(0, this.warmConcurrency);
+        for (const state of retiring) {
+            state.retiring = true;
+            if (!state.ready) state.resolveReady(false);
+            state.worker.terminate();
+        }
     }
 
     _spawnWorker() {
@@ -98,6 +267,7 @@ class AstWorkerPool {
             busy: false,
             job: null,
             failed: false,
+            retiring: false,
             ready: false,
             readyPromise,
             resolveReady,
@@ -116,14 +286,16 @@ class AstWorkerPool {
         });
         worker.on('error', (err) => this._workerFailed(state, err));
         worker.on('exit', (code) => {
-            if (!this.disposed && code !== 0) this._workerFailed(state, new Error(`AST worker exited with code ${code}`));
+            if (!this.disposed && !state.retiring && code !== 0) {
+                this._workerFailed(state, new Error(`AST worker exited with code ${code}`));
+            }
         });
         this.workers.push(state);
         this.stats.maxWorkers = Math.max(this.stats.maxWorkers, this.workers.length);
     }
 
     _workerFailed(state, err) {
-        if (state.failed) return;
+        if (state.failed || state.retiring) return;
         state.failed = true;
         if (!state.ready) state.resolveReady(false);
         const index = this.workers.indexOf(state);
@@ -228,10 +400,12 @@ class AstWorkerPool {
             this.stats.maxActive = Math.max(this.stats.maxActive, this.stats.active);
             state.worker.postMessage({ id: job.id, file: job.file, text: job.text });
         }
+        this._scheduleShrink();
     }
 
     _run(file, text, priority) {
         if (this.disposed) return Promise.reject(new Error('AST worker pool is disposed'));
+        this._cancelShrink();
         return new Promise((resolve, reject) => {
             this._enqueue({
                 id: this.nextJobID++,
@@ -281,24 +455,29 @@ class AstWorkerPool {
         const stat = await fs.promises.stat(file);
         const memory = this.memory.get(file);
         if (memory && memory.mtimeMs === stat.mtimeMs && memory.size === stat.size) {
+            this._rememberMemory(file, memory);
             this.stats.memoryHits += 1;
             return memory.parsed;
         }
         const persisted = this.persisted.get(file);
         if (persisted && persisted.mtimeMs === stat.mtimeMs && persisted.size === stat.size) {
-            const parsed = deserializeParsedFile(persisted.parsed);
-            if (generation === this.generation) {
-                this.memory.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, parsed });
+            const pending = this.pendingWrites.get(file);
+            const serialized = pending ? pending.parsed : await this._readPersisted(file, persisted);
+            if (serialized) {
+                const parsed = deserializeParsedFile(serialized);
+                if (generation === this.generation) {
+                    this._rememberMemory(file, { mtimeMs: stat.mtimeMs, size: stat.size, parsed });
+                }
+                this.stats.diskHits += 1;
+                return parsed;
             }
-            this.stats.diskHits += 1;
-            return parsed;
         }
 
         const serialized = await this._run(file, undefined, priority);
         const parsed = deserializeParsedFile(serialized);
         if (generation === this.generation) {
-            this.memory.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, parsed });
-            this.persisted.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, parsed: serialized });
+            this._rememberMemory(file, { mtimeMs: stat.mtimeMs, size: stat.size, parsed });
+            if (this.cacheFile) this._setPersisted(file, stat, serialized);
         }
         this.stats.parsed += 1;
         this._scheduleWrite();
@@ -326,12 +505,14 @@ class AstWorkerPool {
         }
         this.memory.delete(file);
         this.overlays.delete(file);
-        if (this.persisted.delete(file)) this._scheduleWrite();
+        if (this._deletePersisted(path.normalize(file))) this._scheduleWrite();
     }
 
     clear() {
         this.generation += 1;
         this.inflight.clear();
+        if (this.writeTimer) clearTimeout(this.writeTimer);
+        this.writeTimer = null;
         if (!this.loaded) {
             this.loaded = true;
             this.loadPromise = Promise.resolve();
@@ -339,14 +520,17 @@ class AstWorkerPool {
         this.memory.clear();
         this.overlays.clear();
         this.persisted.clear();
-        if (this.cacheFile) {
+        this.persistedBytes = 0;
+        this.pendingWrites.clear();
+        this.pendingDeletes.clear();
+        this.manifestDirty = false;
+        if (this.astCacheDir) {
             try {
-                fs.unlinkSync(this.cacheFile);
+                fs.rmSync(this.astCacheDir, { recursive: true, force: true });
             } catch (err) {
                 if (err.code !== 'ENOENT') this.log(`AST cache clear failed: ${err.message}`);
             }
         }
-        this._scheduleWrite();
     }
 
     _scheduleWrite() {
@@ -360,15 +544,94 @@ class AstWorkerPool {
 
     async flush() {
         if (!this.cacheFile) return;
-        await fs.promises.mkdir(this.cacheDir, { recursive: true });
-        const payload = JSON.stringify({ schema: CACHE_SCHEMA, files: Object.fromEntries(this.persisted) });
-        const temporary = `${this.cacheFile}.${process.pid}.tmp`;
-        await fs.promises.writeFile(temporary, payload);
-        await fs.promises.rename(temporary, this.cacheFile);
+        if (this.flushPromise) {
+            await this.flushPromise;
+            if (this.pendingWrites.size > 0 || this.pendingDeletes.size > 0 || this.manifestDirty) {
+                return this.flush();
+            }
+            return;
+        }
+        if (this.pendingWrites.size === 0 && this.pendingDeletes.size === 0 && !this.manifestDirty) {
+            return;
+        }
+
+        const writes = [...this.pendingWrites];
+        const deletes = [...this.pendingDeletes];
+        const writeManifest = this.manifestDirty;
+        this.pendingWrites.clear();
+        this.pendingDeletes.clear();
+        this.manifestDirty = false;
+        const manifest = JSON.stringify({ schema: CACHE_SCHEMA, files: [...this.persisted] });
+
+        this.flushPromise = (async () => {
+            await fs.promises.mkdir(this.astCacheDir, { recursive: true });
+            for (let start = 0; start < writes.length; start += CACHE_WRITE_CONCURRENCY) {
+                await Promise.all(
+                    writes.slice(start, start + CACHE_WRITE_CONCURRENCY).map(async ([file, value]) => {
+                        const target = this._cacheShardFile(value.entry.key);
+                        const temporary = `${target}.${process.pid}.tmp`;
+                        const payload = JSON.stringify({
+                            schema: CACHE_SCHEMA,
+                            file,
+                            mtimeMs: value.entry.mtimeMs,
+                            size: value.entry.size,
+                            parsed: value.parsed,
+                        });
+                        await fs.promises.writeFile(temporary, payload);
+                        await fs.promises.rename(temporary, target);
+                    })
+                );
+            }
+            for (let start = 0; start < deletes.length; start += CACHE_WRITE_CONCURRENCY) {
+                await Promise.all(
+                    deletes.slice(start, start + CACHE_WRITE_CONCURRENCY).map(async (key) => {
+                        try {
+                            await fs.promises.unlink(this._cacheShardFile(key));
+                        } catch (err) {
+                            if (err.code !== 'ENOENT') throw err;
+                        }
+                    })
+                );
+            }
+            if (writeManifest) {
+                const temporary = `${this.cacheFile}.${process.pid}.tmp`;
+                await fs.promises.writeFile(temporary, manifest);
+                await fs.promises.rename(temporary, this.cacheFile);
+            }
+        })();
+        try {
+            await this.flushPromise;
+        } catch (err) {
+            for (const [file, value] of writes) {
+                const current = this.persisted.get(file);
+                if (
+                    current &&
+                    current.key === value.entry.key &&
+                    current.mtimeMs === value.entry.mtimeMs &&
+                    current.size === value.entry.size
+                ) {
+                    this.pendingWrites.set(file, value);
+                }
+            }
+            for (const key of deletes) {
+                if (![...this.persisted.values()].some((entry) => entry.key === key)) {
+                    this.pendingDeletes.add(key);
+                }
+            }
+            if (writeManifest) this.manifestDirty = true;
+            this._scheduleWrite();
+            throw err;
+        } finally {
+            this.flushPromise = null;
+        }
+        if (this.pendingWrites.size > 0 || this.pendingDeletes.size > 0 || this.manifestDirty) {
+            return this.flush();
+        }
     }
 
     dispose() {
         this.disposed = true;
+        this._cancelShrink();
         if (this.writeTimer) clearTimeout(this.writeTimer);
         this.writeTimer = null;
         for (const job of this.queue) job.reject(new Error('AST worker pool disposed'));
@@ -381,15 +644,7 @@ class AstWorkerPool {
         }
         this.workers = [];
         if (this.cacheFile && this.loaded) {
-            try {
-                fs.mkdirSync(this.cacheDir, { recursive: true });
-                fs.writeFileSync(
-                    this.cacheFile,
-                    JSON.stringify({ schema: CACHE_SCHEMA, files: Object.fromEntries(this.persisted) })
-                );
-            } catch (err) {
-                this.log(`AST cache final write failed: ${err.message}`);
-            }
+            this.flush().catch((err) => this.log(`AST cache final write failed: ${err.message}`));
         }
     }
 }
@@ -400,4 +655,8 @@ module.exports = {
     DEFAULT_AST_CONCURRENCY,
     MAX_AST_CONCURRENCY,
     DEFAULT_WARM_CONCURRENCY,
+    DEFAULT_IDLE_TIMEOUT_MS,
+    DEFAULT_MEMORY_CACHE_ENTRIES,
+    DEFAULT_DISK_CACHE_ENTRIES,
+    DEFAULT_DISK_CACHE_BYTES,
 };
