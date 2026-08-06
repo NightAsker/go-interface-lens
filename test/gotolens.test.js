@@ -162,6 +162,9 @@ async function main() {
             '{',
             'SplitMethod()',
             '}',
+            'type Generic[P any] interface { GenericMethod(P) }',
+            'type TypeSet interface { ~int | ~string }',
+            'type EmbeddedTypeSet interface { TypeSet; ConstraintMethod() }',
             'type Mixed struct{}',
             'func (Mixed) AliasMethod() {}',
         ].join('\n')
@@ -175,6 +178,12 @@ async function main() {
     console.log('\n== interface declaration variant lenses ==');
     assert('interface alias gets a lens', implementationTargets.includes('Alias'));
     assert('next-line interface brace gets a lens', implementationTargets.includes('Split'));
+    assert('generic runtime interface gets a lens', implementationTargets.includes('Generic'));
+    assert('type-set constraint does not get a lens', !implementationTargets.includes('TypeSet'));
+    assert(
+        'interface embedding a type set does not get a lens',
+        !implementationTargets.includes('EmbeddedTypeSet')
+    );
     assert(
         'one provider emits interface-method lenses from the shared AST',
         interfaceLenses.some(

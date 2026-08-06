@@ -2,6 +2,24 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [1.2.5] - 2026-08-06
+
+### Added
+
+- Show interface-level and method-level CodeLens for generic runtime interfaces.
+- Infer one consistent set of type arguments across the complete interface
+  method set, including multiple parameters, nested composite types, generic
+  receivers, and generic interface or struct embeddings.
+- Validate inferred concrete type arguments against resolvable interface method
+  constraints, including pointer and value method-set rules.
+- Validate exact and approximate type terms, unions, `comparable`, named type-set
+  constraints, and constraints that depend on another inferred type parameter.
+
+### Fixed
+
+- Treat generic interfaces such as `SingleStepTask[P AsyncTaskPayload]` as
+  navigable interfaces instead of silently suppressing their CodeLens.
+
 ## [1.2.4] - 2026-08-05
 
 ### Performance

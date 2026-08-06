@@ -1,6 +1,6 @@
 # Go Interface Lens
 
-[![Version](https://img.shields.io/badge/version-1.2.2-blue.svg)](https://github.com/NightAsker/go-interface-lens)
+[![Version](https://img.shields.io/badge/version-1.2.5-blue.svg)](https://github.com/NightAsker/go-interface-lens)
 [![VSCode](https://img.shields.io/badge/VSCode-1.76+-green.svg)](https://code.visualstudio.com/)
 
 一个面向大型 Go 工程的 VS Code / Cursor 接口导航扩展。它在接口、接口方法和具体实现之间提供双向 CodeLens，同时使用轻量候选索引和按需 AST 校验兼顾响应速度与查找准确性。
@@ -29,7 +29,9 @@
 - 标准库接口、`go.mod` 锁定依赖、local replace、module replace 和 GOROOT 源码。
 - import 别名、包内别名、跨包别名链和复合别名。
 - `byte`/`uint8`、`rune`/`int32`、`any`/`interface{}` 等价关系，并尊重包级同名声明遮蔽。
-- 多行声明、分组参数、泛型实例、匿名接口和嵌套函数类型。
+- 多行声明、分组参数、泛型接口与实现、泛型嵌入、泛型实例、匿名接口和嵌套函数类型。
+- 泛型接口会跨完整方法集统一推导类型实参，并校验可解析的接口方法集约束；支持多个类型参数及其在复合类型中的嵌套、重复使用。
+- 类型参数约束支持精确类型项、`~T`、union、`comparable`、具名约束和依赖其他类型参数的约束；只能作为约束使用的接口本身仍不会显示 CodeLens。
 - 指针、切片、数组、map、可变参数、channel、包限定类型和 Unicode 参数名的签名归一化。
 - Go build tags、GOOS/GOARCH 文件约束和未保存编辑内容。
 
@@ -185,7 +187,7 @@ WASM、Go grammar WASM 和 MIT 许可证；依赖包里的其他语言 grammar �
    }
    ```
 
-3. 确认接口不是只能用于约束的泛型接口。
+3. 确认接口本身不含 `~int | ~string` 之类只能用于类型约束的类型集合；带类型参数但方法集可在运行时使用的泛型接口支持 CodeLens。
 4. 执行 `Developer: Reload Window`。
 5. 查看 `Output -> Go Interface Lens` 和 Extension Host 日志。
 

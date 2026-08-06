@@ -176,7 +176,7 @@ class GoCodeLensProvider {
             new vscode.Range(index, 0, index, document.lineAt(index).text.length);
 
         for (const [interfaceName, info] of parsed.interfaces) {
-            if (info.constraint || info.generic) continue;
+            if (info.constraint) continue;
             codeLenses.push(
                 new vscode.CodeLens(lineRange(info.line), {
                     title: 'implementations',

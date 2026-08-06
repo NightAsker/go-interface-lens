@@ -68,6 +68,8 @@ const imports = await parse([
     'import model "example.com/acme/model"',
     'type Store interface { Save(model.User) error }',
     'type Number interface { ~int | int64 }',
+    'type NamedNumber interface { Number; Value() int }',
+    'type UserID int',
     'type Impl struct{}',
     'func (Impl) Save(value model.User) error { return nil }',
 ]);
@@ -77,6 +79,50 @@ eq(
     imports.interfaces.get('Store').methods.get('Save')
 );
 assert('constraint interface marked non-basic', imports.interfaces.get('Number').constraint);
+eq('type-set union terms are retained', imports.interfaces.get('Number').typeElements, ['~int|int64']);
+assert('a locally embedded type set keeps the outer interface non-basic', imports.interfaces.get('NamedNumber').constraint);
+eq('named type underlying type is retained', imports.types.get('UserID').underlying, 'int');
+
+console.log('\n== declaration AST: generic interfaces and receivers ==');
+const generics = await parse([
+    'package p',
+    'import task "example.com/common/task"',
+    'type Base[T any] interface { Base(T) }',
+    'type SingleStepTask[P task.AsyncTaskPayload, R interface { comparable; ~int | ~string }] interface {',
+    '    Base[P]',
+    '    Decode(body []byte) (P, error)',
+    '    Channel(chan P)',
+    '    Shape(struct { Payload P; Results []R })',
+    '}',
+    'type GenericImpl[T task.AsyncTaskPayload, R any] struct{}',
+    'func (GenericImpl[X, Y]) Decode([]byte) (X, error) { panic("unused") }',
+    'func (GenericImpl[A, B]) Channel(chan A) {}',
+    'func (GenericImpl[C, D]) Shape(struct { Payload C; Results []D }) {}',
+]);
+const genericInterface = generics.interfaces.get('SingleStepTask');
+eq('generic interface parameters retain declaration order', genericInterface.typeParameters.map((p) => p.marker), ['$0', '$1']);
+eq(
+    'qualified type-parameter constraint retains import identity',
+    genericInterface.typeParameters[0].constraint,
+    '@{example.com/common/task}.AsyncTaskPayload'
+);
+eq('generic interface embed retains its arguments', genericInterface.embedArguments.get('Base'), ['$0']);
+eq(
+    'inline type-set constraint elements are retained',
+    genericInterface.typeParameters[1].constraintTypeElements,
+    ['comparable', '~int|~string']
+);
+eq('generic channel element keeps a type-variable boundary', genericInterface.methods.get('Channel'), '(chan($0))()');
+eq(
+    'generic anonymous struct fields keep names and type-variable boundaries',
+    genericInterface.methods.get('Shape'),
+    '(struct{Payload:$0;Results:[]$1})()'
+);
+eq(
+    'receiver type parameter names normalize by position across methods',
+    generics.types.get('GenericImpl').methods.get('Shape'),
+    '(struct{Payload:$0;Results:[]$1})()'
+);
 
 console.log('\n== declaration AST: complete field normalization ==');
 const normalized = await parse([

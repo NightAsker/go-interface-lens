@@ -10,7 +10,10 @@ const {
     resolveInterfaceMethods,
     satisfies,
     looseSignatureEqual,
+    inferTypeParameterBindings,
+    substituteTypeParameters,
     splitNormalizedSignature,
+    splitTopLevel,
     BUILTIN_INTERFACES,
 } = require('./signatures');
 const { listGoFiles, resolveGoModCache, grepInterfaceFilesForMethod } = require('./search');
@@ -50,6 +53,28 @@ const NON_METHOD_CALLS = new Set([
     'recover',
 ]);
 
+const PREDECLARED_CONCRETE_TYPES = new Set([
+    'bool',
+    'byte',
+    'complex64',
+    'complex128',
+    'float32',
+    'float64',
+    'int',
+    'int8',
+    'int16',
+    'int32',
+    'int64',
+    'rune',
+    'string',
+    'uint',
+    'uint8',
+    'uint16',
+    'uint32',
+    'uint64',
+    'uintptr',
+]);
+
 function scanCandidateMethodNames(text) {
     const names = new Set();
     const matcher = /\b([A-Z_a-z]\w*)\s*\(/g;
@@ -61,7 +86,7 @@ function scanCandidateMethodNames(text) {
 }
 
 const CANDIDATE_TYPE_REFERENCE =
-    String.raw`\*?(?:[A-Z_a-z]\w*\.)?[A-Z_a-z]\w*(?:\s*\[[^\]\n]*\])?`;
+    String.raw`\*?(?:[A-Z_a-z]\w*\.)?[A-Z_a-z]\w*(?:\s*\[(?:[^\[\]\n]|\[[^\]\n]*\])*\])?`;
 const EMBED_ONLY_LINE_RE = new RegExp(
     String.raw`^\s*${CANDIDATE_TYPE_REFERENCE}\s*(?:\x60[^\x60\n]*\x60)?\s*;?\s*$`,
     'm'
@@ -70,7 +95,7 @@ const INLINE_EMBED_RE = new RegExp(
     String.raw`(?:\{|;)\s*${CANDIDATE_TYPE_REFERENCE}\s*(?=;|\})`
 );
 const CAPTURED_TYPE_REFERENCE =
-    String.raw`\*?(?:([A-Z_a-z]\w*)\.)?([A-Z_a-z]\w*)(?:\s*\[[^\]\n]*\])?`;
+    String.raw`\*?(?:([A-Z_a-z]\w*)\.)?([A-Z_a-z]\w*)(?:\s*\[(?:[^\[\]\n]|\[[^\]\n]*\])*\])?`;
 const EMBED_ONLY_LINE_CAPTURE_RE = new RegExp(
     String.raw`^\s*${CAPTURED_TYPE_REFERENCE}\s*(?:\x60[^\x60\n]*\x60)?\s*;?\s*(?://.*)?$`,
     'gm'
@@ -125,7 +150,9 @@ function scanImports(text) {
 }
 
 function normalizedCandidateReference(reference) {
-    return reference.replace(/^\s*\*\s*/, '').replace(/\s*\[[^\]\n]*\]\s*$/, '');
+    return reference
+        .replace(/^\s*\*\s*/, '')
+        .replace(/\s*\[(?:[^\[\]\n]|\[[^\]\n]*\])*\]\s*$/, '');
 }
 
 function scanTypeAliases(text) {
@@ -236,6 +263,27 @@ function importedSignatureReferences(signature) {
         importPath: match[1],
         name: match[2],
     }));
+}
+
+function normalizedNamedTypeReference(value) {
+    let source = (value || '').trim();
+    let pointer = false;
+    while (source.startsWith('*')) {
+        pointer = true;
+        source = source.slice(1);
+    }
+    const match = source.match(
+        /^(@\{([^}]+)\}\.([A-Z_a-z]\w*)|([A-Z_a-z]\w*))(?:\[(.*)\])?$/
+    );
+    if (!match) return null;
+    return {
+        name: match[3] || match[4],
+        importPath: match[2] || null,
+        pointer,
+        arguments: match[5]
+            ? splitTopLevel(match[5], ',').map((argument) => argument.trim())
+            : [],
+    };
 }
 
 function potentialAliasImports(signatures) {
@@ -364,6 +412,22 @@ const CANONICAL_BUILTIN_INTERFACES = new Map(
         ),
     ])
 );
+
+function instantiateMethods(methods, typeParameters, typeArguments) {
+    const parameters = typeParameters || [];
+    const argumentsList = typeArguments || [];
+    if (parameters.length === 0) return new Map(methods);
+    if (parameters.length !== argumentsList.length) return null;
+    const bindings = new Map(
+        parameters.map((parameter, index) => [parameter.marker, argumentsList[index]])
+    );
+    return new Map(
+        [...methods].map(([name, signature]) => [
+            name,
+            substituteTypeParameters(signature, bindings),
+        ])
+    );
+}
 
 /**
  * Workspace-wide, incrementally maintained index of Go interfaces and types.
@@ -981,11 +1045,8 @@ class WorkspaceIndex {
         if (!info) return { methods: new Map(), unresolved: [interfaceName] };
         const methods = new Map(info.methods);
         const unresolved = [];
+        let constraint = !!info.constraint;
         for (const embed of info.embeds || []) {
-            if (info.genericEmbeds && info.genericEmbeds.has(embed)) {
-                unresolved.push(embed);
-                continue;
-            }
             if (BUILTIN_INTERFACES.has(embed)) {
                 for (const [name, signature] of CANONICAL_BUILTIN_INTERFACES.get(embed)) {
                     if (!methods.has(name)) methods.set(name, signature);
@@ -1010,14 +1071,500 @@ class WorkspaceIndex {
                 interfaces,
                 new Set(visiting)
             );
-            for (const [name, signature] of nested.methods) {
+            constraint = constraint || !!nested.constraint;
+            let nestedMethods = nested.methods;
+            if (info.genericEmbeds && info.genericEmbeds.has(embed)) {
+                nestedMethods = instantiateMethods(
+                    nested.methods,
+                    nested.typeParameters,
+                    info.embedArguments && info.embedArguments.get(embed)
+                );
+                if (!nestedMethods) {
+                    unresolved.push(embed);
+                    continue;
+                }
+            }
+            for (const [name, signature] of nestedMethods) {
                 if (!methods.has(name)) methods.set(name, signature);
             }
             unresolved.push(...nested.unresolved);
         }
-        const resolved = { methods, unresolved };
+        const resolved = {
+            methods,
+            unresolved,
+            typeParameters: info.typeParameters || [],
+            packageKey: info.packageKey,
+            constraint,
+        };
         this._resolvedInterfaceCache.set(interfaceName, resolved);
         return resolved;
+    }
+
+    _constraintMethodSet(parameter, ownerPackageKey, interfaces) {
+        if (parameter.constraintMethods && parameter.constraintMethods.size > 0) {
+            return { methods: parameter.constraintMethods, unresolved: [] };
+        }
+        const reference = normalizedNamedTypeReference(parameter.constraint);
+        if (!reference) return null;
+        let interfaceKey = null;
+        if (reference.importPath && this._interfaceKeyByImportIdentity) {
+            interfaceKey = this._interfaceKeyByImportIdentity.get(
+                `${reference.importPath}\0${reference.name}`
+            );
+        } else if (!reference.importPath && ownerPackageKey) {
+            interfaceKey = symbolKeyFor(ownerPackageKey, reference.name);
+        }
+        if (!interfaceKey || !interfaces.has(interfaceKey)) return null;
+        const resolved = this._resolveInterfaceMethodsCached(interfaceKey, interfaces);
+        if (reference.arguments.length === 0) return resolved;
+        const methods = instantiateMethods(
+            resolved.methods,
+            resolved.typeParameters,
+            reference.arguments
+        );
+        return methods ? { ...resolved, methods, typeParameters: [] } : null;
+    }
+
+    _interfaceTypeSetRequirements(interfaceKey, interfaces, seen) {
+        const visiting = seen || new Set();
+        if (!interfaceKey || visiting.has(interfaceKey)) {
+            return { groups: [], comparable: false, unresolved: true };
+        }
+        const info = interfaces.get(interfaceKey);
+        if (!info) return { groups: [], comparable: false, unresolved: true };
+        visiting.add(interfaceKey);
+        const result = { groups: [], comparable: false, unresolved: false };
+        for (const element of info.typeElements || []) {
+            const nested = this._typeElementRequirements(
+                element,
+                info.packageKey,
+                interfaces,
+                new Set(visiting)
+            );
+            result.groups.push(...nested.groups);
+            result.comparable = result.comparable || nested.comparable;
+            result.unresolved = result.unresolved || nested.unresolved;
+        }
+        return result;
+    }
+
+    _typeElementRequirements(expression, ownerPackageKey, interfaces, seen) {
+        const source = (expression || '').trim();
+        if (!source || source === 'any' || source === 'interface{}') {
+            return { groups: [], comparable: false, unresolved: false };
+        }
+        if (source === 'comparable') {
+            return { groups: [], comparable: true, unresolved: false };
+        }
+        const alternatives = splitTopLevel(source, '|').map((term) => term.trim());
+        if (alternatives.length > 1 || source.startsWith('~')) {
+            return {
+                groups: [
+                    alternatives.map((term) => ({ value: term, ownerPackageKey })),
+                ],
+                comparable: false,
+                unresolved: false,
+            };
+        }
+        const reference = normalizedNamedTypeReference(source);
+        if (reference && !reference.pointer) {
+            let interfaceKey = null;
+            if (reference.importPath && this._interfaceKeyByImportIdentity) {
+                interfaceKey = this._interfaceKeyByImportIdentity.get(
+                    `${reference.importPath}\0${reference.name}`
+                );
+            } else if (!reference.importPath && ownerPackageKey) {
+                const localKey = symbolKeyFor(ownerPackageKey, reference.name);
+                if (interfaces.has(localKey)) interfaceKey = localKey;
+            }
+            if (interfaceKey) {
+                let nested = this._interfaceTypeSetRequirements(
+                    interfaceKey,
+                    interfaces,
+                    seen
+                );
+                if (reference.arguments.length > 0) {
+                    const target = interfaces.get(interfaceKey);
+                    const parameters = (target && target.typeParameters) || [];
+                    if (parameters.length !== reference.arguments.length) {
+                        return { groups: [], comparable: false, unresolved: true };
+                    }
+                    const bindings = new Map(
+                        parameters.map((parameter, index) => [
+                            parameter.marker,
+                            reference.arguments[index],
+                        ])
+                    );
+                    nested = {
+                        ...nested,
+                        groups: nested.groups.map((group) =>
+                            group.map((term) => ({
+                                ...term,
+                                value: substituteTypeParameters(term.value, bindings),
+                            }))
+                        ),
+                    };
+                }
+                return nested;
+            }
+        }
+        return {
+            groups: [[{ value: source, ownerPackageKey }]],
+            comparable: false,
+            unresolved: false,
+        };
+    }
+
+    _typeParameterRequirements(parameter, ownerPackageKey, interfaces) {
+        const elements = parameter.constraintTypeElements || [];
+        if (elements.length > 0) {
+            const result = { groups: [], comparable: false, unresolved: false };
+            for (const element of elements) {
+                const nested = this._typeElementRequirements(
+                    element,
+                    ownerPackageKey,
+                    interfaces
+                );
+                result.groups.push(...nested.groups);
+                result.comparable = result.comparable || nested.comparable;
+                result.unresolved = result.unresolved || nested.unresolved;
+            }
+            return result;
+        }
+        return this._typeElementRequirements(
+            parameter.constraint,
+            ownerPackageKey,
+            interfaces
+        );
+    }
+
+    _typeKeyForReference(reference, ownerPackageKey, types) {
+        if (reference.importPath && this._typeKeyByImportIdentity) {
+            return this._typeKeyByImportIdentity.get(
+                `${reference.importPath}\0${reference.name}`
+            );
+        }
+        if (!reference.importPath && ownerPackageKey) {
+            const localKey = symbolKeyFor(ownerPackageKey, reference.name);
+            if (types.has(localKey)) return localKey;
+        }
+        return null;
+    }
+
+    _underlyingType(value, ownerPackageKey, types, seen) {
+        const source = (value || '').trim();
+        if (!source || /^\$\d+$/.test(source)) return null;
+        const reference = normalizedNamedTypeReference(source);
+        if (!reference || reference.pointer) return source;
+        const typeKey = this._typeKeyForReference(reference, ownerPackageKey, types);
+        if (!reference.importPath && PREDECLARED_CONCRETE_TYPES.has(reference.name)) {
+            if (!typeKey) return PREDECLARED_TYPE_ALIASES.get(reference.name) || reference.name;
+        }
+        if (!typeKey) return source;
+        const visiting = seen || new Set();
+        if (visiting.has(typeKey)) return null;
+        visiting.add(typeKey);
+        const info = types.get(typeKey);
+        let underlying = info && info.underlying;
+        if (!underlying) return null;
+        if (reference.arguments.length > 0) {
+            const parameters = info.typeParameters || [];
+            if (parameters.length !== reference.arguments.length) return null;
+            underlying = substituteTypeParameters(
+                underlying,
+                new Map(
+                    parameters.map((parameter, index) => [
+                        parameter.marker,
+                        reference.arguments[index],
+                    ])
+                )
+            );
+        }
+        const nestedReference = normalizedNamedTypeReference(underlying);
+        if (nestedReference && !nestedReference.pointer) {
+            return this._underlyingType(
+                underlying,
+                info.packageKey,
+                types,
+                visiting
+            );
+        }
+        return underlying;
+    }
+
+    _isComparableType(value, ownerPackageKey, types, seen) {
+        const source = (value || '').trim();
+        if (!source || /^\$\d+$/.test(source)) return null;
+        const reference = normalizedNamedTypeReference(source);
+        if (reference) {
+            if (reference.pointer) return true;
+            const typeKey = this._typeKeyForReference(reference, ownerPackageKey, types);
+            if (!reference.importPath && PREDECLARED_CONCRETE_TYPES.has(reference.name)) {
+                if (!typeKey) return true;
+            }
+            if (!reference.importPath && BUILTIN_INTERFACES.has(reference.name) && !typeKey) {
+                return true;
+            }
+            if (typeKey) {
+                const visiting = seen || new Set();
+                if (visiting.has(typeKey)) return null;
+                visiting.add(typeKey);
+                const underlying = this._underlyingType(
+                    source,
+                    ownerPackageKey,
+                    types
+                );
+                return underlying
+                    ? this._isComparableType(
+                          underlying,
+                          types.get(typeKey).packageKey,
+                          types,
+                          visiting
+                      )
+                    : null;
+            }
+            return null;
+        }
+        if (
+            source.startsWith('[]') ||
+            source.startsWith('map[') ||
+            source.startsWith('func(')
+        ) {
+            return false;
+        }
+        if (
+            source.startsWith('*') ||
+            source.startsWith('chan(') ||
+            source.startsWith('<-chan(') ||
+            source.startsWith('chan<-(') ||
+            source.startsWith('interface{')
+        ) {
+            return true;
+        }
+        if (source.startsWith('[')) {
+            const close = source.indexOf(']');
+            if (close === -1 || close === 1) return false;
+            return this._isComparableType(
+                source.slice(close + 1),
+                ownerPackageKey,
+                types,
+                seen
+            );
+        }
+        if (source.startsWith('struct{') && source.endsWith('}')) {
+            const fields = splitTopLevel(source.slice(7, -1), ';').filter(Boolean);
+            for (const fieldValue of fields) {
+                const colon = fieldValue.indexOf(':');
+                let fieldType = colon === -1 ? fieldValue : fieldValue.slice(colon + 1);
+                fieldType = fieldType.replace(/(?:`[^`]*`|"(?:\\.|[^"])*")$/, '');
+                const comparable = this._isComparableType(
+                    fieldType,
+                    ownerPackageKey,
+                    types,
+                    seen
+                );
+                if (comparable !== true) return comparable;
+            }
+            return true;
+        }
+        return null;
+    }
+
+    _bindingSatisfiesTypeSet(binding, requirements, candidateType, types) {
+        if (!binding || /^\$\d+$/.test(binding)) return true;
+        const ownerPackageKey = candidateType && candidateType.packageKey;
+        if (requirements.comparable) {
+            const comparable = this._isComparableType(
+                binding,
+                ownerPackageKey,
+                types
+            );
+            if (comparable === false) return false;
+        }
+        for (const group of requirements.groups) {
+            let matched = false;
+            let unresolved = false;
+            for (const term of group) {
+                const approximate = term.value.startsWith('~');
+                const wanted = approximate ? term.value.slice(1) : term.value;
+                if (approximate) {
+                    const actualUnderlying = this._underlyingType(
+                        binding,
+                        ownerPackageKey,
+                        types
+                    );
+                    const wantedUnderlying = this._underlyingType(
+                        wanted,
+                        term.ownerPackageKey,
+                        types
+                    );
+                    if (!actualUnderlying || !wantedUnderlying) {
+                        unresolved = true;
+                    } else if (actualUnderlying === wantedUnderlying) {
+                        matched = true;
+                    }
+                } else if (binding === wanted) {
+                    matched = true;
+                }
+                if (matched) break;
+            }
+            if (!matched && !unresolved) return false;
+        }
+        return true;
+    }
+
+    _boundTypeMethodSet(binding, candidateType, types, interfaces) {
+        if (!binding || /^\$\d+$/.test(binding)) return null;
+        const reference = normalizedNamedTypeReference(binding);
+        if (!reference) {
+            if (!binding.startsWith('interface{')) return new Map();
+            return null;
+        }
+        let typeKey = null;
+        let interfaceKey = null;
+        if (reference.importPath) {
+            const identity = `${reference.importPath}\0${reference.name}`;
+            typeKey = this._typeKeyByImportIdentity && this._typeKeyByImportIdentity.get(identity);
+            interfaceKey =
+                this._interfaceKeyByImportIdentity &&
+                this._interfaceKeyByImportIdentity.get(identity);
+        } else if (candidateType && candidateType.packageKey) {
+            const localKey = symbolKeyFor(candidateType.packageKey, reference.name);
+            if (types.has(localKey)) typeKey = localKey;
+            if (interfaces.has(localKey)) interfaceKey = localKey;
+        }
+        if (!typeKey && !interfaceKey && !reference.importPath && BUILTIN_INTERFACES.has(reference.name)) {
+            return reference.pointer
+                ? new Map()
+                : CANONICAL_BUILTIN_INTERFACES.get(reference.name);
+        }
+        if (!typeKey && !reference.importPath && PREDECLARED_CONCRETE_TYPES.has(reference.name)) {
+            return new Map();
+        }
+        if (typeKey) {
+            const methodSets = this._resolveTypeMethodSetsCached(typeKey, types);
+            let methods = reference.pointer ? methodSets.pointer : methodSets.value;
+            if (reference.arguments.length > 0) {
+                methods = instantiateMethods(
+                    methods,
+                    types.get(typeKey).typeParameters,
+                    reference.arguments
+                );
+            }
+            return methods;
+        }
+        if (interfaceKey) {
+            const resolved = this._resolveInterfaceMethodsCached(interfaceKey, interfaces);
+            if (reference.arguments.length === 0) return resolved.methods;
+            return instantiateMethods(
+                resolved.methods,
+                resolved.typeParameters,
+                reference.arguments
+            );
+        }
+        return null;
+    }
+
+    _genericBindingsSatisfyConstraints(
+        bindings,
+        resolved,
+        candidateType,
+        types,
+        interfaces,
+        loose
+    ) {
+        for (const parameter of resolved.typeParameters || []) {
+            const required = this._constraintMethodSet(
+                parameter,
+                resolved.packageKey,
+                interfaces
+            );
+            const binding = bindings.get(parameter.marker);
+            if (required && required.methods.size > 0) {
+                const actual = this._boundTypeMethodSet(
+                    binding,
+                    candidateType,
+                    types,
+                    interfaces
+                );
+                // Imported argument packages can be unavailable in an incomplete
+                // workspace. Keep the result rather than introducing a false
+                // negative; when the declaration is present, enforce the constraint.
+                if (actual) {
+                    const wanted = new Map(
+                        [...required.methods].map(([name, signature]) => [
+                            name,
+                            substituteTypeParameters(signature, bindings),
+                        ])
+                    );
+                    if (
+                        !satisfies(wanted, actual, {
+                            unresolved: required.unresolved,
+                            allowUnresolved: true,
+                            loose,
+                        })
+                    ) {
+                        return false;
+                    }
+                }
+            }
+
+            const requirements = this._typeParameterRequirements(
+                parameter,
+                resolved.packageKey,
+                interfaces
+            );
+            const instantiatedRequirements = {
+                ...requirements,
+                groups: requirements.groups.map((group) =>
+                    group.map((term) => ({
+                        ...term,
+                        value: substituteTypeParameters(term.value, bindings),
+                    }))
+                ),
+            };
+            if (
+                !this._bindingSatisfiesTypeSet(
+                    binding,
+                    instantiatedRequirements,
+                    candidateType,
+                    types
+                )
+            ) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    _interfaceSatisfiedBy(resolved, methods, candidateType, types, interfaces, options) {
+        const settings = options || {};
+        if (!resolved.typeParameters || resolved.typeParameters.length === 0) {
+            return satisfies(resolved.methods, methods, settings);
+        }
+        if (
+            resolved.unresolved.length > 0 &&
+            !settings.allowUnresolved
+        ) {
+            return false;
+        }
+        const bindings = inferTypeParameterBindings(
+            resolved.methods,
+            methods,
+            resolved.typeParameters,
+            settings
+        );
+        return !!(
+            bindings &&
+            this._genericBindingsSatisfyConstraints(
+                bindings,
+                resolved,
+                candidateType,
+                types,
+                interfaces,
+                !!settings.loose
+            )
+        );
     }
 
     /**
@@ -1059,7 +1606,6 @@ class WorkspaceIndex {
         const promote = (target, mode) => {
             const candidates = new Map();
             for (const embed of type.embeds) {
-                if (type.genericEmbeds && type.genericEmbeds.has(embed)) continue;
                 const canPromoteInterface = type.struct || type.interfaceAlias;
                 const imported = importedReferenceIdentity(embed);
                 let embeddedKey = null;
@@ -1097,8 +1643,7 @@ class WorkspaceIndex {
                     const embeddedInterface = this._mergedInterfaces.get(embeddedInterfaceKey);
                     if (
                         !embeddedInterface ||
-                        embeddedInterface.constraint ||
-                        embeddedInterface.generic
+                        embeddedInterface.constraint
                     ) {
                         continue;
                     }
@@ -1110,6 +1655,17 @@ class WorkspaceIndex {
                     source = CANONICAL_BUILTIN_INTERFACES.get(embed);
                 } else {
                     continue;
+                }
+                if (type.genericEmbeds && type.genericEmbeds.has(embed)) {
+                    const target = embeddedKey
+                        ? types.get(embeddedKey)
+                        : this._mergedInterfaces.get(embeddedInterfaceKey);
+                    source = instantiateMethods(
+                        source,
+                        target && target.typeParameters,
+                        type.embedArguments && type.embedArguments.get(embed)
+                    );
+                    if (!source) continue;
                 }
                 for (const [name, signature] of source) {
                     const candidate = candidates.get(name);
@@ -1290,6 +1846,29 @@ class WorkspaceIndex {
                     canonicalizeWithinPackage(signature, packageKey),
                     resolveQualifiedAlias
                 ).replace(/\s+/g, '');
+            const canonicalTypeParameters = (parameters) =>
+                (parameters || []).map((parameter) => ({
+                    ...parameter,
+                    constraint: canonicalSignature(parameter.constraint || 'any'),
+                    constraintMethods: new Map(
+                        [...(parameter.constraintMethods || new Map())].map(
+                            ([methodName, signature]) => [
+                                methodName,
+                                canonicalSignature(signature),
+                            ]
+                        )
+                    ),
+                    constraintTypeElements: (
+                        parameter.constraintTypeElements || []
+                    ).map(canonicalSignature),
+                }));
+            const canonicalEmbedArguments = (argumentsByEmbed) =>
+                new Map(
+                    [...(argumentsByEmbed || new Map())].map(([embed, argumentsList]) => [
+                        embed,
+                        argumentsList.map(canonicalSignature),
+                    ])
+                );
             const aliases = aliasesByPackage.get(packageKey);
             for (const [name, info] of parsed.interfaces) {
                 const symbolKey = symbolKeyFor(packageKey, name);
@@ -1305,6 +1884,9 @@ class WorkspaceIndex {
                         methodLines: info.methodLines || new Map(),
                         constraint: !!info.constraint,
                         generic: !!info.generic,
+                        typeParameters: canonicalTypeParameters(info.typeParameters),
+                        embedArguments: canonicalEmbedArguments(info.embedArguments),
+                        typeElements: (info.typeElements || []).map(canonicalSignature),
                         externalSource: !!parsed.externalSource,
                     });
                 }
@@ -1317,6 +1899,9 @@ class WorkspaceIndex {
                         constraint: false,
                         generic: false,
                         genericEmbeds: new Set(),
+                        embedArguments: new Map(),
+                        typeParameters: [],
+                        typeElements: [],
                         externalSource: false,
                         importPath: importPathsByPackage.get(packageKey) || null,
                     });
@@ -1328,6 +1913,13 @@ class WorkspaceIndex {
                 flat.generic = flat.generic || !!info.generic;
                 flat.externalSource = flat.externalSource || !!parsed.externalSource;
                 for (const embed of info.genericEmbeds || []) flat.genericEmbeds.add(embed);
+                for (const [embed, argumentsList] of canonicalEmbedArguments(info.embedArguments)) {
+                    flat.embedArguments.set(embed, argumentsList);
+                }
+                if (flat.typeParameters.length === 0 && (info.typeParameters || []).length > 0) {
+                    flat.typeParameters = canonicalTypeParameters(info.typeParameters);
+                }
+                flat.typeElements.push(...(info.typeElements || []).map(canonicalSignature));
                 if (!flat.importPath) flat.importPath = importPathsByPackage.get(packageKey) || null;
             }
             for (const [name, info] of parsed.types) {
@@ -1346,6 +1938,11 @@ class WorkspaceIndex {
                     pointerMethods: info.pointerMethods || new Set(),
                     pointerEmbeds: info.pointerEmbeds || new Set(),
                     genericEmbeds: info.genericEmbeds || new Set(),
+                    embedArguments: canonicalEmbedArguments(info.embedArguments),
+                    typeParameters: canonicalTypeParameters(info.typeParameters),
+                    underlying: info.underlying
+                        ? canonicalSignature(info.underlying)
+                        : null,
                     declared: info.declared !== false,
                     externalSource: !!parsed.externalSource,
                 });
@@ -1359,6 +1956,9 @@ class WorkspaceIndex {
                         pointerOnlyMethods: new Set(),
                         pointerEmbeds: new Set(),
                         genericEmbeds: new Set(),
+                        embedArguments: new Map(),
+                        typeParameters: [],
+                        underlying: null,
                         struct: false,
                         aliasTarget: null,
                         interfaceAlias: false,
@@ -1378,6 +1978,15 @@ class WorkspaceIndex {
                 flat.embeds.push(...info.embeds);
                 for (const embed of info.pointerEmbeds || []) flat.pointerEmbeds.add(embed);
                 for (const embed of info.genericEmbeds || []) flat.genericEmbeds.add(embed);
+                for (const [embed, argumentsList] of canonicalEmbedArguments(info.embedArguments)) {
+                    flat.embedArguments.set(embed, argumentsList);
+                }
+                if (flat.typeParameters.length === 0 && (info.typeParameters || []).length > 0) {
+                    flat.typeParameters = canonicalTypeParameters(info.typeParameters);
+                }
+                if (!flat.underlying && info.underlying) {
+                    flat.underlying = canonicalSignature(info.underlying);
+                }
                 flat.struct = flat.struct || info.struct === true;
                 flat.externalSource = flat.externalSource || !!parsed.externalSource;
                 if (!flat.aliasTarget && aliases && aliases.has(name)) {
@@ -1409,15 +2018,15 @@ class WorkspaceIndex {
                 interfaceAliasCache.set(typeKey, true);
                 return true;
             }
-            const imported = importedReferenceIdentity(target);
+            const reference = normalizedNamedTypeReference(target);
             let interfaceKey = null;
             let targetTypeKey = null;
-            if (imported) {
-                const identity = `${imported.importPath}\0${imported.name}`;
+            if (reference && reference.importPath) {
+                const identity = `${reference.importPath}\0${reference.name}`;
                 interfaceKey = interfaceKeyByImportIdentity.get(identity);
                 targetTypeKey = typeKeyByImportIdentity.get(identity);
-            } else if (!target.includes('.')) {
-                interfaceKey = symbolKeyFor(type.packageKey, target);
+            } else if (reference) {
+                interfaceKey = symbolKeyFor(type.packageKey, reference.name);
                 targetTypeKey = interfaceKey;
             }
             const result =
@@ -1802,6 +2411,17 @@ class WorkspaceIndex {
                             externalAdditions.add(imported.importPath);
                         }
                     }
+                    for (const parameter of declaration.typeParameters || []) {
+                        for (const reference of importedSignatureReferences(
+                            parameter.constraint || ''
+                        )) {
+                            const packageKey = this._packageForImportPath(reference.importPath);
+                            if (packageKey && !packages.has(packageKey)) additions.add(packageKey);
+                            else if (!packageKey && !externalImports.has(reference.importPath)) {
+                                externalAdditions.add(reference.importPath);
+                            }
+                        }
+                    }
                 }
             }
             if (additions.size === 0 && externalAdditions.size === 0) break;
@@ -1904,9 +2524,9 @@ class WorkspaceIndex {
         const interfaceKey = view._findInterfaceKey(interfaceName, interfaceFile);
         if (!interfaceKey) return null;
         const declaration = interfaces.get(interfaceKey);
-        if (!declaration || declaration.constraint || declaration.generic) return null;
+        if (!declaration || declaration.constraint) return null;
         const resolved = view._resolveInterfaceMethodsCached(interfaceKey, interfaces);
-        if (resolved.methods.size === 0) return null;
+        if (resolved.constraint || resolved.methods.size === 0) return null;
         return { interfaceKey, resolved };
     }
 
@@ -2131,7 +2751,7 @@ class WorkspaceIndex {
         const interfaceKey = this._findInterfaceKey(interfaceName, interfaceFile);
         if (!interfaceKey) return [];
         const resolved = this._resolveInterfaceMethodsCached(interfaceKey, interfaces);
-        if (resolved.methods.size === 0) return [];
+        if (resolved.constraint || resolved.methods.size === 0) return [];
 
         // Run BOTH the strict pass (exact signatures) and the loose pass, then
         // merge. A cross-package implementation qualifies the interface's types
@@ -2144,26 +2764,40 @@ class WorkspaceIndex {
         // loose matching is package-aware (see looseSignatureEqual): it no longer
         // equates two different packages' same-named types, so it does not
         // reintroduce cross-package false positives.
-        const strict = this._collectImplementations(resolved, types, false);
-        const loose = this._collectImplementations(resolved, types, true);
+        const strict = this._collectImplementations(resolved, types, interfaces, false);
+        const loose = this._collectImplementations(resolved, types, interfaces, true);
         return dedupeResults([...strict, ...loose]);
     }
 
-    _collectImplementations(resolved, types, loose) {
+    _collectImplementations(resolved, types, interfaces, loose) {
         const results = [];
         for (const [typeKey, typeInfo] of types) {
             if (typeInfo.interfaceAlias || typeInfo.externalSource) continue;
             const methodSets = this._resolveTypeMethodSetsCached(typeKey, types);
-            const valueImplements = satisfies(resolved.methods, methodSets.value, {
-                unresolved: resolved.unresolved,
-                loose,
-            });
-            const pointerImplements =
-                valueImplements ||
-                satisfies(resolved.methods, methodSets.pointer, {
+            const valueImplements = this._interfaceSatisfiedBy(
+                resolved,
+                methodSets.value,
+                typeInfo,
+                types,
+                interfaces,
+                {
                     unresolved: resolved.unresolved,
                     loose,
-                });
+                }
+            );
+            const pointerImplements =
+                valueImplements ||
+                this._interfaceSatisfiedBy(
+                    resolved,
+                    methodSets.pointer,
+                    typeInfo,
+                    types,
+                    interfaces,
+                    {
+                        unresolved: resolved.unresolved,
+                        loose,
+                    }
+                );
             if (pointerImplements) {
                 // One package-qualified type can contribute declarations and
                 // methods from multiple files. Preserve its recorded locations;
@@ -2197,6 +2831,7 @@ class WorkspaceIndex {
         const interfaceKey = this._findInterfaceKey(interfaceName, interfaceFile);
         if (!interfaceKey) return [];
         const resolved = this._resolveInterfaceMethodsCached(interfaceKey, interfaces);
+        if (resolved.constraint) return [];
         const wantSig = resolved.methods.get(methodName);
 
         // Run both strict and loose passes and merge (deduped). A cross-package
@@ -2205,12 +2840,26 @@ class WorkspaceIndex {
         // pass; skipping loose whenever strict found anything dropped those
         // implementations. Package-aware loose matching (looseSignatureEqual)
         // keeps this from reintroducing cross-package false positives.
-        const strict = this._collectMethodImplementations(resolved, wantSig, methodName, types, false);
-        const loose = this._collectMethodImplementations(resolved, wantSig, methodName, types, true);
+        const strict = this._collectMethodImplementations(
+            resolved,
+            wantSig,
+            methodName,
+            types,
+            interfaces,
+            false
+        );
+        const loose = this._collectMethodImplementations(
+            resolved,
+            wantSig,
+            methodName,
+            types,
+            interfaces,
+            true
+        );
         return dedupeResults([...strict, ...loose]);
     }
 
-    _collectMethodImplementations(resolved, wantSig, methodName, types, loose) {
+    _collectMethodImplementations(resolved, wantSig, methodName, types, interfaces, loose) {
         const results = [];
         const sigMatches = (a, b) => {
             if (a === b) return true;
@@ -2224,12 +2873,25 @@ class WorkspaceIndex {
             const implementsWith = (methods) => {
                 const sig = methods.get(methodName);
                 if (sig === undefined) return false;
-                if (wantSig !== undefined && !sigMatches(sig, wantSig)) return false;
-                return satisfies(resolved.methods, methods, {
-                    unresolved: resolved.unresolved,
-                    allowUnresolved: true,
-                    loose,
-                });
+                if (
+                    (!resolved.typeParameters || resolved.typeParameters.length === 0) &&
+                    wantSig !== undefined &&
+                    !sigMatches(sig, wantSig)
+                ) {
+                    return false;
+                }
+                return this._interfaceSatisfiedBy(
+                    resolved,
+                    methods,
+                    typeInfo,
+                    types,
+                    interfaces,
+                    {
+                        unresolved: resolved.unresolved,
+                        allowUnresolved: true,
+                        loose,
+                    }
+                );
             };
             const valueImplements = implementsWith(methodSets.value);
             const pointerImplements = valueImplements || implementsWith(methodSets.pointer);
@@ -2313,6 +2975,7 @@ class WorkspaceIndex {
         const seenInterfaces = new Set();
 
         const consider = (interfaceKey, resolved, decl, external) => {
+            if (resolved.constraint) return false;
             const sig = resolved.methods.get(methodName);
             if (sig === undefined) return false;
 
@@ -2329,7 +2992,24 @@ class WorkspaceIndex {
             let sigEqual = false;
             let matchedLoose = false;
             if (mySig !== undefined) {
-                if (sig === mySig) {
+                if (resolved.typeParameters && resolved.typeParameters.length > 0) {
+                    const wantedMethod = new Map([[methodName, sig]]);
+                    const actualMethod = new Map([[methodName, mySig]]);
+                    sigEqual = !!inferTypeParameterBindings(
+                        wantedMethod,
+                        actualMethod,
+                        resolved.typeParameters
+                    );
+                    if (!sigEqual) {
+                        sigEqual = !!inferTypeParameterBindings(
+                            wantedMethod,
+                            actualMethod,
+                            resolved.typeParameters,
+                            { loose: true }
+                        );
+                        matchedLoose = sigEqual;
+                    }
+                } else if (sig === mySig) {
                     sigEqual = true;
                 } else if (looseSignatureEqual(sig, mySig)) {
                     sigEqual = true;
@@ -2343,11 +3023,18 @@ class WorkspaceIndex {
             // implementation.
             if (
                 typeMethods.size > 0 &&
-                !satisfies(resolved.methods, typeMethods, {
-                    unresolved: resolved.unresolved,
-                    allowUnresolved: true,
-                    loose: external || matchedLoose,
-                })
+                !this._interfaceSatisfiedBy(
+                    resolved,
+                    typeMethods,
+                    typeKey && types.get(typeKey),
+                    types,
+                    interfaces,
+                    {
+                        unresolved: resolved.unresolved,
+                        allowUnresolved: true,
+                        loose: external || matchedLoose,
+                    }
+                )
             ) {
                 if (mySig === undefined || !sigEqual) return false;
             }
@@ -2521,7 +3208,7 @@ class WorkspaceIndex {
                 if (promoted.length > 0) return promoted;
             } else if (embeddedInterfaceKey) {
                 const info = this._mergedInterfaces.get(embeddedInterfaceKey);
-                if (!info || info.constraint || info.generic) continue;
+                if (!info || info.constraint) continue;
                 const resolved = this._resolveInterfaceMethodsCached(
                     embeddedInterfaceKey,
                     this._mergedInterfaces
