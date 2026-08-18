@@ -21,6 +21,7 @@ const {
     resolveGoModCache,
     grepInterfaceFilesForMethod,
     grepImplementationFilesForMethod,
+    scanDependencyFilesForMethods,
     grepGoFilesForTypeNames,
 } = require('./search');
 const { findGoMod, resolveLockedModuleDirs, resolveModuleImportDirectory } = require('./gomod');
@@ -29,6 +30,7 @@ const { AstWorkerPool, DEFAULT_AST_CONCURRENCY } = require('./ast-cache');
 
 const CANDIDATE_CACHE_SCHEMA = 1;
 const CANDIDATE_CACHE_WRITE_DELAY_MS = 500;
+const RELATION_CACHE_SCHEMA = 1;
 
 const NON_METHOD_CALLS = new Set([
     'if',
@@ -533,6 +535,9 @@ class WorkspaceIndex {
         this._reversePrewarmPromise = null;
         this._reversePrewarmRequested = false;
         this._reversePrewarmTimer = null;
+        this._incrementalPrewarmBase = null;
+        this._incrementalPrewarmFiles = new Set();
+        this._pendingInvalidationFiles = new Set();
         this._disposed = false;
         this._importPathByDirectory = new Map();
         this._packageKeyByImportPath = new Map();
@@ -540,10 +545,12 @@ class WorkspaceIndex {
         this._externalPackageCache = new Map();
         this._dependencyCandidateCache = new Map();
         this._dependencyImplementationCandidateCache = new Map();
+        this._dependencyImplementationBatchCandidateCache = new Map();
         this._dependencyTypeReferenceCandidateCache = new Map();
         this._goRootPromise = null;
         this._candidateCacheDir = this.options.cacheDir || '';
         this._candidateCacheStates = new Map();
+        this._relationCacheFiles = new Set();
         const cfg = this.getConfig();
         this.astPool = this.options.disableAst
             ? null
@@ -779,6 +786,153 @@ class WorkspaceIndex {
         }
     }
 
+    _relationCacheFile() {
+        if (!this._candidateCacheDir) return '';
+        const roots = [...this._builds.keys()].map(path.normalize).sort();
+        if (roots.length === 0) return '';
+        const key = crypto
+            .createHash('sha1')
+            .update(roots.join('\0'))
+            .digest('hex')
+            .slice(0, 16);
+        const file = path.join(
+            this._candidateCacheDir,
+            `interface-relations-v${RELATION_CACHE_SCHEMA}-${key}.json`
+        );
+        this._relationCacheFiles.add(file);
+        return file;
+    }
+
+    _relationCacheFingerprint() {
+        if (this.overlayTexts.size > 0) return null;
+        const cfg = this.getConfig();
+        const hash = crypto.createHash('sha256');
+        hash.update(
+            JSON.stringify({
+                schema: RELATION_CACHE_SCHEMA,
+                build: this._candidateCacheFingerprint(cfg),
+                searchDependencies: cfg.searchDependencies !== false,
+                goModCache: (cfg.goModCache || '').trim(),
+                excludedFilePatterns: [...(cfg.excludedFilePatterns || [])].sort(),
+                excludedTypePatterns: [...(cfg.excludedTypePatterns || [])].sort(),
+            })
+        );
+        const cachedEntries = new Map();
+        for (const state of this._candidateCacheStates.values()) {
+            for (const [file, entry] of state.entries) cachedEntries.set(path.normalize(file), entry);
+        }
+        for (const file of [...this._packageKeyByFile.keys()].sort()) {
+            let entry = cachedEntries.get(path.normalize(file));
+            if (!entry) {
+                try {
+                    const stat = fs.statSync(file);
+                    entry = { mtimeMs: stat.mtimeMs, size: stat.size };
+                } catch (_) {
+                    return null;
+                }
+            }
+            hash.update(`\0${path.normalize(file)}\0${entry.mtimeMs}\0${entry.size}`);
+        }
+        for (const root of [...this._builds.keys()].map(path.normalize).sort()) {
+            hash.update(`\0root\0${root}`);
+            for (const name of ['go.mod', 'go.sum']) {
+                const file = path.join(root, name);
+                try {
+                    hash.update(`\0${name}\0${fs.readFileSync(file)}`);
+                } catch (error) {
+                    if (error.code !== 'ENOENT') return null;
+                }
+            }
+        }
+        return hash.digest('hex');
+    }
+
+    _serializeRelationState(state, fingerprint) {
+        return {
+            schema: RELATION_CACHE_SCHEMA,
+            fingerprint,
+            dependencyConfigKey: state.dependencyConfigKey,
+            dependenciesPrewarmed: !!state.dependenciesPrewarmed,
+            resultsByReceiver: [...state.resultsByReceiver],
+            resultsByInterface: [...state.resultsByInterface],
+            completeResultsByInterface: [...state.completeResultsByInterface],
+            methodResultsByInterface: [...state.methodResultsByInterface].map(
+                ([key, methods]) => [key, [...methods]]
+            ),
+            stats: state.stats,
+        };
+    }
+
+    async _writeRelationSnapshot(state) {
+        const cacheFile = this._relationCacheFile();
+        const fingerprint = this._relationCacheFingerprint();
+        if (!cacheFile || !fingerprint) return;
+        const temporary = `${cacheFile}.${process.pid}.tmp`;
+        const payload = JSON.stringify(this._serializeRelationState(state, fingerprint));
+        try {
+            await fs.promises.mkdir(this._candidateCacheDir, { recursive: true });
+            await fs.promises.writeFile(temporary, payload);
+            await fs.promises.rename(temporary, cacheFile);
+        } catch (error) {
+            this.log(`Relation snapshot write failed: ${error.message}`);
+            try {
+                await fs.promises.unlink(temporary);
+            } catch (_) {
+                // Best-effort cleanup of an incomplete atomic write.
+            }
+        }
+    }
+
+    async _loadRelationSnapshot(generation) {
+        const started = Date.now();
+        const cacheFile = this._relationCacheFile();
+        const fingerprint = this._relationCacheFingerprint();
+        if (!cacheFile || !fingerprint) return null;
+        try {
+            const payload = JSON.parse(await fs.promises.readFile(cacheFile, 'utf8'));
+            if (
+                payload.schema !== RELATION_CACHE_SCHEMA ||
+                payload.fingerprint !== fingerprint ||
+                payload.dependencyConfigKey !== this._dependencyPrewarmConfigKey() ||
+                !Array.isArray(payload.resultsByReceiver) ||
+                !Array.isArray(payload.resultsByInterface) ||
+                !Array.isArray(payload.completeResultsByInterface) ||
+                !Array.isArray(payload.methodResultsByInterface)
+            ) {
+                return null;
+            }
+            return {
+                generation,
+                astFiles: new Map(),
+                view: null,
+                workspacePackages: new Set(this._packageFiles.keys()),
+                resultsByReceiver: new Map(payload.resultsByReceiver),
+                resultsByInterface: new Map(payload.resultsByInterface),
+                completeResultsByInterface: new Map(payload.completeResultsByInterface),
+                methodResultsByInterface: new Map(
+                    payload.methodResultsByInterface.map(([key, methods]) => [
+                        key,
+                        new Map(methods),
+                    ])
+                ),
+                dependenciesPrewarmed: !!payload.dependenciesPrewarmed,
+                dependencyConfigKey: payload.dependencyConfigKey,
+                snapshotRestored: true,
+                stats: {
+                    ...(payload.stats || {}),
+                    snapshotRestored: true,
+                    phaseTimings: { snapshotReadMs: Date.now() - started },
+                    durationMs: Date.now() - started,
+                },
+            };
+        } catch (error) {
+            if (error.code !== 'ENOENT') {
+                this.log(`Relation snapshot load failed: ${error.message}`);
+            }
+            return null;
+        }
+    }
+
     async _build(root) {
         const cfg = this.getConfig();
         const t0 = Date.now();
@@ -1003,14 +1157,14 @@ class WorkspaceIndex {
         if (this._isExcluded(absPath) || !shouldIncludeGoFile(absPath, text, this._buildContext)) {
             this.overlays.delete(absPath);
             this.overlayTexts.delete(absPath);
-            this._invalidateMerged();
+            this._invalidateMerged([absPath]);
             if (notify !== false) this._emitChange();
             return;
         }
         this.overlays.set(absPath, scanFileMetadata(text));
         this.overlayTexts.set(absPath, text);
         this._recordCandidateFile(absPath, text, this.overlays.get(absPath));
-        this._invalidateMerged();
+        this._invalidateMerged([absPath]);
         if (notify !== false) this._emitChange();
     }
 
@@ -1025,7 +1179,7 @@ class WorkspaceIndex {
         } catch (_) {
             this._removeCandidateFile(absPath);
         }
-        this._invalidateMerged();
+        this._invalidateMerged([absPath]);
         this._emitChange();
     }
 
@@ -1034,11 +1188,27 @@ class WorkspaceIndex {
         this.overlayTexts.delete(absPath);
         this._indexText(absPath, text, true);
         this._updateCandidateCachesForFile(absPath);
-        this._invalidateMerged();
+        this._invalidateMerged([absPath]);
         this._emitChange();
     }
 
-    _invalidateMerged() {
+    _invalidateMerged(changedFiles) {
+        const normalizedChanges = [...(changedFiles || [])].map(path.normalize);
+        if (normalizedChanges.length > 0) {
+            const reusable = this._reversePrewarm || this._incrementalPrewarmBase;
+            if (
+                reusable &&
+                reusable.astFiles &&
+                reusable.astFiles.size > 0 &&
+                !reusable.snapshotRestored
+            ) {
+                this._incrementalPrewarmBase = reusable;
+                for (const file of normalizedChanges) this._incrementalPrewarmFiles.add(file);
+            }
+        } else {
+            this._incrementalPrewarmBase = null;
+            this._incrementalPrewarmFiles.clear();
+        }
         this._mergedInterfaces = null;
         this._mergedTypes = null;
         // Resolved-method sets are derived from the merged view; drop them too.
@@ -1823,13 +1993,13 @@ class WorkspaceIndex {
             const p = uri.fsPath;
             if (this._isExcluded(p)) return;
             this._indexFile(p);
-            this._scheduleInvalidate();
+            this._scheduleInvalidate(p);
         };
         this._watcher.onDidCreate(onChange);
         this._watcher.onDidChange(onChange);
         this._watcher.onDidDelete((uri) => {
             this._removeFile(uri.fsPath);
-            this._scheduleInvalidate();
+            this._scheduleInvalidate(uri.fsPath);
         });
     }
 
@@ -1841,11 +2011,14 @@ class WorkspaceIndex {
      * parse results in `this.files` are always updated immediately (so no data
      * is lost); only the derived merged view is invalidated once per burst.
      */
-    _scheduleInvalidate() {
+    _scheduleInvalidate(file) {
+        if (file) this._pendingInvalidationFiles.add(path.normalize(file));
         if (this._invalidateTimer) return;
         this._invalidateTimer = setTimeout(() => {
             this._invalidateTimer = null;
-            this._invalidateMerged();
+            const changedFiles = [...this._pendingInvalidationFiles];
+            this._pendingInvalidationFiles.clear();
+            this._invalidateMerged(changedFiles);
             // Notify listeners (e.g. CodeLens providers) that results may have
             // changed, so lenses like "goto interface" re-evaluate whether they
             // still have a matching interface.
@@ -2529,7 +2702,7 @@ class WorkspaceIndex {
                     try {
                         const text = await fs.promises.readFile(file, 'utf8');
                         if (!shouldIncludeGoFile(file, text, this._buildContext)) return null;
-                        return { file, text };
+                        return { file, diskText: text };
                     } catch (_) {
                         return null;
                     }
@@ -2720,7 +2893,7 @@ class WorkspaceIndex {
 
     _implementationAstContext(interfaceName, interfaceFile) {
         const prewarmed = this._prewarmedImplementationLookup(interfaceName, interfaceFile);
-        if (prewarmed) {
+        if (prewarmed && prewarmed.view) {
             const descriptor = this._interfaceDescriptor(
                 prewarmed.view,
                 interfaceName,
@@ -2951,6 +3124,20 @@ class WorkspaceIndex {
         return this._cachedAstQuery(key, async () => {
             const started = Date.now();
             const cfg = this.getConfig();
+            const prewarmed = this._prewarmedImplementationLookup(
+                interfaceName,
+                interfaceFile
+            );
+            if (
+                prewarmed &&
+                (cfg.searchDependencies === false || prewarmed.dependenciesPrewarmed)
+            ) {
+                this.log(
+                    `AST implementation query ${interfaceName}: 0 AST file(s), ` +
+                        `${Date.now() - started}ms (relation-prewarmed)`
+                );
+                return [...prewarmed.results];
+            }
             const context =
                 cfg.searchDependencies === false
                     ? await this._implementationAstContext(interfaceName, interfaceFile)
@@ -2979,15 +3166,32 @@ class WorkspaceIndex {
         return this._cachedAstQuery(key, async () => {
             const started = Date.now();
             const cfg = this.getConfig();
+            const prewarmed = this._prewarmedImplementationLookup(
+                interfaceName,
+                interfaceFile
+            );
+            const precomputed = prewarmed && prewarmed.methodResults;
+            if (
+                prewarmed &&
+                precomputed &&
+                precomputed.has(methodName) &&
+                (cfg.searchDependencies === false || prewarmed.dependenciesPrewarmed)
+            ) {
+                this.log(
+                    `AST method query ${interfaceName}.${methodName}: 0 AST file(s), ` +
+                        `${Date.now() - started}ms (relation-prewarmed)`
+                );
+                return [...precomputed.get(methodName)];
+            }
             const context =
                 cfg.searchDependencies === false
                     ? await this._implementationAstContext(interfaceName, interfaceFile)
                     : await this._dependencyImplementationAstContext(interfaceName, interfaceFile);
             if (!context) return [];
-            const precomputed = context.methodImplementationResults;
+            const contextPrecomputed = context.methodImplementationResults;
             const results =
-                precomputed && precomputed.has(methodName)
-                    ? precomputed.get(methodName)
+                contextPrecomputed && contextPrecomputed.has(methodName)
+                    ? contextPrecomputed.get(methodName)
                     : context.view.findMethodImplementations(
                           interfaceName,
                           methodName,
@@ -3098,7 +3302,7 @@ class WorkspaceIndex {
      * implementations from locked dependencies. Calls share one in-flight
      * promise; foreground AST queries retain their higher queue priority and
      * can overtake this background work.
-     * @returns {Promise<{ready:boolean,stale?:boolean,workspaceFiles:number,workspacePackages:number,workspaceInterfaces:number,receiverMethods:number,relationships:number,implementationRelationships:number,dependencyFiles:number,dependencyImplementationRelationships:number,durationMs:number}>}
+     * @returns {Promise<{ready:boolean,stale?:boolean,workspaceFiles:number,workspacePackages:number,workspaceInterfaces:number,receiverMethods:number,relationships:number,implementationRelationships:number,dependencyFiles:number,dependencyImplementationRelationships:number,dependencyCandidateScans:number,dependencyReferenceScans:number,durationMs:number}>}
      */
     prewarmReverseInterfaces() {
         this._reversePrewarmRequested = true;
@@ -3113,6 +3317,8 @@ class WorkspaceIndex {
                 implementationRelationships: 0,
                 dependencyFiles: 0,
                 dependencyImplementationRelationships: 0,
+                dependencyCandidateScans: 0,
+                dependencyReferenceScans: 0,
                 durationMs: 0,
             });
         }
@@ -3131,13 +3337,27 @@ class WorkspaceIndex {
         );
         let stale = false;
         let request;
-        request = this._buildReversePrewarm(generation)
+        request = this._loadRelationSnapshot(generation)
+            .then((restored) => restored || this._buildReversePrewarm(generation))
+            .then(async (state) => {
+                if (!state.snapshotRestored && generation === this._astGeneration) {
+                    await this._writeRelationSnapshot(state);
+                }
+                return state;
+            })
             .then((state) => {
                 if (this._disposed || generation !== this._astGeneration) {
                     stale = !this._disposed;
                     return { ...state.stats, ready: false, stale: true };
                 }
                 this._reversePrewarm = state;
+                this._incrementalPrewarmBase = null;
+                this._incrementalPrewarmFiles.clear();
+                const phaseTimings = state.stats.phaseTimings || {};
+                const phaseSummary = Object.entries(phaseTimings)
+                    .filter(([, value]) => Number.isFinite(value))
+                    .map(([name, value]) => `${name}=${value}ms`)
+                    .join(', ');
                 this.log(
                     `Workspace interface relation prewarm complete: ${state.stats.workspaceFiles} file(s), ` +
                         `${state.stats.workspacePackages} package(s), ` +
@@ -3147,7 +3367,11 @@ class WorkspaceIndex {
                         `${state.stats.implementationRelationships} implementation relationship(s), ` +
                         `${state.stats.dependencyFiles} dependency file(s), ` +
                         `${state.stats.dependencyImplementationRelationships} dependency implementation relationship(s), ` +
-                        `${state.stats.durationMs}ms`
+                        `${state.stats.dependencyCandidateScans} dependency candidate scan(s), ` +
+                        `${state.stats.dependencyReferenceScans} dependency reference scan(s), ` +
+                        `${state.stats.snapshotRestored ? 'snapshot restored, ' : ''}` +
+                        `${state.stats.durationMs}ms` +
+                        (phaseSummary ? ` (${phaseSummary})` : '')
                 );
                 return { ...state.stats, ready: true };
             })
@@ -3169,7 +3393,66 @@ class WorkspaceIndex {
         return request;
     }
 
+    _workspaceInterfaceTargets(view, workspaceFileSet) {
+        const { interfaces } = view._merged();
+        const targets = [];
+        for (const [interfaceKey, interfaceInfo] of interfaces) {
+            const declaration = view._interfaceDecls.get(interfaceKey);
+            if (
+                !declaration ||
+                interfaceInfo.externalSource ||
+                !workspaceFileSet.has(path.normalize(declaration.file))
+            ) {
+                continue;
+            }
+            targets.push({
+                interfaceKey,
+                forwardKey: this._forwardPrewarmKey(
+                    declaration.name || interfaceInfo.name,
+                    declaration.file
+                ),
+                name: declaration.name || interfaceInfo.name,
+                file: declaration.file,
+            });
+        }
+        return targets;
+    }
+
+    _interfaceTargetsFingerprint(view, targets) {
+        const { interfaces } = view._merged();
+        const signatures = targets
+            .map((target) => {
+                const resolved = view._resolveInterfaceMethodsCached(
+                    target.interfaceKey,
+                    interfaces
+                );
+                return [
+                    target.forwardKey,
+                    !!resolved.constraint,
+                    [...resolved.methods].sort(([left], [right]) => left.localeCompare(right)),
+                    resolved.unresolved || [],
+                    resolved.typeParameters || [],
+                ];
+            })
+            .sort(([left], [right]) => left.localeCompare(right));
+        return crypto.createHash('sha1').update(JSON.stringify(signatures)).digest('hex');
+    }
+
     async _buildReversePrewarm(generation) {
+        const incrementalBase = this._incrementalPrewarmBase;
+        const incrementalFiles = [...this._incrementalPrewarmFiles];
+        if (
+            incrementalBase &&
+            incrementalFiles.length > 0 &&
+            incrementalBase.astFiles &&
+            incrementalBase.astFiles.size > 0
+        ) {
+            return this._buildIncrementalReversePrewarm(
+                generation,
+                incrementalBase,
+                incrementalFiles
+            );
+        }
         const started = Date.now();
         const workspacePackages = new Set(this._packageFiles.keys());
         const workspaceFileSet = new Set(
@@ -3191,7 +3474,112 @@ class WorkspaceIndex {
         for (const info of initialMerged.interfaces.values()) {
             for (const methodName of info.methods.keys()) methodNames.add(methodName);
         }
-        for (const info of initialMerged.types.values()) {
+        const aliasExpansion = await this._expandSignatureAliasPackages(
+            closure.astFiles,
+            methodNames,
+            WorkspaceIndex.REVERSE_PREWARM_PRIORITY
+        );
+        const workspaceView = aliasExpansion.view;
+        const interfaceTargets = this._workspaceInterfaceTargets(
+            workspaceView,
+            workspaceFileSet
+        );
+        const interfaceFingerprint = this._interfaceTargetsFingerprint(
+            workspaceView,
+            interfaceTargets
+        );
+        const workspaceAstMs = Date.now() - started;
+
+        const dependencyStarted = Date.now();
+        const dependencyPrewarm = await this._prewarmDependencyImplementations(
+            generation,
+            interfaceTargets,
+            {
+                astFiles: aliasExpansion.astFiles,
+                view: workspaceView,
+                workspacePackages,
+            },
+            workspaceFileSet
+        );
+        const dependencyMs = Date.now() - dependencyStarted;
+        const relationshipStarted = Date.now();
+        const relationships = await this._buildPrewarmRelationships(
+            dependencyPrewarm.view,
+            interfaceTargets,
+            workspaceFileSet,
+            dependencyPrewarm.complete && this.getConfig().searchDependencies !== false,
+            generation
+        );
+        const relationshipMs = Date.now() - relationshipStarted;
+
+        return {
+            generation,
+            astFiles: dependencyPrewarm.astFiles,
+            view: dependencyPrewarm.view,
+            workspacePackages,
+            resultsByReceiver: relationships.resultsByReceiver,
+            resultsByInterface: relationships.resultsByInterface,
+            completeResultsByInterface: relationships.completeResultsByInterface,
+            methodResultsByInterface: relationships.methodResultsByInterface,
+            dependenciesPrewarmed: dependencyPrewarm.complete,
+            dependencyConfigKey: dependencyPrewarm.configKey,
+            interfaceFingerprint,
+            stats: {
+                workspaceFiles: workspaceFileSet.size,
+                workspacePackages: workspacePackages.size,
+                workspaceInterfaces: relationships.resultsByInterface.size,
+                receiverMethods: relationships.receiverMethods,
+                relationships: relationships.relationships,
+                implementationRelationships: relationships.implementationRelationships,
+                dependencyFiles: dependencyPrewarm.dependencyFiles,
+                dependencyImplementationRelationships:
+                    relationships.dependencyImplementationRelationships,
+                dependencyCandidateScans: dependencyPrewarm.dependencyCandidateScans,
+                dependencyReferenceScans: dependencyPrewarm.dependencyReferenceScans,
+                relationshipCandidateChecks: relationships.candidateChecks,
+                relationshipPasses: 1,
+                phaseTimings: {
+                    workspaceAstMs,
+                    dependencyMs,
+                    relationshipMs,
+                    ...(dependencyPrewarm.phaseTimings || {}),
+                },
+                durationMs: Date.now() - started,
+            },
+        };
+    }
+
+    async _buildIncrementalReversePrewarm(generation, base, changedFiles) {
+        const started = Date.now();
+        const workspacePackages = new Set(this._packageFiles.keys());
+        const workspaceFileSet = new Set(
+            [...this._packageFiles.values()].flatMap((files) => [...files])
+        );
+        const changedDirectories = new Set(changedFiles.map((file) => path.dirname(file)));
+        let astFiles = new Map(base.astFiles);
+        for (const file of [...astFiles.keys()]) {
+            if (changedDirectories.has(path.dirname(path.normalize(file)))) astFiles.delete(file);
+        }
+        const changedPackages = new Set();
+        for (const directory of changedDirectories) {
+            for (const packageKey of this._packageKeysByDirectory.get(directory) || []) {
+                changedPackages.add(packageKey);
+            }
+        }
+        const changedAstFiles = await this._parseAstPackages(
+            changedPackages,
+            WorkspaceIndex.REVERSE_PREWARM_PRIORITY
+        );
+        for (const [file, info] of changedAstFiles) astFiles.set(file, info);
+
+        const closure = await this._expandEmbeddedAstPackages(
+            workspacePackages,
+            astFiles,
+            WorkspaceIndex.REVERSE_PREWARM_PRIORITY
+        );
+        const initialView = this._createAstView(closure.astFiles);
+        const methodNames = new Set();
+        for (const info of initialView._merged().interfaces.values()) {
             for (const methodName of info.methods.keys()) methodNames.add(methodName);
         }
         const aliasExpansion = await this._expandSignatureAliasPackages(
@@ -3199,168 +3587,291 @@ class WorkspaceIndex {
             methodNames,
             WorkspaceIndex.REVERSE_PREWARM_PRIORITY
         );
-        const view = aliasExpansion.view;
-        const { interfaces, types } = view._merged();
-        const locationsByType = new Map();
-        const resultsByInterface = new Map();
-        const forwardKeyByInterface = new Map();
-        const interfaceTargets = [];
-
-        for (const [interfaceKey, interfaceInfo] of interfaces) {
-            const declaration = view._interfaceDecls.get(interfaceKey);
-            if (
-                !declaration ||
-                interfaceInfo.externalSource ||
-                !workspaceFileSet.has(path.normalize(declaration.file))
-            ) {
-                continue;
-            }
-            const forwardKey = this._forwardPrewarmKey(
-                declaration.name || interfaceInfo.name,
-                declaration.file
+        const workspaceView = aliasExpansion.view;
+        const interfaceTargets = this._workspaceInterfaceTargets(
+            workspaceView,
+            workspaceFileSet
+        );
+        const interfaceFingerprint = this._interfaceTargetsFingerprint(
+            workspaceView,
+            interfaceTargets
+        );
+        const workspaceAstMs = Date.now() - started;
+        const configKey = this._dependencyPrewarmConfigKey();
+        const dependencyStarted = Date.now();
+        let dependencyPrewarm;
+        if (
+            base.interfaceFingerprint === interfaceFingerprint &&
+            base.dependencyConfigKey === configKey &&
+            base.dependenciesPrewarmed
+        ) {
+            dependencyPrewarm = {
+                complete: true,
+                configKey,
+                astFiles: aliasExpansion.astFiles,
+                view: workspaceView,
+                dependencyFiles: base.stats.dependencyFiles || 0,
+                dependencyCandidateScans: 0,
+                dependencyReferenceScans: 0,
+            };
+        } else {
+            dependencyPrewarm = await this._prewarmDependencyImplementations(
+                generation,
+                interfaceTargets,
+                {
+                    astFiles: aliasExpansion.astFiles,
+                    view: workspaceView,
+                    workspacePackages,
+                },
+                workspaceFileSet
             );
-            forwardKeyByInterface.set(interfaceKey, forwardKey);
-            resultsByInterface.set(forwardKey, []);
-            interfaceTargets.push({
-                interfaceKey,
-                forwardKey,
-                name: declaration.name || interfaceInfo.name,
-                file: declaration.file,
-            });
         }
+        const dependencyMs = Date.now() - dependencyStarted;
+        const relationshipStarted = Date.now();
+        const relationships = await this._buildPrewarmRelationships(
+            dependencyPrewarm.view,
+            interfaceTargets,
+            workspaceFileSet,
+            dependencyPrewarm.complete && this.getConfig().searchDependencies !== false,
+            generation
+        );
+        const relationshipMs = Date.now() - relationshipStarted;
+        return {
+            generation,
+            astFiles: dependencyPrewarm.astFiles,
+            view: dependencyPrewarm.view,
+            workspacePackages,
+            resultsByReceiver: relationships.resultsByReceiver,
+            resultsByInterface: relationships.resultsByInterface,
+            completeResultsByInterface: relationships.completeResultsByInterface,
+            methodResultsByInterface: relationships.methodResultsByInterface,
+            dependenciesPrewarmed: dependencyPrewarm.complete,
+            dependencyConfigKey: dependencyPrewarm.configKey,
+            interfaceFingerprint,
+            incremental: true,
+            stats: {
+                workspaceFiles: workspaceFileSet.size,
+                workspacePackages: workspacePackages.size,
+                workspaceInterfaces: relationships.resultsByInterface.size,
+                receiverMethods: relationships.receiverMethods,
+                relationships: relationships.relationships,
+                implementationRelationships: relationships.implementationRelationships,
+                dependencyFiles: dependencyPrewarm.dependencyFiles,
+                dependencyImplementationRelationships:
+                    relationships.dependencyImplementationRelationships,
+                dependencyCandidateScans: dependencyPrewarm.dependencyCandidateScans,
+                dependencyReferenceScans: dependencyPrewarm.dependencyReferenceScans,
+                relationshipCandidateChecks: relationships.candidateChecks,
+                relationshipPasses: 1,
+                incremental: true,
+                incrementalFiles: changedAstFiles.size,
+                phaseTimings: {
+                    workspaceAstMs,
+                    dependencyMs,
+                    relationshipMs,
+                    ...(dependencyPrewarm.phaseTimings || {}),
+                },
+                durationMs: Date.now() - started,
+            },
+        };
+    }
 
-        for (const [file, info] of aliasExpansion.astFiles) {
-            const normalizedFile = path.normalize(file);
-            if (!workspaceFileSet.has(normalizedFile)) continue;
-            for (const [typeName] of info.types) {
-                const typeKey = view._findTypeKey(typeName, normalizedFile);
-                const typeInfo = typeKey && types.get(typeKey);
-                if (!typeKey || !typeInfo || typeInfo.externalSource || typeInfo.interfaceAlias) {
-                    continue;
-                }
-                if (!locationsByType.has(typeKey)) locationsByType.set(typeKey, new Set());
-                locationsByType.get(typeKey).add(normalizedFile);
-            }
-        }
-
+    async _buildPrewarmRelationships(
+        view,
+        interfaceTargets,
+        workspaceFileSet,
+        includeExternalImplementations,
+        generation
+    ) {
+        const { interfaces, types } = view._merged();
+        const typesByMethod = new Map();
         const resultsByReceiver = new Map();
         let receiverMethods = 0;
-        let relationships = 0;
-        let implementationRelationships = 0;
-        let sliceStarted = Date.now();
-        for (const [typeKey, locations] of locationsByType) {
-            if (generation !== this._astGeneration || this._disposed) break;
-            const typeInfo = types.get(typeKey);
-            const methods = view._resolveTypeMethodsCached(typeKey, types);
+
+        for (const [typeKey, typeInfo] of types) {
+            if (typeInfo.interfaceAlias) continue;
             const methodSets = view._resolveTypeMethodSetsCached(typeKey, types);
-            const matchedForwardInterfaces = new Set();
-            const representativeFile = locations.values().next().value;
-            for (const methodKey of methods.keys()) {
-                const methodName = bareMethodName(methodKey);
-                const results = view
-                    ._collectLocalInterfaces(typeInfo.name, methodName, {
-                        receiverFile: representativeFile,
-                    })
-                    .results.filter((result) => !result.external);
-                receiverMethods += 1;
-                relationships += results.length;
-                for (const result of results) {
-                    if (result.external) continue;
-                    const interfaceKey = view._findInterfaceKey(result.name, result.file);
-                    const forwardKey = interfaceKey && forwardKeyByInterface.get(interfaceKey);
-                    if (!forwardKey || matchedForwardInterfaces.has(interfaceKey)) continue;
-                    const resolved = view._resolveInterfaceMethodsCached(interfaceKey, interfaces);
-                    const implementsWith = (methodSet) =>
+            const allLocations = view._typesByLocation.get(typeKey) || [];
+            const workspaceLocations = allLocations.filter((location) =>
+                workspaceFileSet.has(path.normalize(location.file))
+            );
+            const context = { typeKey, typeInfo, methodSets, allLocations, workspaceLocations };
+            for (const methodKey of methodSets.pointer.keys()) {
+                if (!typesByMethod.has(methodKey)) typesByMethod.set(methodKey, []);
+                typesByMethod.get(methodKey).push(context);
+                if (workspaceLocations.length > 0) {
+                    receiverMethods += 1;
+                    for (const location of workspaceLocations) {
+                        resultsByReceiver.set(
+                            this._reversePrewarmKey(
+                                typeInfo.name,
+                                bareMethodName(methodKey),
+                                location.file
+                            ),
+                            []
+                        );
+                    }
+                }
+            }
+        }
+
+        const completeResultsByInterface = new Map();
+        const resultsByInterface = new Map();
+        const methodResultsByInterface = new Map();
+        let implementationRelationships = 0;
+        let dependencyImplementationRelationships = 0;
+        let candidateChecks = 0;
+        let sliceStarted = Date.now();
+
+        for (const target of interfaceTargets) {
+            if (generation !== this._astGeneration || this._disposed) break;
+            const resolved = view._resolveInterfaceMethodsCached(target.interfaceKey, interfaces);
+            const completeResults = [];
+            const methodResults = new Map();
+            for (const methodKey of resolved.methods.keys()) {
+                methodResults.set(bareMethodName(methodKey), []);
+            }
+            if (!resolved.constraint && resolved.methods.size > 0) {
+                const anchor = [...resolved.methods.keys()].sort((left, right) => {
+                    const leftCount = (typesByMethod.get(left) || []).length;
+                    const rightCount = (typesByMethod.get(right) || []).length;
+                    return leftCount - rightCount || left.localeCompare(right);
+                })[0];
+                for (const context of typesByMethod.get(anchor) || []) {
+                    if (context.typeInfo.externalSource && !includeExternalImplementations) {
+                        continue;
+                    }
+                    candidateChecks += 1;
+                    const implementsWith = (methods, allowUnresolved) =>
                         view._interfaceSatisfiedBy(
                             resolved,
-                            methodSet,
-                            typeInfo,
+                            methods,
+                            context.typeInfo,
                             types,
                             interfaces,
-                            { unresolved: resolved.unresolved }
+                            {
+                                unresolved: resolved.unresolved,
+                                allowUnresolved: !!allowUnresolved,
+                            }
                         ) ||
                         view._interfaceSatisfiedBy(
                             resolved,
-                            methodSet,
-                            typeInfo,
+                            methods,
+                            context.typeInfo,
                             types,
                             interfaces,
-                            { unresolved: resolved.unresolved, loose: true }
+                            {
+                                unresolved: resolved.unresolved,
+                                allowUnresolved: !!allowUnresolved,
+                                loose: true,
+                            }
                         );
-                    const valueImplements = implementsWith(methodSets.value);
+                    const valueImplements = implementsWith(context.methodSets.value, false);
                     const pointerImplements =
-                        valueImplements || implementsWith(methodSets.pointer);
-                    if (!pointerImplements) continue;
+                        valueImplements || implementsWith(context.methodSets.pointer, false);
+                    const reverseValueImplements =
+                        context.workspaceLocations.length > 0 &&
+                        (valueImplements || implementsWith(context.methodSets.value, true));
+                    const reversePointerImplements =
+                        reverseValueImplements ||
+                        (context.workspaceLocations.length > 0 &&
+                            (pointerImplements ||
+                                implementsWith(context.methodSets.pointer, true)));
+                    if (!pointerImplements && !reversePointerImplements) continue;
 
-                    const allLocations = view._typesByLocation.get(typeKey) || [];
-                    const declarations = allLocations.filter(
-                        (location) => location.declared !== false
-                    );
-                    const implementationLocations =
-                        declarations.length > 0 ? declarations : allLocations;
-                    for (const declaration of implementationLocations) {
-                        resultsByInterface.get(forwardKey).push({
-                            name: valueImplements ? typeInfo.name : `*${typeInfo.name}`,
-                            file: declaration.file,
-                            line: declaration.line,
-                            external: false,
-                        });
+                    const resultName = valueImplements
+                        ? context.typeInfo.name
+                        : `*${context.typeInfo.name}`;
+                    if (pointerImplements) {
+                        const declarations = context.allLocations.filter(
+                            (location) => location.declared !== false
+                        );
+                        const implementationLocations =
+                            declarations.length > 0 ? declarations : context.allLocations;
+                        for (const declaration of implementationLocations) {
+                            completeResults.push({
+                                name: resultName,
+                                file: declaration.file,
+                                line: declaration.line,
+                                external: !!context.typeInfo.externalSource,
+                            });
+                        }
+                        if (context.typeInfo.externalSource) {
+                            dependencyImplementationRelationships += 1;
+                        } else {
+                            implementationRelationships += 1;
+                        }
                     }
-                    matchedForwardInterfaces.add(interfaceKey);
-                    implementationRelationships += 1;
-                }
-                for (const file of locations) {
-                    resultsByReceiver.set(
-                        this._reversePrewarmKey(typeInfo.name, methodName, file),
-                        results
-                    );
+
+                    const mode = valueImplements ? 'value' : 'pointer';
+                    for (const methodKey of resolved.methods.keys()) {
+                        const methodName = bareMethodName(methodKey);
+                        if (pointerImplements) {
+                            const signature = context.methodSets[mode].get(methodKey);
+                            for (const location of view._findMethodLocations(
+                                context.typeKey,
+                                methodKey,
+                                mode
+                            )) {
+                                methodResults.get(methodName).push({
+                                    name: resultName,
+                                    ...location,
+                                    signature,
+                                    external: !!context.typeInfo.externalSource,
+                                });
+                            }
+                        }
+                        if (!reversePointerImplements) continue;
+                        const interfaceResult = {
+                            name: target.name,
+                            file: target.file,
+                            line: (view._interfaceDecls.get(target.interfaceKey) || {}).line,
+                            external: false,
+                        };
+                        for (const receiverLocation of context.workspaceLocations) {
+                            const reverseKey = this._reversePrewarmKey(
+                                context.typeInfo.name,
+                                methodName,
+                                receiverLocation.file
+                            );
+                            const reverseResults = resultsByReceiver.get(reverseKey);
+                            if (reverseResults) reverseResults.push(interfaceResult);
+                        }
+                    }
                 }
             }
+            const dedupedComplete = dedupeResults(completeResults);
+            completeResultsByInterface.set(target.forwardKey, dedupedComplete);
+            resultsByInterface.set(
+                target.forwardKey,
+                dedupedComplete.filter((result) => !result.external)
+            );
+            for (const [methodName, results] of methodResults) {
+                methodResults.set(methodName, dedupeResults(results));
+            }
+            methodResultsByInterface.set(target.forwardKey, methodResults);
             if (Date.now() - sliceStarted >= WorkspaceIndex.REVERSE_PREWARM_TIME_SLICE_MS) {
                 await this._yieldToEventLoop();
                 sliceStarted = Date.now();
             }
         }
 
-        for (const [key, results] of resultsByInterface) {
-            resultsByInterface.set(key, dedupeResults(results));
+        let relationships = 0;
+        for (const [key, results] of resultsByReceiver) {
+            const deduped = dedupeResults(results);
+            resultsByReceiver.set(key, deduped);
+            relationships += deduped.length;
         }
-
-        const dependencyPrewarm = await this._prewarmDependencyImplementations(
-            generation,
-            interfaceTargets,
-            {
-                astFiles: aliasExpansion.astFiles,
-                view,
-                workspacePackages,
-                resultsByInterface,
-            },
-            workspaceFileSet
-        );
-
         return {
-            generation,
-            astFiles: aliasExpansion.astFiles,
-            view,
-            workspacePackages,
             resultsByReceiver,
             resultsByInterface,
-            completeResultsByInterface: dependencyPrewarm.completeResultsByInterface,
-            methodResultsByInterface: dependencyPrewarm.methodResultsByInterface,
-            dependenciesPrewarmed: dependencyPrewarm.complete,
-            dependencyConfigKey: dependencyPrewarm.configKey,
-            stats: {
-                workspaceFiles: workspaceFileSet.size,
-                workspacePackages: workspacePackages.size,
-                workspaceInterfaces: resultsByInterface.size,
-                receiverMethods,
-                relationships,
-                implementationRelationships,
-                dependencyFiles: dependencyPrewarm.dependencyFiles,
-                dependencyImplementationRelationships:
-                    dependencyPrewarm.dependencyImplementationRelationships,
-                durationMs: Date.now() - started,
-            },
+            completeResultsByInterface,
+            methodResultsByInterface,
+            receiverMethods,
+            relationships,
+            implementationRelationships,
+            dependencyImplementationRelationships,
+            candidateChecks,
         };
     }
 
@@ -3370,102 +3881,281 @@ class WorkspaceIndex {
         workspaceState,
         workspaceFileSet
     ) {
+        const started = Date.now();
         const configKey = this._dependencyPrewarmConfigKey();
-        const completeResultsByInterface = new Map(workspaceState.resultsByInterface);
-        const methodResultsByInterface = new Map();
-        const dependencyFiles = new Set();
-        let dependencyImplementationRelationships = 0;
         const cfg = this.getConfig();
         if (cfg.searchDependencies === false || interfaceTargets.length === 0) {
             return {
                 complete: true,
                 configKey,
-                completeResultsByInterface,
-                methodResultsByInterface,
+                astFiles: workspaceState.astFiles,
+                view: workspaceState.view,
                 dependencyFiles: 0,
-                dependencyImplementationRelationships: 0,
+                dependencyCandidateScans: 0,
+                dependencyReferenceScans: 0,
+                phaseTimings: {
+                    dependencyCandidateMs: 0,
+                    dependencyLoadMs: 0,
+                    dependencyExpansionMs: 0,
+                },
             };
         }
 
-        let next = 0;
-        const warmNext = async () => {
-            while (next < interfaceTargets.length) {
-                if (generation !== this._astGeneration || this._disposed) return;
-                const target = interfaceTargets[next++];
-                const descriptor = this._interfaceDescriptor(
-                    workspaceState.view,
-                    target.name,
-                    target.file
-                );
-                if (!descriptor) continue;
-                const candidatePackages = this._candidatePackagesForMethods(
-                    descriptor.resolved.methods.keys()
-                );
-                const interfacePackage = this._packageForFile(target.file);
-                if (interfacePackage) candidatePackages.add(interfacePackage);
-                const context = await this._buildDependencyImplementationAstContext(
-                    target.name,
-                    target.file,
-                    {
-                        astFiles: workspaceState.astFiles,
-                        view: workspaceState.view,
-                        candidatePackages,
-                        descriptor,
-                        implementationResults: [
-                            ...(workspaceState.resultsByInterface.get(target.forwardKey) || []),
-                        ],
-                        includeExternalImplementations: false,
-                        prewarmed: true,
-                    },
-                    WorkspaceIndex.REVERSE_PREWARM_PRIORITY
-                );
-                if (generation !== this._astGeneration || this._disposed) return;
-                const results = Array.isArray(context.implementationResults)
-                    ? context.implementationResults
-                    : context.view.findImplementations(target.name, target.file, {
-                          includeExternal: true,
-                      });
-                const completeResults = dedupeResults(results);
-                completeResultsByInterface.set(target.forwardKey, completeResults);
-                dependencyImplementationRelationships += completeResults.filter(
-                    (result) => result.external
-                ).length;
-                for (const file of context.astFiles.keys()) {
-                    const normalized = path.normalize(file);
-                    if (!workspaceFileSet.has(normalized)) dependencyFiles.add(normalized);
-                }
+        const cacheRoot = resolveGoModCache(cfg.goModCache);
+        const dependencyDirs = cacheRoot && this._dependencySearchDirs(cacheRoot);
+        const preparedTargets = [];
+        const searchableTargets = [];
+        const anchorMethods = new Set();
+        const allMethodKeys = new Set();
+        const searchableMethodNames = new Set();
+        for (const target of interfaceTargets) {
+            const descriptor = this._interfaceDescriptor(
+                workspaceState.view,
+                target.name,
+                target.file
+            );
+            if (!descriptor) continue;
+            const methodKeys = [...descriptor.resolved.methods.keys()];
+            for (const methodKey of methodKeys) allMethodKeys.add(methodKey);
+            const prepared = { ...target, descriptor, methodKeys };
+            preparedTargets.push(prepared);
+            if (!methodKeys.every((methodKey) => isExportedIdentifier(bareMethodName(methodKey)))) {
+                continue;
+            }
+            for (const methodKey of methodKeys) {
+                searchableMethodNames.add(bareMethodName(methodKey));
+            }
+            searchableTargets.push(prepared);
+        }
 
-                const resultsByMethod = new Map();
-                for (const methodKey of descriptor.resolved.methods.keys()) {
-                    const methodName = bareMethodName(methodKey);
-                    if (resultsByMethod.has(methodName)) continue;
-                    resultsByMethod.set(
-                        methodName,
-                        context.view.findMethodImplementations(
-                            target.name,
-                            methodName,
-                            target.file,
-                            { includeExternal: true }
+        if (!cacheRoot || dependencyDirs === null || searchableTargets.length === 0) {
+            return {
+                complete: true,
+                configKey,
+                astFiles: workspaceState.astFiles,
+                view: workspaceState.view,
+                dependencyFiles: 0,
+                dependencyCandidateScans: 0,
+                dependencyReferenceScans: 0,
+                phaseTimings: {
+                    dependencyCandidateMs: 0,
+                    dependencyLoadMs: 0,
+                    dependencyExpansionMs: 0,
+                },
+            };
+        }
+
+        const candidateStarted = Date.now();
+        const dependencyCandidates = await this._dependencyImplementationBatchCandidates(
+            cacheRoot,
+            searchableMethodNames,
+            dependencyDirs
+        );
+        const dependencyCandidateMs = Date.now() - candidateStarted;
+        const candidateFiles = new Set();
+        for (const target of searchableTargets) {
+            const anchors = target.methodKeys
+                .map(bareMethodName)
+                .sort((left, right) => {
+                    const leftCount = (dependencyCandidates.filesByMethod.get(left) || new Set())
+                        .size;
+                    const rightCount = (dependencyCandidates.filesByMethod.get(right) || new Set())
+                        .size;
+                    return leftCount - rightCount || left.localeCompare(right);
+                });
+            if (anchors.length === 0) continue;
+            const anchor = anchors[0];
+            anchorMethods.add(anchor);
+            for (const file of dependencyCandidates.filesByMethod.get(anchor) || []) {
+                candidateFiles.add(file);
+            }
+        }
+        let astFiles = new Map(workspaceState.astFiles);
+        const loadedDirectories = new Set([...astFiles.keys()].map((file) => path.dirname(file)));
+        let dependencyLoadMs = 0;
+        const loadCandidatePackages = async (files) => {
+            const loadStarted = Date.now();
+            const additions = new Map();
+            for (const file of files) {
+                const directory = path.dirname(file);
+                if (loadedDirectories.has(directory)) continue;
+                additions.set(directory, this._importPathForFile(file));
+            }
+            const entries = [...additions];
+            let next = 0;
+            const loaded = [];
+            const loadNext = async () => {
+                while (next < entries.length) {
+                    const [directory, importPath] = entries[next++];
+                    loadedDirectories.add(directory);
+                    loaded.push(
+                        await this._loadExternalDirectory(
+                            directory,
+                            importPath,
+                            WorkspaceIndex.REVERSE_PREWARM_PRIORITY
                         )
                     );
                 }
-                methodResultsByInterface.set(target.forwardKey, resultsByMethod);
-                await this._yieldToEventLoop();
+            };
+            const concurrency = Math.min(
+                entries.length,
+                Math.max(1, Math.min(8, (this.astPool.backgroundConcurrency || 1) * 2))
+            );
+            await Promise.all(Array.from({ length: concurrency }, () => loadNext()));
+            for (const externalPackage of loaded) {
+                if (!externalPackage) continue;
+                for (const [file, info] of externalPackage.files) astFiles.set(file, info);
             }
+            dependencyLoadMs += Date.now() - loadStarted;
+            return entries.length;
         };
-        const concurrency = Math.min(
-            interfaceTargets.length,
-            Math.max(1, Math.min(4, this.astPool.backgroundConcurrency || 1))
+        await loadCandidatePackages(candidateFiles);
+
+        const expansionStarted = Date.now();
+        const loadBeforeExpansion = dependencyLoadMs;
+        let aliasExpansion = null;
+        let dependencyReferenceScans = 0;
+        const searchedTypeNames = new Set();
+        for (let round = 0; round < 10; round++) {
+            if (generation !== this._astGeneration || this._disposed) break;
+            const closure = await this._expandEmbeddedAstPackages(
+                workspaceState.workspacePackages,
+                astFiles,
+                WorkspaceIndex.REVERSE_PREWARM_PRIORITY
+            );
+            aliasExpansion = await this._expandSignatureAliasPackages(
+                closure.astFiles,
+                allMethodKeys,
+                WorkspaceIndex.REVERSE_PREWARM_PRIORITY
+            );
+            astFiles = aliasExpansion.astFiles;
+            const referencedTypeNames = this._dependencyReferencedTypeNames(
+                aliasExpansion.view,
+                searchableTargets
+            );
+            for (const name of searchedTypeNames) referencedTypeNames.delete(name);
+            if (referencedTypeNames.size === 0) break;
+            for (const name of referencedTypeNames) searchedTypeNames.add(name);
+            const references = await this._dependencyTypeReferenceCandidates(
+                cacheRoot,
+                referencedTypeNames,
+                dependencyDirs
+            );
+            dependencyReferenceScans += 1;
+            for (const file of references) candidateFiles.add(file);
+            const before = astFiles.size;
+            await loadCandidatePackages(references);
+            if (astFiles.size === before) break;
+        }
+        if (!aliasExpansion || aliasExpansion.astFiles.size !== astFiles.size) {
+            const closure = await this._expandEmbeddedAstPackages(
+                workspaceState.workspacePackages,
+                astFiles,
+                WorkspaceIndex.REVERSE_PREWARM_PRIORITY
+            );
+            aliasExpansion = await this._expandSignatureAliasPackages(
+                closure.astFiles,
+                allMethodKeys,
+                WorkspaceIndex.REVERSE_PREWARM_PRIORITY
+            );
+            astFiles = aliasExpansion.astFiles;
+        }
+
+        const view = aliasExpansion.view;
+        const dependencyFiles = new Set();
+        const dependencyPackages = new Set();
+        for (const file of astFiles.keys()) {
+            const normalized = path.normalize(file);
+            if (workspaceFileSet.has(normalized)) continue;
+            dependencyFiles.add(normalized);
+            dependencyPackages.add(path.dirname(normalized));
+        }
+        this.log(
+            `AST dependency implementation batch: ${preparedTargets.length} interface(s), ` +
+                `${anchorMethods.size} anchor method(s), ${candidateFiles.size} candidate file(s), ` +
+                `${dependencyPackages.size} package(s), ${dependencyReferenceScans} reference scan(s)`
         );
-        await Promise.all(Array.from({ length: concurrency }, () => warmNext()));
         return {
             complete: generation === this._astGeneration && !this._disposed,
             configKey,
-            completeResultsByInterface,
-            methodResultsByInterface,
+            astFiles,
+            view,
             dependencyFiles: dependencyFiles.size,
-            dependencyImplementationRelationships,
+            dependencyCandidateScans: 1,
+            dependencyReferenceScans,
+            phaseTimings: {
+                dependencyCandidateMs,
+                dependencyLoadMs,
+                dependencyExpansionMs: Math.max(
+                    0,
+                    Date.now() -
+                        expansionStarted -
+                        (dependencyLoadMs - loadBeforeExpansion)
+                ),
+                dependencyTotalMs: Date.now() - started,
+            },
         };
+    }
+
+    _dependencyReferencedTypeNames(view, searchableTargets) {
+        const { interfaces, types } = view._merged();
+        const externalTypesByMethod = new Map();
+        for (const [typeKey, typeInfo] of types) {
+            if (!typeInfo.externalSource || typeInfo.interfaceAlias) continue;
+            const methodSets = view._resolveTypeMethodSetsCached(typeKey, types);
+            const context = { typeInfo, methodSets };
+            for (const methodKey of methodSets.pointer.keys()) {
+                if (!externalTypesByMethod.has(methodKey)) {
+                    externalTypesByMethod.set(methodKey, []);
+                }
+                externalTypesByMethod.get(methodKey).push(context);
+            }
+        }
+
+        const referenced = new Set();
+        for (const target of searchableTargets) {
+            const currentTarget = this._interfaceDescriptor(view, target.name, target.file);
+            if (!currentTarget || currentTarget.resolved.methods.size === 0) continue;
+            const anchor = [...currentTarget.resolved.methods.keys()].sort((left, right) => {
+                const leftTypes = (externalTypesByMethod.get(left) || []).length;
+                const rightTypes = (externalTypesByMethod.get(right) || []).length;
+                return leftTypes - rightTypes || left.localeCompare(right);
+            })[0];
+            for (const context of externalTypesByMethod.get(anchor) || []) {
+                const implementsWith = (methods) =>
+                    view._interfaceSatisfiedBy(
+                        currentTarget.resolved,
+                        methods,
+                        context.typeInfo,
+                        types,
+                        interfaces,
+                        { unresolved: currentTarget.resolved.unresolved }
+                    ) ||
+                    view._interfaceSatisfiedBy(
+                        currentTarget.resolved,
+                        methods,
+                        context.typeInfo,
+                        types,
+                        interfaces,
+                        { unresolved: currentTarget.resolved.unresolved, loose: true }
+                    );
+                if (
+                    implementsWith(context.methodSets.value) ||
+                    implementsWith(context.methodSets.pointer)
+                ) {
+                    referenced.add(context.typeInfo.name);
+                }
+            }
+            for (const interfaceKey of view._interfacesByMethod.get(anchor) || []) {
+                const info = interfaces.get(interfaceKey);
+                if (!info || !info.externalSource || info.constraint) continue;
+                const resolved = view._resolveInterfaceMethodsCached(interfaceKey, interfaces);
+                if (satisfies(currentTarget.resolved.methods, resolved.methods)) {
+                    referenced.add(info.name);
+                }
+            }
+        }
+        return referenced;
     }
 
     getReversePrewarmStats() {
@@ -3522,6 +4212,25 @@ class WorkspaceIndex {
                 receiverAstFiles = aliasExpansion.astFiles;
             }
             const cfg = this.getConfig();
+            if (
+                cfg.searchDependencies !== false &&
+                receiverAstFiles.size === 0
+            ) {
+                const receiverCandidates = this._candidatePackagesForMethods([methodName]);
+                receiverCandidates.add(receiverPackage);
+                const receiverFiles = await this._parseAstPackages(receiverCandidates, 200);
+                const receiverClosure = await this._expandEmbeddedAstPackages(
+                    receiverCandidates,
+                    receiverFiles,
+                    200
+                );
+                const receiverAliases = await this._expandSignatureAliasPackages(
+                    receiverClosure.astFiles,
+                    [methodName],
+                    200
+                );
+                receiverAstFiles = receiverAliases.astFiles;
+            }
             if (cfg.searchDependencies !== false) {
                 const cacheRoot = resolveGoModCache(cfg.goModCache);
                 if (cacheRoot) {
@@ -3563,7 +4272,7 @@ class WorkspaceIndex {
                     if (!shouldIncludeGoFile(file, '', this._buildContext)) return null;
                     const text = await fs.promises.readFile(file, 'utf8');
                     if (!shouldIncludeGoFile(file, text, this._buildContext)) return null;
-                    return { file, text };
+                    return { file, diskText: text };
                 } catch (_) {
                     return null;
                 }
@@ -3648,6 +4357,29 @@ class WorkspaceIndex {
             throw error;
         });
         this._dependencyImplementationCandidateCache.set(key, request);
+        return request;
+    }
+
+    _dependencyImplementationBatchCandidates(cacheRoot, methodNames, lockedDirs) {
+        const normalizedDirs = [...(lockedDirs || [])].map(path.normalize).sort();
+        const names = [...new Set(methodNames)].map(bareMethodName).filter(Boolean).sort();
+        const key = `${path.normalize(cacheRoot)}\0${names.join(',')}\0${normalizedDirs.join('\0')}`;
+        if (this._dependencyImplementationBatchCandidateCache.has(key)) {
+            return this._dependencyImplementationBatchCandidateCache.get(key);
+        }
+        let request;
+        request = scanDependencyFilesForMethods(
+            cacheRoot,
+            names,
+            normalizedDirs.length > 0 ? Number.MAX_SAFE_INTEGER : undefined,
+            normalizedDirs
+        ).catch((error) => {
+            if (this._dependencyImplementationBatchCandidateCache.get(key) === request) {
+                this._dependencyImplementationBatchCandidateCache.delete(key);
+            }
+            throw error;
+        });
+        this._dependencyImplementationBatchCandidateCache.set(key, request);
         return request;
     }
 
@@ -4207,6 +4939,7 @@ class WorkspaceIndex {
         this._externalPackageCache.clear();
         this._dependencyCandidateCache.clear();
         this._dependencyImplementationCandidateCache.clear();
+        this._dependencyImplementationBatchCandidateCache.clear();
         this._dependencyTypeReferenceCandidateCache.clear();
         for (const state of this._candidateCacheStates.values()) {
             if (state.writeTimer) clearTimeout(state.writeTimer);
@@ -4223,6 +4956,16 @@ class WorkspaceIndex {
             }
         }
         this._candidateCacheStates.clear();
+        for (const cacheFile of this._relationCacheFiles) {
+            try {
+                fs.unlinkSync(cacheFile);
+            } catch (error) {
+                if (error.code !== 'ENOENT') {
+                    this.log(`Relation snapshot clear failed: ${error.message}`);
+                }
+            }
+        }
+        this._relationCacheFiles.clear();
         if (this.astPool) this.astPool.clear();
         this._invalidateMerged();
         this._builds.clear();
@@ -4253,6 +4996,7 @@ class WorkspaceIndex {
             state.writeTimer = null;
         }
         this._candidateCacheStates.clear();
+        this._relationCacheFiles.clear();
         this.files.clear();
         this.overlays.clear();
         this.overlayTexts.clear();
@@ -4269,6 +5013,7 @@ class WorkspaceIndex {
         this._externalPackageCache.clear();
         this._dependencyCandidateCache.clear();
         this._dependencyImplementationCandidateCache.clear();
+        this._dependencyImplementationBatchCandidateCache.clear();
         this._dependencyTypeReferenceCandidateCache.clear();
         this._builds.clear();
         this._builtRoots.clear();

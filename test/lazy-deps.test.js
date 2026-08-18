@@ -33,6 +33,9 @@ async function main() {
     const staleDepImplDir = path.join(modCache, 'example.com', 'depimpl@v0.9.0');
     const ifaceDepDir = path.join(modCache, 'example.com', 'iface@v1.0.0');
     const wrapperDir = path.join(modCache, 'example.com', 'wrapper@v1.0.0');
+    const noiseAliasDir = path.join(modCache, 'example.com', 'noisealias@v1.0.0');
+    const anchorNoiseDir = path.join(modCache, 'example.com', 'anchornoise@v1.0.0');
+    const ordinaryRefDir = path.join(modCache, 'example.com', 'ordinaryref@v1.0.0');
     const goRoot = path.join(tmp, 'goroot');
     const standardDir = path.join(goRoot, 'src', 'standard', 'sort');
     fs.mkdirSync(root, { recursive: true });
@@ -42,10 +45,13 @@ async function main() {
     fs.mkdirSync(staleDepImplDir, { recursive: true });
     fs.mkdirSync(ifaceDepDir, { recursive: true });
     fs.mkdirSync(wrapperDir, { recursive: true });
+    fs.mkdirSync(noiseAliasDir, { recursive: true });
+    fs.mkdirSync(anchorNoiseDir, { recursive: true });
+    fs.mkdirSync(ordinaryRefDir, { recursive: true });
     fs.mkdirSync(standardDir, { recursive: true });
     fs.writeFileSync(
         path.join(root, 'go.mod'),
-        'module example.com/project\n\ngo 1.22\n\nrequire (\n\texample.com/dep v1.0.0\n\texample.com/aliasdep v1.0.0\n\texample.com/depimpl v1.0.0\n\texample.com/iface v1.0.0\n\texample.com/wrapper v1.0.0\n)\n'
+        'module example.com/project\n\ngo 1.22\n\nrequire (\n\texample.com/dep v1.0.0\n\texample.com/aliasdep v1.0.0\n\texample.com/depimpl v1.0.0\n\texample.com/iface v1.0.0\n\texample.com/wrapper v1.0.0\n\texample.com/noisealias v1.0.0\n\texample.com/anchornoise v1.0.0\n\texample.com/ordinaryref v1.0.0\n)\n'
     );
     const implementationFile = path.join(root, 'impl.go');
     fs.writeFileSync(
@@ -55,6 +61,7 @@ async function main() {
             'import "context"',
             'import dep "example.com/dep"',
             'import aliasdep "example.com/aliasdep"',
+            'import noise "example.com/noisealias"',
             'type ExternalImpl struct{}',
             'func (ExternalImpl) ExternalOnly(value string) error { return nil }',
             'func (ExternalImpl) Extra() error { return nil }',
@@ -62,6 +69,9 @@ async function main() {
             'func (ExternalImpl) Accept(value aliasdep.ExternalID) {}',
             'func (ExternalImpl) AcceptBytes(value aliasdep.Bytes) {}',
             'func (ExternalImpl) HandleMessage(ctx context.Context, msg *aliasdep.ConsumeMessage) error { return nil }',
+            'func (ExternalImpl) Unrelated(value noise.Payload) {}',
+            'type OtherUnrelated struct{}',
+            'func (OtherUnrelated) Unrelated(value string) {}',
             'type WrongAliasImpl struct{}',
             'func (WrongAliasImpl) Accept(value aliasdep.Other) {}',
         ].join('\n') + '\n'
@@ -72,6 +82,24 @@ async function main() {
     fs.writeFileSync(path.join(staleDepImplDir, 'go.mod'), 'module example.com/depimpl\n\ngo 1.22\n');
     fs.writeFileSync(path.join(ifaceDepDir, 'go.mod'), 'module example.com/iface\n\ngo 1.22\n');
     fs.writeFileSync(path.join(wrapperDir, 'go.mod'), 'module example.com/wrapper\n\ngo 1.22\n');
+    fs.writeFileSync(path.join(noiseAliasDir, 'go.mod'), 'module example.com/noisealias\n\ngo 1.22\n');
+    fs.writeFileSync(path.join(anchorNoiseDir, 'go.mod'), 'module example.com/anchornoise\n\ngo 1.22\n');
+    fs.writeFileSync(path.join(ordinaryRefDir, 'go.mod'), 'module example.com/ordinaryref\n\ngo 1.22\n');
+    fs.writeFileSync(path.join(noiseAliasDir, 'noise.go'), 'package noisealias\ntype Payload struct{}\n');
+    for (let i = 0; i < 8; i++) {
+        fs.writeFileSync(
+            path.join(anchorNoiseDir, `common${i}.go`),
+            `package anchornoise\ntype Common${i} struct{}\nfunc (Common${i}) Common() {}\n`
+        );
+    }
+    fs.writeFileSync(
+        path.join(ordinaryRefDir, 'ordinary.go'),
+        [
+            'package ordinaryref',
+            'import impl "example.com/depimpl"',
+            'func Observe(handler *impl.DependencyHandler) {}',
+        ].join('\n') + '\n'
+    );
     fs.writeFileSync(
         path.join(aliasDepDir, 'alias.go'),
         [
@@ -115,6 +143,9 @@ async function main() {
             'func (*PartialHandler) HandleMessage(ctx context.Context, msg *ConsumeMessage) error { return nil }',
             'type WrongHandler struct{}',
             'func (*WrongHandler) HandleMessage(ctx context.Context, msg *ConsumeMessage) int { return 0 }',
+            'type AnchorImpl struct{}',
+            'func (AnchorImpl) Common() {}',
+            'func (AnchorImpl) RareDep() {}',
         ].join('\n') + '\n'
     );
     fs.writeFileSync(
@@ -214,6 +245,7 @@ async function main() {
         '    HandleMessage(context.Context, *dep.MessageExt) error',
         '    DependencyOnly() error',
         '}',
+        'type AnchorContract interface { Common(); RareDep() }',
         'type EmbeddedExternal struct { dep.External }',
         'type EmbeddedExternalAlias struct { dep.ExternalAlias }',
         'type EmbeddedSort struct { sort.Interface }',
@@ -229,17 +261,59 @@ async function main() {
     assert('reverse lookup also searches an unrelated dependency interface when a local match exists', mergedHandlerNames.includes('RemoteHandler'));
 
     const dependencyPrewarmPriorities = [];
+    const dependencyPrewarmDirectories = [];
     const loadExternalDirectoryForPrewarm = index._loadExternalDirectory.bind(index);
+    const batchDependencyCandidates = index._dependencyImplementationBatchCandidates;
+    const perInterfaceDependencyContext = index._buildDependencyImplementationAstContext;
+    const individualImplementationCandidates = index._dependencyImplementationCandidates;
+    const individualInterfaceCandidates = index._dependencyInterfaceCandidates;
+    let batchCandidateScans = 0;
+    assert(
+        'dependency prewarm exposes one batched multi-method candidate scan',
+        typeof batchDependencyCandidates === 'function'
+    );
     index._loadExternalDirectory = (directory, importPath, priority) => {
+        dependencyPrewarmDirectories.push(path.normalize(directory));
         dependencyPrewarmPriorities.push(priority);
         return loadExternalDirectoryForPrewarm(directory, importPath, priority);
+    };
+    index._dependencyImplementationBatchCandidates = async (...args) => {
+        batchCandidateScans += 1;
+        return batchDependencyCandidates.apply(index, args);
+    };
+    index._buildDependencyImplementationAstContext = async () => {
+        throw new Error('dependency prewarm rebuilt a separate AST context per interface');
+    };
+    index._dependencyImplementationCandidates = async () => {
+        throw new Error('dependency prewarm ran an individual implementation candidate scan');
+    };
+    index._dependencyInterfaceCandidates = async () => {
+        throw new Error('dependency prewarm ran an individual interface candidate scan');
     };
     try {
         await index.prewarmReverseInterfaces();
     } finally {
         index._loadExternalDirectory = loadExternalDirectoryForPrewarm;
+        index._dependencyImplementationBatchCandidates = batchDependencyCandidates;
+        index._buildDependencyImplementationAstContext = perInterfaceDependencyContext;
+        index._dependencyImplementationCandidates = individualImplementationCandidates;
+        index._dependencyInterfaceCandidates = individualInterfaceCandidates;
     }
     const prewarmStats = index.getReversePrewarmStats();
+    eq('all workspace interfaces share one dependency candidate scan', batchCandidateScans, 1);
+    eq('prewarm reports one batched dependency scan', prewarmStats.dependencyCandidateScans, 1);
+    assert(
+        'unrelated receiver signatures do not load dependency packages during relation prewarm',
+        !dependencyPrewarmDirectories.includes(path.normalize(noiseAliasDir))
+    );
+    assert(
+        'dependency anchor selection uses dependency-side rarity instead of workspace counts',
+        !dependencyPrewarmDirectories.includes(path.normalize(anchorNoiseDir))
+    );
+    assert(
+        'type-reference expansion ignores ordinary parameter and expression references',
+        !dependencyPrewarmDirectories.includes(path.normalize(ordinaryRefDir))
+    );
     assert(
         'locked dependency implementation prewarm stays at background priority',
         dependencyPrewarmPriorities.length > 0 &&
@@ -300,6 +374,14 @@ async function main() {
     assert('dependency implementation rejects a wrong anchor signature', !dependencyImplementations.some((result) => result.name === '*WrongHandler'));
     assert('dependency implementation excludes an unlocked cached module version', !dependencyImplementations.some((result) => result.name === '*StaleHandler'));
     assert('dependency implementation includes a type using promoted methods from another dependency', dependencyImplementations.some((result) => result.name === 'EmbeddedDependencyHandler'));
+    const anchorImplementations = await index.findImplementationsAst(
+        'AnchorContract',
+        localInterfaceFile
+    );
+    assert(
+        'dependency-aware rare anchor still retains the complete implementation',
+        anchorImplementations.some((result) => result.name === 'AnchorImpl')
+    );
     eq(
         'prewarmed dependency implementation queries perform no AST reads',
         astReads(index.getAstStats()),
@@ -394,8 +476,67 @@ async function main() {
             !localOnlyInterfaces.some((result) => result.name === 'RemoteHandler')
     );
 
+    console.log('\n== persistent dependency AST reuse ==');
+    await index.astPool.flush();
+    const dependencyCacheIndex = new WorkspaceIndex(config, () => {}, {
+        cacheDir: path.join(tmp, 'cache'),
+    });
+    await dependencyCacheIndex._loadExternalDirectory(
+        depImplDir,
+        'example.com/depimpl',
+        10
+    );
+    assert(
+        'unchanged dependency package restores declaration ASTs from disk cache',
+        dependencyCacheIndex.getAstStats().diskHits >= 2
+    );
+    eq(
+        'unchanged dependency package performs no Tree-sitter reparsing after restart',
+        dependencyCacheIndex.getAstStats().parsed,
+        0
+    );
+
+    const dependencySnapshotIndex = new WorkspaceIndex(config, () => {}, {
+        cacheDir: path.join(tmp, 'cache'),
+    });
+    await dependencySnapshotIndex.ensureBuilt(root);
+    dependencySnapshotIndex._buildReversePrewarm = async () => {
+        throw new Error('dependency relationship snapshot was not restored');
+    };
+    const dependencySnapshot = await dependencySnapshotIndex.prewarmReverseInterfaces();
+    assert(
+        'dependency-enabled restart restores the complete relationship snapshot',
+        dependencySnapshot.snapshotRestored
+    );
+    const beforeSnapshotImplementation = astReads(dependencySnapshotIndex.getAstStats());
+    const snapshotImplementations = await dependencySnapshotIndex.findImplementationsAst(
+        'DependencyHandlerContract',
+        localInterfaceFile
+    );
+    assert(
+        'restored dependency snapshot includes external concrete implementations',
+        snapshotImplementations.some((result) => result.name === '*DependencyHandler')
+    );
+    eq(
+        'restored dependency implementation performs no AST reads',
+        astReads(dependencySnapshotIndex.getAstStats()),
+        beforeSnapshotImplementation
+    );
+    const snapshotInterfaces = await dependencySnapshotIndex.findInterfacesAst(
+        'ExternalImpl',
+        'HandleMessage',
+        { receiverFile: implementationFile }
+    );
+    assert(
+        'restored snapshot retains dependency-interface reverse lookup correctness',
+        snapshotInterfaces.some((result) => result.name === 'LocalHandler') &&
+            snapshotInterfaces.some((result) => result.name === 'RemoteHandler')
+    );
+
     index.dispose();
     localOnlyIndex.dispose();
+    dependencyCacheIndex.dispose();
+    dependencySnapshotIndex.dispose();
     if (previousGoRoot === undefined) delete process.env.GOROOT;
     else process.env.GOROOT = previousGoRoot;
     fs.rmSync(tmp, { recursive: true, force: true });

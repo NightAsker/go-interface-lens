@@ -120,7 +120,7 @@ async function main() {
     });
     let activeCalls = 0;
     let maxBackgroundCalls = 0;
-    boundedBackground.parseFile = async (file) => {
+    boundedBackground.parseDiskFile = async (file) => {
         activeCalls += 1;
         maxBackgroundCalls = Math.max(maxBackgroundCalls, activeCalls);
         await new Promise((resolve) => setTimeout(resolve, 2));
@@ -132,10 +132,31 @@ async function main() {
     }));
     await boundedBackground.parseFiles(backgroundRequests, 10);
     assert(
-        'background prewarm bounds file-cache and parser fan-out below the full pool',
-        maxBackgroundCalls < boundedBackground.effectiveConcurrency
+        'background cache restoration uses a wider bounded I/O lane',
+        maxBackgroundCalls > boundedBackground.backgroundConcurrency &&
+            maxBackgroundCalls <= boundedBackground.backgroundIOConcurrency
     );
-    assert('bounded background prewarm remains concurrent', maxBackgroundCalls > 1);
+
+    activeCalls = 0;
+    let maxBackgroundParserCalls = 0;
+    boundedBackground.parseFile = async (file) => {
+        activeCalls += 1;
+        maxBackgroundParserCalls = Math.max(maxBackgroundParserCalls, activeCalls);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        activeCalls -= 1;
+        return file;
+    };
+    await boundedBackground.parseFiles(
+        backgroundRequests.map((request, index) => ({
+            ...request,
+            text: `package p\ntype Overlay${index} struct{}\n`,
+        })),
+        10
+    );
+    assert(
+        'background overlay parsing remains inside the reserved parser lane',
+        maxBackgroundParserCalls <= boundedBackground.backgroundConcurrency
+    );
 
     activeCalls = 0;
     let maxForegroundCalls = 0;
@@ -146,7 +167,13 @@ async function main() {
         activeCalls -= 1;
         return file;
     };
-    await boundedBackground.parseFiles(backgroundRequests, 200);
+    await boundedBackground.parseFiles(
+        backgroundRequests.map((request, index) => ({
+            ...request,
+            text: `package p\ntype Foreground${index} struct{}\n`,
+        })),
+        200
+    );
     assert(
         'foreground batch parsing retains full parallel fan-out',
         maxForegroundCalls >= boundedBackground.effectiveConcurrency
@@ -218,10 +245,13 @@ async function main() {
     await first.parseFile(files[0], undefined, 100);
     assert('second query hits memory cache', first.stats.memoryHits >= 1);
     await first.flush();
-    const shardFiles = fs
+    const packFiles = fs
         .readdirSync(first.astCacheDir)
-        .filter((file) => file.endsWith('.json') && file !== 'index.json');
-    eq('persistent AST cache writes one shard per parsed file', shardFiles.length, files.length);
+        .filter((file) => file.startsWith('pack-') && file.endsWith('.json'));
+    assert(
+        'persistent AST cache batches parsed files into fewer cache packs',
+        packFiles.length > 0 && packFiles.length < files.length
+    );
     first.dispose();
 
     const second = new AstWorkerPool({ concurrency: 2, cacheDir, log: () => {} });
@@ -237,12 +267,36 @@ async function main() {
     assert('field selector metadata restores from the persistent AST cache', disk.types.get('Type0').fieldNames.has('RunField'));
 
     const corruptEntry = second.persisted.get(files[1]);
-    fs.writeFileSync(second._cacheShardFile(corruptEntry.key), '{broken');
+    fs.writeFileSync(second._cachePackFile(corruptEntry.pack), '{broken');
+    second.packMemory.clear();
     const parsedBeforeRecovery = second.stats.parsed;
     const recovered = await second.parseFile(files[1], undefined, 100);
-    assert('a corrupt AST shard is reparsed without failing the query', recovered.types.has('Type1'));
-    eq('corrupt shard recovery reparses only that file', second.stats.parsed, parsedBeforeRecovery + 1);
+    assert('a corrupt AST pack is reparsed without failing the query', recovered.types.has('Type1'));
+    eq('corrupt pack recovery reparses only the requested file', second.stats.parsed, parsedBeforeRecovery + 1);
     await second.flush();
+
+    console.log('\n== cacheable prefetched dependency sources ==');
+    const prefetchedCacheDir = path.join(tmp, 'prefetched-cache');
+    const prefetchedText = fs.readFileSync(files[3], 'utf8');
+    const prefetchedFirst = new AstWorkerPool({
+        concurrency: 2,
+        cacheDir: prefetchedCacheDir,
+        log: () => {},
+    });
+    await prefetchedFirst.parseDiskFile(files[3], prefetchedText, 10);
+    await prefetchedFirst.flush();
+    eq('prefetched disk source is parsed once on its first load', prefetchedFirst.stats.parsed, 1);
+    prefetchedFirst.dispose();
+
+    const prefetchedSecond = new AstWorkerPool({
+        concurrency: 2,
+        cacheDir: prefetchedCacheDir,
+        log: () => {},
+    });
+    await prefetchedSecond.parseDiskFile(files[3], prefetchedText, 10);
+    eq('prefetched dependency source restores from persistent AST cache', prefetchedSecond.stats.diskHits, 1);
+    eq('prefetched dependency source is not reparsed after restart', prefetchedSecond.stats.parsed, 0);
+    prefetchedSecond.dispose();
 
     const boundedCacheDir = path.join(tmp, 'bounded-cache');
     const bounded = new AstWorkerPool({
@@ -257,12 +311,12 @@ async function main() {
     await bounded.flush();
     const boundedManifest = JSON.parse(fs.readFileSync(bounded.cacheFile, 'utf8'));
     eq('bounded disk manifest persists only retained entries', boundedManifest.files.length, 2);
-    const boundedShards = fs
+    const boundedPacks = fs
         .readdirSync(bounded.astCacheDir)
-        .filter((file) => file.endsWith('.json') && file !== 'index.json');
-    eq('bounded disk cache keeps only retained shards', boundedShards.length, 2);
+        .filter((file) => file.startsWith('pack-') && file.endsWith('.json'));
+    assert('bounded disk cache removes packs that no retained entry references', boundedPacks.length <= 1);
     bounded.clear();
-    assert('clear removes the sharded AST cache directory', !fs.existsSync(bounded.astCacheDir));
+    assert('clear removes the packed AST cache directory', !fs.existsSync(bounded.astCacheDir));
     bounded.dispose();
 
     second.dispose();

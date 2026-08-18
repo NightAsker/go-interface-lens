@@ -2,6 +2,27 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.0.0] - 2026-08-18
+
+### Changed
+
+- Batch all workspace interface method anchors into one locked-dependency
+  candidate scan and one shared AST view during implementation prewarming.
+- Share dependency alias, embedding, and type-reference expansion across every
+  workspace interface instead of rebuilding a dependency context per interface.
+- Build forward implementations, reverse interfaces, and method locations in
+  one rare-method-indexed relationship pass.
+- Persist complete relationship snapshots so unchanged workspaces can answer
+  implementation queries without restoring every AST on the next startup.
+- Store declaration ASTs in cache packs with a separate bounded I/O lane, and
+  persist dependency ASTs even when their source was prefetched for build tags.
+- Select dependency anchors using dependency-side hit counts and restrict
+  follow-up type searches to aliases and embedded fields.
+- Reuse the previous dependency AST context after package-local edits and parse
+  only changed packages when interface signatures are unchanged.
+- Report phase timings for workspace AST work, dependency discovery/loading,
+  relationship construction, and snapshot restoration.
+
 ## [1.2.11] - 2026-08-18
 
 ### Fixed

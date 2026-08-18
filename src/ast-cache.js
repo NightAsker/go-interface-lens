@@ -7,7 +7,7 @@ const os = require('os');
 const { Worker } = require('worker_threads');
 const { deserializeParsedFile } = require('./ast');
 
-const CACHE_SCHEMA = 9;
+const CACHE_SCHEMA = 10;
 const DEFAULT_AST_CONCURRENCY = 16;
 const MAX_AST_CONCURRENCY = 32;
 const DEFAULT_WARM_CONCURRENCY = 4;
@@ -16,6 +16,8 @@ const DEFAULT_MEMORY_CACHE_ENTRIES = 512;
 const DEFAULT_DISK_CACHE_ENTRIES = 4096;
 const DEFAULT_DISK_CACHE_BYTES = 256 * 1024 * 1024;
 const CACHE_WRITE_CONCURRENCY = 8;
+const CACHE_PACK_ENTRIES = 64;
+const MAX_MEMORY_PACKS = 8;
 const BACKGROUND_PRIORITY_MAX = 10;
 
 function availableParallelism() {
@@ -58,6 +60,10 @@ class AstWorkerPool {
                   )
                 : 1;
         this.foregroundReserve = this.effectiveConcurrency - this.backgroundConcurrency;
+        this.backgroundIOConcurrency = Math.max(
+            this.backgroundConcurrency,
+            Math.min(16, this.effectiveConcurrency * 2)
+        );
         this.idleTimeoutMs = Number.isFinite(opts.idleTimeoutMs)
             ? Math.max(0, Math.trunc(opts.idleTimeoutMs))
             : DEFAULT_IDLE_TIMEOUT_MS;
@@ -82,6 +88,8 @@ class AstWorkerPool {
         this.persistedBytes = 0;
         this.pendingWrites = new Map();
         this.pendingDeletes = new Set();
+        this.packMemory = new Map();
+        this.nextPackID = 1;
         this.manifestDirty = false;
         this.flushPromise = null;
         this.inflight = new Map();
@@ -122,7 +130,7 @@ class AstWorkerPool {
                                 Array.isArray(item) &&
                                 typeof item[0] === 'string' &&
                                 item[1] &&
-                                typeof item[1].key === 'string'
+                                typeof item[1].pack === 'string'
                         )
                     );
                     this.persistedBytes = [...this.persisted.values()].reduce(
@@ -140,12 +148,29 @@ class AstWorkerPool {
         return this.loadPromise;
     }
 
-    _cacheKey(file) {
-        return crypto.createHash('sha1').update(path.normalize(file)).digest('hex');
+    _cachePackFile(pack) {
+        return path.join(this.astCacheDir, `${pack}.json`);
     }
 
-    _cacheShardFile(key) {
-        return path.join(this.astCacheDir, `${key}.json`);
+    _newPackKey() {
+        return `pack-${Date.now().toString(36)}-${process.pid.toString(36)}-${(
+            this.nextPackID++
+        ).toString(36)}-${crypto.randomBytes(4).toString('hex')}`;
+    }
+
+    _packIsReferenced(pack) {
+        if (!pack) return false;
+        for (const entry of this.persisted.values()) {
+            if (entry.pack === pack) return true;
+        }
+        return false;
+    }
+
+    _queuePackDeleteIfUnused(pack) {
+        if (pack && !this._packIsReferenced(pack)) {
+            this.packMemory.delete(pack);
+            this.pendingDeletes.add(pack);
+        }
     }
 
     _rememberMemory(file, value) {
@@ -162,7 +187,7 @@ class AstWorkerPool {
         this.persisted.delete(file);
         this.persistedBytes = Math.max(0, this.persistedBytes - (entry.bytes || 0));
         this.pendingWrites.delete(file);
-        this.pendingDeletes.add(entry.key);
+        this._queuePackDeleteIfUnused(entry.pack);
         this.manifestDirty = true;
         return true;
     }
@@ -186,35 +211,77 @@ class AstWorkerPool {
             this.persistedBytes = Math.max(0, this.persistedBytes - (existing.bytes || 0));
         }
         const entry = {
-            key: existing ? existing.key : this._cacheKey(normalized),
+            pack: null,
             mtimeMs: stat.mtimeMs,
             size: stat.size,
             bytes: Buffer.byteLength(JSON.stringify(serialized)),
         };
         this.persisted.set(normalized, entry);
         this.persistedBytes += entry.bytes;
-        this.pendingDeletes.delete(entry.key);
         this.pendingWrites.set(normalized, { entry, parsed: serialized });
+        this._queuePackDeleteIfUnused(existing && existing.pack);
         this.manifestDirty = true;
         this._trimPersisted();
     }
 
+    _rememberPack(pack, value) {
+        this.packMemory.delete(pack);
+        this.packMemory.set(pack, value);
+        while (this.packMemory.size > MAX_MEMORY_PACKS) {
+            this.packMemory.delete(this.packMemory.keys().next().value);
+        }
+    }
+
+    async _readPack(pack) {
+        const cached = this.packMemory.get(pack);
+        if (cached) {
+            this._rememberPack(pack, cached);
+            return cached;
+        }
+        const request = fs.promises
+            .readFile(this._cachePackFile(pack), 'utf8')
+            .then((source) => {
+                const payload = JSON.parse(source);
+                if (payload.schema !== CACHE_SCHEMA || !Array.isArray(payload.files)) {
+                    throw new Error('AST cache pack schema mismatch');
+                }
+                return new Map(
+                    payload.files
+                        .filter((item) => Array.isArray(item) && typeof item[0] === 'string')
+                        .map(([file, value]) => [path.normalize(file), value])
+                );
+            })
+            .catch((error) => {
+                this.packMemory.delete(pack);
+                throw error;
+            });
+        this._rememberPack(pack, request);
+        return request;
+    }
+
+    _invalidatePack(pack) {
+        this.packMemory.delete(pack);
+        for (const [file, current] of [...this.persisted]) {
+            if (current.pack === pack) this._deletePersisted(file);
+        }
+    }
+
     async _readPersisted(file, entry) {
         try {
-            const payload = JSON.parse(await fs.promises.readFile(this._cacheShardFile(entry.key), 'utf8'));
+            const pack = await this._readPack(entry.pack);
+            const payload = pack.get(path.normalize(file));
             if (
-                payload.schema !== CACHE_SCHEMA ||
-                path.normalize(payload.file || '') !== path.normalize(file) ||
+                !payload ||
                 payload.mtimeMs !== entry.mtimeMs ||
                 payload.size !== entry.size
             ) {
-                throw new Error('AST cache shard metadata mismatch');
+                throw new Error('AST cache pack metadata mismatch');
             }
             return payload.parsed;
         } catch (err) {
-            this._deletePersisted(path.normalize(file));
+            this._invalidatePack(entry.pack);
             this._scheduleWrite();
-            if (err.code !== 'ENOENT') this.log(`AST cache shard load failed: ${err.message}`);
+            if (err.code !== 'ENOENT') this.log(`AST cache pack load failed: ${err.message}`);
             return null;
         }
     }
@@ -474,10 +541,9 @@ class AstWorkerPool {
     }
 
     parseFile(file, text, priority) {
+        if (text === undefined) return this.parseDiskFile(file, undefined, priority);
         const overlayHash =
-            text === undefined
-                ? 'disk'
-                : crypto.createHash('sha1').update(text).digest('hex');
+            crypto.createHash('sha1').update(text).digest('hex');
         const key = `${file}\0${overlayHash}`;
         const requestedPriority = Number.isFinite(priority) ? priority : 0;
         const existing = this.inflight.get(key);
@@ -496,22 +562,48 @@ class AstWorkerPool {
         return entry.promise;
     }
 
+    /**
+     * Parse an on-disk source while optionally reusing text already read by the
+     * caller for build-constraint filtering. Unlike an editor overlay, this path
+     * validates file metadata and participates in the persistent AST cache.
+     */
+    parseDiskFile(file, prefetchedText, priority) {
+        const key = `${file}\0disk`;
+        const requestedPriority = Number.isFinite(priority) ? priority : 0;
+        const existing = this.inflight.get(key);
+        if (existing) {
+            if (requestedPriority > existing.priority) {
+                existing.priority = requestedPriority;
+                this._promoteQueuedJob(key, requestedPriority);
+            }
+            return existing.promise;
+        }
+        const entry = { promise: null, priority: requestedPriority };
+        entry.promise = this._parseDiskFile(file, prefetchedText, entry, key).finally(() => {
+            if (this.inflight.get(key) === entry) this.inflight.delete(key);
+        });
+        this.inflight.set(key, entry);
+        return entry.promise;
+    }
+
     async _parseFile(file, text, request, key) {
         await this._load();
         const generation = this.generation;
-        if (text !== undefined) {
-            const overlay = this.overlays.get(file);
-            if (overlay && overlay.text === text) {
-                this.stats.memoryHits += 1;
-                return overlay.parsed;
-            }
-            const serialized = await this._run(file, text, request.priority, key);
-            const parsed = deserializeParsedFile(serialized);
-            if (generation === this.generation) this.overlays.set(file, { text, parsed });
-            this.stats.parsed += 1;
-            return parsed;
+        const overlay = this.overlays.get(file);
+        if (overlay && overlay.text === text) {
+            this.stats.memoryHits += 1;
+            return overlay.parsed;
         }
+        const serialized = await this._run(file, text, request.priority, key);
+        const parsed = deserializeParsedFile(serialized);
+        if (generation === this.generation) this.overlays.set(file, { text, parsed });
+        this.stats.parsed += 1;
+        return parsed;
+    }
 
+    async _parseDiskFile(file, prefetchedText, request, key) {
+        await this._load();
+        const generation = this.generation;
         const stat = await fs.promises.stat(file);
         const memory = this.memory.get(file);
         if (memory && memory.mtimeMs === stat.mtimeMs && memory.size === stat.size) {
@@ -533,7 +625,7 @@ class AstWorkerPool {
             }
         }
 
-        const serialized = await this._run(file, undefined, request.priority, key);
+        const serialized = await this._run(file, prefetchedText, request.priority, key);
         const parsed = deserializeParsedFile(serialized);
         if (generation === this.generation) {
             this._rememberMemory(file, { mtimeMs: stat.mtimeMs, size: stat.size, parsed });
@@ -548,25 +640,41 @@ class AstWorkerPool {
         const requestedPriority = Number.isFinite(priority) ? priority : 100;
         if (requestedPriority <= BACKGROUND_PRIORITY_MAX) {
             const results = new Array(requests.length);
-            let next = 0;
-            const run = async () => {
-                while (next < requests.length) {
-                    const index = next++;
+            const diskIndexes = [];
+            const overlayIndexes = [];
+            for (let index = 0; index < requests.length; index++) {
+                if (requests[index].text === undefined) diskIndexes.push(index);
+                else overlayIndexes.push(index);
+            }
+            const run = async (indexes, disk) => {
+                while (indexes.length > 0) {
+                    const index = indexes.pop();
                     const request = requests[index];
                     results[index] = [
                         request.file,
-                        await this.parseFile(request.file, request.text, requestedPriority),
+                        disk
+                            ? await this.parseDiskFile(request.file, request.diskText, requestedPriority)
+                            : await this.parseFile(request.file, request.text, requestedPriority),
                     ];
                 }
             };
-            const runners = Math.min(requests.length, this.backgroundConcurrency);
-            await Promise.all(Array.from({ length: runners }, () => run()));
+            const diskRunners = Math.min(diskIndexes.length, this.backgroundIOConcurrency);
+            const overlayRunners = Math.min(
+                overlayIndexes.length,
+                this.backgroundConcurrency
+            );
+            await Promise.all([
+                ...Array.from({ length: diskRunners }, () => run(diskIndexes, true)),
+                ...Array.from({ length: overlayRunners }, () => run(overlayIndexes, false)),
+            ]);
             return new Map(results);
         }
         const results = await Promise.all(
             requests.map(async (request) => [
                 request.file,
-                await this.parseFile(request.file, request.text, requestedPriority),
+                request.text === undefined
+                    ? await this.parseDiskFile(request.file, request.diskText, requestedPriority)
+                    : await this.parseFile(request.file, request.text, requestedPriority),
             ])
         );
         return new Map(results);
@@ -601,6 +709,7 @@ class AstWorkerPool {
         this.persistedBytes = 0;
         this.pendingWrites.clear();
         this.pendingDeletes.clear();
+        this.packMemory.clear();
         this.manifestDirty = false;
         if (this.astCacheDir) {
             try {
@@ -635,46 +744,66 @@ class AstWorkerPool {
 
         const writes = [...this.pendingWrites];
         const deletes = [...this.pendingDeletes];
-        const writeManifest = this.manifestDirty;
         this.pendingWrites.clear();
         this.pendingDeletes.clear();
         this.manifestDirty = false;
-        const manifest = JSON.stringify({ schema: CACHE_SCHEMA, files: [...this.persisted] });
 
         this.flushPromise = (async () => {
             await fs.promises.mkdir(this.astCacheDir, { recursive: true });
-            for (let start = 0; start < writes.length; start += CACHE_WRITE_CONCURRENCY) {
-                await Promise.all(
-                    writes.slice(start, start + CACHE_WRITE_CONCURRENCY).map(async ([file, value]) => {
-                        const target = this._cacheShardFile(value.entry.key);
-                        const temporary = `${target}.${process.pid}.tmp`;
-                        const payload = JSON.stringify({
-                            schema: CACHE_SCHEMA,
-                            file,
+            const packWrites = [];
+            for (let start = 0; start < writes.length; start += CACHE_PACK_ENTRIES) {
+                const entries = writes
+                    .slice(start, start + CACHE_PACK_ENTRIES)
+                    .filter(([file, value]) => this.persisted.get(file) === value.entry);
+                if (entries.length === 0) continue;
+                const pack = this._newPackKey();
+                for (const [file, value] of entries) {
+                    const current = this.persisted.get(file);
+                    if (current === value.entry) current.pack = pack;
+                }
+                const target = this._cachePackFile(pack);
+                const temporary = `${target}.${process.pid}.tmp`;
+                const payload = JSON.stringify({
+                    schema: CACHE_SCHEMA,
+                    files: entries.map(([file, value]) => [
+                        file,
+                        {
                             mtimeMs: value.entry.mtimeMs,
                             size: value.entry.size,
                             parsed: value.parsed,
-                        });
-                        await fs.promises.writeFile(temporary, payload);
-                        await fs.promises.rename(temporary, target);
+                        },
+                    ]),
+                });
+                packWrites.push({ target, temporary, payload });
+            }
+            for (let start = 0; start < packWrites.length; start += CACHE_WRITE_CONCURRENCY) {
+                await Promise.all(
+                    packWrites.slice(start, start + CACHE_WRITE_CONCURRENCY).map(async (pack) => {
+                        await fs.promises.writeFile(pack.temporary, pack.payload);
+                        await fs.promises.rename(pack.temporary, pack.target);
                     })
                 );
             }
-            for (let start = 0; start < deletes.length; start += CACHE_WRITE_CONCURRENCY) {
+
+            const manifest = JSON.stringify({
+                schema: CACHE_SCHEMA,
+                files: [...this.persisted].filter(([, entry]) => typeof entry.pack === 'string'),
+            });
+            const temporaryManifest = `${this.cacheFile}.${process.pid}.tmp`;
+            await fs.promises.writeFile(temporaryManifest, manifest);
+            await fs.promises.rename(temporaryManifest, this.cacheFile);
+
+            const unusedPacks = deletes.filter((pack) => !this._packIsReferenced(pack));
+            for (let start = 0; start < unusedPacks.length; start += CACHE_WRITE_CONCURRENCY) {
                 await Promise.all(
-                    deletes.slice(start, start + CACHE_WRITE_CONCURRENCY).map(async (key) => {
+                    unusedPacks.slice(start, start + CACHE_WRITE_CONCURRENCY).map(async (pack) => {
                         try {
-                            await fs.promises.unlink(this._cacheShardFile(key));
+                            await fs.promises.unlink(this._cachePackFile(pack));
                         } catch (err) {
                             if (err.code !== 'ENOENT') throw err;
                         }
                     })
                 );
-            }
-            if (writeManifest) {
-                const temporary = `${this.cacheFile}.${process.pid}.tmp`;
-                await fs.promises.writeFile(temporary, manifest);
-                await fs.promises.rename(temporary, this.cacheFile);
             }
         })();
         try {
@@ -684,19 +813,19 @@ class AstWorkerPool {
                 const current = this.persisted.get(file);
                 if (
                     current &&
-                    current.key === value.entry.key &&
+                    current === value.entry &&
                     current.mtimeMs === value.entry.mtimeMs &&
                     current.size === value.entry.size
                 ) {
                     this.pendingWrites.set(file, value);
                 }
             }
-            for (const key of deletes) {
-                if (![...this.persisted.values()].some((entry) => entry.key === key)) {
-                    this.pendingDeletes.add(key);
+            for (const pack of deletes) {
+                if (!this._packIsReferenced(pack)) {
+                    this.pendingDeletes.add(pack);
                 }
             }
-            if (writeManifest) this.manifestDirty = true;
+            this.manifestDirty = true;
             this._scheduleWrite();
             throw err;
         } finally {

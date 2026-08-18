@@ -101,6 +101,20 @@ async function main() {
     const reverseMs = Number(process.hrtime.bigint() - reverseStarted) / 1e6;
     const readsAfterReverse = index.getAstStats();
 
+    const restoredIndex = new WorkspaceIndex(config, () => {}, {
+        cacheDir: path.join(tmp, 'cache'),
+    });
+    await restoredIndex.ensureBuilt(root);
+    const restoredPrewarmStarted = process.hrtime.bigint();
+    const restoredPrewarm = await restoredIndex.prewarmReverseInterfaces();
+    const restoredPrewarmMs = Number(process.hrtime.bigint() - restoredPrewarmStarted) / 1e6;
+    const restoredQueryStarted = process.hrtime.bigint();
+    const restoredForward = await restoredIndex.findImplementationsAst(
+        'WarmOnly',
+        interfaceFile
+    );
+    const restoredQueryMs = Number(process.hrtime.bigint() - restoredQueryStarted) / 1e6;
+
     console.log('== lazy AST performance (402 Go files) ==');
     console.log(`  startup regex index : ${buildMs.toFixed(1)}ms`);
     console.log(`  legacy warm query   : ${legacyQueryMs.toFixed(2)}ms`);
@@ -109,6 +123,8 @@ async function main() {
     console.log(`  reverse prewarm     : ${prewarmMs.toFixed(1)}ms`);
     console.log(`  prewarmed forward   : ${forwardMs.toFixed(2)}ms`);
     console.log(`  prewarmed reverse   : ${reverseMs.toFixed(2)}ms`);
+    console.log(`  restored prewarm    : ${restoredPrewarmMs.toFixed(2)}ms`);
+    console.log(`  restored query      : ${restoredQueryMs.toFixed(2)}ms`);
     console.log(`  AST files parsed    : ${index.getAstStats().parsed}`);
 
     assert('cold AST query finds implementation', cold.length === 1 && cold[0].name === 'Impl');
@@ -141,7 +157,15 @@ async function main() {
             readsAfterReverse.memoryHits === readsBeforeReverse.memoryHits &&
             readsAfterReverse.diskHits === readsBeforeReverse.diskHits
     );
+    assert('unchanged restart restores its relation snapshot', restoredPrewarm.snapshotRestored);
+    assert('relationship snapshot restores within a broad budget', restoredPrewarmMs < 1000);
+    assert(
+        'restored relationship snapshot preserves implementation results',
+        restoredForward.length === 1 && restoredForward[0].name === '*WarmImpl'
+    );
+    assert('restored snapshot query stays responsive', restoredQueryMs < 100);
 
+    restoredIndex.dispose();
     index.dispose();
     fs.rmSync(tmp, { recursive: true, force: true });
     done();

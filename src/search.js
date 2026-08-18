@@ -207,6 +207,84 @@ async function grepImplementationFilesForMethod(root, methodName, maxFiles, sear
 }
 
 /**
+ * Find dependency files relevant to any of the supplied interface method
+ * anchors in one ripgrep pass. Receiver declarations locate direct concrete
+ * implementations; interface declarations retain types that may later be
+ * promoted through embedding. Tree-sitter performs the exact verification.
+ *
+ * @param {string} root dependency root
+ * @param {Iterable<string>} methodNames interface method anchors
+ * @param {number} [maxFiles] cap on candidate files
+ * @param {string[]} [searchDirs] restrict search to locked module directories
+ * @returns {Promise<{files:string[],filesByMethod:Map<string,Set<string>>}>}
+ */
+async function scanDependencyFilesForMethods(root, methodNames, maxFiles, searchDirs) {
+    const names = [...new Set(methodNames)]
+        .filter((name) => /^[A-Za-z_]\w*$/.test(name))
+        .sort();
+    if (names.length === 0) return { files: [], filesByMethod: new Map() };
+    const rg = findRipgrep();
+    const cap = maxFiles || 1000;
+    const args = ['--json', '-U', '--glob', '*.go'];
+    const chunkSize = 128;
+    for (let start = 0; start < names.length; start += chunkSize) {
+        const alternatives = names.slice(start, start + chunkSize).join('|');
+        args.push(
+            '-e',
+            `(?:\\bfunc\\s*\\([^)]*\\)\\s*(?:${alternatives})\\s*\\(|` +
+                `^\\s*(?:${alternatives})\\s*\\(|` +
+                `\\binterface\\s*\\{[^}]*(?:${alternatives})\\s*\\()`
+        );
+    }
+    args.push('--');
+    const targets = Array.isArray(searchDirs) && searchDirs.length > 0 ? searchDirs : ['.'];
+    for (const target of targets) args.push(target);
+
+    try {
+        const out = await runExec(rg || 'rg', args, root, 60000);
+        const files = new Set();
+        const filesByMethod = new Map(names.map((name) => [name, new Set()]));
+        const methodMatcher = new RegExp(`\\b(${names.join('|')})\\s*\\(`, 'g');
+        for (const line of out.split('\n')) {
+            if (!line) continue;
+            let message;
+            try {
+                message = JSON.parse(line);
+            } catch (_) {
+                continue;
+            }
+            if (!message || message.type !== 'match' || !message.data) continue;
+            const rawPath = message.data.path && message.data.path.text;
+            if (!rawPath) continue;
+            const file = path.normalize(path.isAbsolute(rawPath) ? rawPath : path.join(root, rawPath));
+            files.add(file);
+            const matchedSource = (message.data.lines && message.data.lines.text) || '';
+            methodMatcher.lastIndex = 0;
+            let match;
+            while ((match = methodMatcher.exec(matchedSource))) {
+                const methodFiles = filesByMethod.get(match[1]);
+                if (methodFiles) methodFiles.add(file);
+            }
+        }
+        const limitedFiles = [...files].slice(0, cap);
+        const retained = new Set(limitedFiles);
+        for (const [name, methodFiles] of filesByMethod) {
+            filesByMethod.set(
+                name,
+                new Set([...methodFiles].filter((file) => retained.has(file)))
+            );
+        }
+        return { files: limitedFiles, filesByMethod };
+    } catch (_) {
+        return { files: [], filesByMethod: new Map() };
+    }
+}
+
+async function grepDependencyFilesForMethods(root, methodNames, maxFiles, searchDirs) {
+    return (await scanDependencyFilesForMethods(root, methodNames, maxFiles, searchDirs)).files;
+}
+
+/**
  * Find files that may embed or alias one of the supplied named types. AST
  * method-set resolution later rejects ordinary references and ambiguous embeds.
  *
@@ -221,14 +299,28 @@ async function grepGoFilesForTypeNames(root, typeNames, maxFiles, searchDirs) {
     if (names.length === 0) return [];
     const rg = findRipgrep();
     const cap = maxFiles || 400;
+    const alternatives = names.join('|');
+    const namedReference = `\\*?(?:[A-Z_a-z]\\w*\\.)?(?:${alternatives})\\b`;
+    const typeArguments = `(?:\\s*\\[[^\\]\\n]*\\])?`;
+    const directAlias =
+        `\\btype\\s+[A-Z_a-z]\\w*(?:\\s*\\[[^\\]\\n]*\\])?` +
+        `\\s*=\\s*${namedReference}${typeArguments}`;
+    const groupedAlias =
+        `\\btype\\s*\\([^)]*\\b[A-Z_a-z]\\w*` +
+        `(?:\\s*\\[[^\\]\\n]*\\])?\\s*=\\s*${namedReference}${typeArguments}`;
+    const embeddedField =
+        `\\b(?:struct|interface)\\s*\\{` +
+        `(?:[^};\\n]*(?:;|\\n))*\\s*${namedReference}${typeArguments}` +
+        `\\s*(?:\x60[^\x60\\n]*\x60)?\\s*(?:;|\\n|\\})`;
     const args = [
         '-l',
+        '-U',
         '--glob',
         '*.go',
         '--max-count',
         '1',
         '-e',
-        `\\b(?:${names.join('|')})\\b`,
+        `(?:${directAlias}|${groupedAlias}|${embeddedField})`,
         '--',
     ];
     const targets = Array.isArray(searchDirs) && searchDirs.length > 0 ? searchDirs : ['.'];
@@ -343,5 +435,7 @@ module.exports = {
     resolveGoModCache,
     grepInterfaceFilesForMethod,
     grepImplementationFilesForMethod,
+    grepDependencyFilesForMethods,
+    scanDependencyFilesForMethods,
     grepGoFilesForTypeNames,
 };

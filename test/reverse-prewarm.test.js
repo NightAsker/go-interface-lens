@@ -117,6 +117,17 @@ async function main() {
         'prewarm computes concrete forward implementation relationships',
         warmed.implementationRelationships >= 2
     );
+    eq('prewarm builds forward and reverse maps in one relationship pass', warmed.relationshipPasses, 1);
+    assert(
+        'relationship prewarm verifies narrowed interface/type candidates',
+        warmed.relationshipCandidateChecks < warmed.receiverMethods * warmed.workspaceInterfaces
+    );
+    assert(
+        'prewarm reports actionable phase timings',
+        warmed.phaseTimings &&
+            Number.isFinite(warmed.phaseTimings.workspaceAstMs) &&
+            Number.isFinite(warmed.phaseTimings.relationshipMs)
+    );
     assert('Tree-sitter prewarm uses multiple workers', index.getAstStats().maxActive > 1);
     assert(
         'prewarm completion is logged',
@@ -197,6 +208,44 @@ async function main() {
         beforeNegativeForwardQuery
     );
 
+    console.log('\n== persistent relationship snapshot ==');
+    const restoredIndex = new WorkspaceIndex(
+        () => ({
+            excludedFolders: ['vendor'],
+            excludedFilePatterns: [],
+            excludedTypePatterns: [],
+            searchDependencies: false,
+            goModCache: '',
+            astConcurrency: 4,
+        }),
+        () => {},
+        { cacheDir: path.join(tmp, 'cache') }
+    );
+    await restoredIndex.ensureBuilt(root);
+    restoredIndex._buildReversePrewarm = async () => {
+        throw new Error('unchanged restart rebuilt relationships instead of restoring its snapshot');
+    };
+    const restoredWarm = await restoredIndex.prewarmReverseInterfaces();
+    assert('unchanged restart restores the complete relationship snapshot', restoredWarm.snapshotRestored);
+    assert(
+        'snapshot restoration reports its own phase timing',
+        Number.isFinite(restoredWarm.phaseTimings.snapshotReadMs)
+    );
+    const beforeRestoredQuery = astReads(restoredIndex.getAstStats());
+    eq(
+        'restored snapshot answers interface implementations directly',
+        (await restoredIndex.findImplementationsAst('Handler', contractFile)).map(
+            (item) => item.name
+        ),
+        ['*MessageSyncHandler']
+    );
+    eq(
+        'restored relationship query performs no AST reads',
+        astReads(restoredIndex.getAstStats()),
+        beforeRestoredQuery
+    );
+    restoredIndex.dispose();
+
     console.log('\n== edits invalidate and rebuild the complete relation map ==');
     const changedContract = [...contractSource];
     changedContract.splice(changedContract.indexOf('}'), 0, '    Reset() error');
@@ -204,7 +253,14 @@ async function main() {
     fs.writeFileSync(contractFile, changedContractText);
     index.updateFileText(contractFile, changedContractText);
     assert('workspace edit invalidates ready prewarm results', index.getReversePrewarmStats().ready === false);
-    await index.prewarmReverseInterfaces();
+    const readsBeforeIncrementalWarm = astReads(index.getAstStats());
+    const incrementallyWarmed = await index.prewarmReverseInterfaces();
+    assert('single-package edit uses incremental relation prewarm', incrementallyWarmed.incremental);
+    eq('incremental relation prewarm reparses only the changed package file', incrementallyWarmed.incrementalFiles, 1);
+    assert(
+        'incremental prewarm avoids touching unchanged workspace AST entries',
+        index.getAstStats().memoryHits - readsBeforeIncrementalWarm.memoryHits <= 1
+    );
     const beforeChangedQuery = astReads(index.getAstStats());
     const changedInterfaces = await index.findInterfacesAst('MessageSyncHandler', 'HandleMessage', {
         receiverFile: implementationFile,
