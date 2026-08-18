@@ -2703,6 +2703,29 @@ class WorkspaceIndex {
     }
 
     _implementationAstContext(interfaceName, interfaceFile) {
+        const prewarmed = this._prewarmedImplementationLookup(interfaceName, interfaceFile);
+        if (prewarmed) {
+            const descriptor = this._interfaceDescriptor(
+                prewarmed.view,
+                interfaceName,
+                interfaceFile
+            );
+            if (!descriptor) return Promise.resolve(null);
+            const candidatePackages = this._candidatePackagesForMethods(
+                descriptor.resolved.methods.keys()
+            );
+            const interfacePackage = this._packageForFile(interfaceFile);
+            if (interfacePackage) candidatePackages.add(interfacePackage);
+            return Promise.resolve({
+                astFiles: prewarmed.astFiles,
+                view: prewarmed.view,
+                candidatePackages,
+                descriptor,
+                implementationResults: [...prewarmed.results],
+                includeExternalImplementations: false,
+                prewarmed: true,
+            });
+        }
         const key = `context\0${interfaceFile}\0${interfaceName}`;
         return this._cachedAstQuery(key, () =>
             this._buildImplementationAstContext(interfaceName, interfaceFile)
@@ -2801,7 +2824,22 @@ class WorkspaceIndex {
                 }
             };
             await loadCandidatePackages(candidateFiles);
-            if (astFiles.size === context.astFiles.size) return context;
+            if (astFiles.size === context.astFiles.size) {
+                if (!Array.isArray(context.implementationResults)) return context;
+                const externalResults = context.view
+                    .findImplementations(interfaceName, interfaceFile, {
+                        includeExternal: true,
+                    })
+                    .filter((result) => result.external);
+                return {
+                    ...context,
+                    implementationResults: dedupeResults([
+                        ...context.implementationResults,
+                        ...externalResults,
+                    ]),
+                    includeExternalImplementations: true,
+                };
+            }
 
             let aliasExpansion = null;
             const searchedTypeNames = new Set();
@@ -2851,6 +2889,11 @@ class WorkspaceIndex {
                 if (astFiles.size === before) break;
             }
             if (!aliasExpansion) return context;
+            const externalResults = aliasExpansion.view
+                .findImplementations(interfaceName, interfaceFile, {
+                    includeExternal: true,
+                })
+                .filter((result) => result.external);
             this.log(
                 `AST dependency implementation context ${interfaceName}: ${candidateFiles.size} ` +
                     `candidate file(s), ${discoveredImports.size} package(s), anchor ${anchorMethod}`
@@ -2860,6 +2903,10 @@ class WorkspaceIndex {
                 astFiles: aliasExpansion.astFiles,
                 view: aliasExpansion.view,
                 dependencyCandidateFiles: [...candidateFiles],
+                implementationResults: Array.isArray(context.implementationResults)
+                    ? dedupeResults([...context.implementationResults, ...externalResults])
+                    : undefined,
+                includeExternalImplementations: true,
             };
         });
     }
@@ -2874,12 +2921,15 @@ class WorkspaceIndex {
                     ? await this._implementationAstContext(interfaceName, interfaceFile)
                     : await this._dependencyImplementationAstContext(interfaceName, interfaceFile);
             if (!context) return [];
-            const results = context.view.findImplementations(interfaceName, interfaceFile, {
-                includeExternal: cfg.searchDependencies !== false,
-            });
+            const results = Array.isArray(context.implementationResults)
+                ? context.implementationResults
+                : context.view.findImplementations(interfaceName, interfaceFile, {
+                      includeExternal: cfg.searchDependencies !== false,
+                  });
             this.log(
                 `AST implementation query ${interfaceName}: ${context.candidatePackages.size} package(s), ` +
-                    `${context.astFiles.size} file(s), ${Date.now() - started}ms`
+                    `${context.astFiles.size} file(s), ${Date.now() - started}ms` +
+                    (context.prewarmed ? ' (workspace-prewarmed)' : '')
             );
             return results;
         });
@@ -2899,11 +2949,17 @@ class WorkspaceIndex {
                 interfaceName,
                 methodName,
                 interfaceFile,
-                { includeExternal: cfg.searchDependencies !== false }
+                {
+                    includeExternal:
+                        context.includeExternalImplementations === undefined
+                            ? cfg.searchDependencies !== false
+                            : context.includeExternalImplementations,
+                }
             );
             this.log(
                 `AST method query ${interfaceName}.${methodName}: ${context.candidatePackages.size} package(s), ` +
-                    `${context.astFiles.size} file(s), ${Date.now() - started}ms`
+                    `${context.astFiles.size} file(s), ${Date.now() - started}ms` +
+                    (context.prewarmed ? ' (workspace-prewarmed)' : '')
             );
             return results;
         });
@@ -2911,6 +2967,22 @@ class WorkspaceIndex {
 
     _reversePrewarmKey(receiverType, methodName, receiverFile) {
         return `${path.normalize(receiverFile || '')}\0${receiverType}\0${methodName}`;
+    }
+
+    _forwardPrewarmKey(interfaceName, interfaceFile) {
+        return `${path.normalize(interfaceFile || '')}\0${interfaceName}`;
+    }
+
+    _prewarmedImplementationLookup(interfaceName, interfaceFile) {
+        const state = this._reversePrewarm;
+        if (!state || state.generation !== this._astGeneration || !interfaceFile) return null;
+        const key = this._forwardPrewarmKey(interfaceName, interfaceFile);
+        if (!state.resultsByInterface || !state.resultsByInterface.has(key)) return null;
+        return {
+            results: state.resultsByInterface.get(key),
+            astFiles: state.astFiles,
+            view: state.view,
+        };
     }
 
     _prewarmedReverseLookup(receiverType, methodName, receiverFile) {
@@ -2937,7 +3009,9 @@ class WorkspaceIndex {
         this._reversePrewarmTimer = setTimeout(() => {
             this._reversePrewarmTimer = null;
             this.prewarmReverseInterfaces().catch((error) => {
-                if (!this._disposed) this.log(`Reverse interface prewarm failed: ${error.message}`);
+                if (!this._disposed) {
+                    this.log(`Workspace interface relation prewarm failed: ${error.message}`);
+                }
             });
         }, WorkspaceIndex.REVERSE_PREWARM_INVALIDATION_DELAY_MS);
         if (typeof this._reversePrewarmTimer.unref === 'function') {
@@ -2947,10 +3021,11 @@ class WorkspaceIndex {
 
     /**
      * Parse the complete workspace in the AST worker pool and precompute every
-     * concrete receiver-method -> workspace-interface relationship. Calls share
+     * concrete receiver-method -> workspace-interface relationship plus the
+     * inverse workspace-interface -> concrete implementation map. Calls share
      * one in-flight promise; foreground AST queries retain their higher queue
      * priority and can overtake this background work.
-     * @returns {Promise<{ready:boolean,stale?:boolean,workspaceFiles:number,workspacePackages:number,receiverMethods:number,relationships:number,durationMs:number}>}
+     * @returns {Promise<{ready:boolean,stale?:boolean,workspaceFiles:number,workspacePackages:number,workspaceInterfaces:number,receiverMethods:number,relationships:number,implementationRelationships:number,durationMs:number}>}
      */
     prewarmReverseInterfaces() {
         this._reversePrewarmRequested = true;
@@ -2959,8 +3034,10 @@ class WorkspaceIndex {
                 ready: false,
                 workspaceFiles: 0,
                 workspacePackages: 0,
+                workspaceInterfaces: 0,
                 receiverMethods: 0,
                 relationships: 0,
+                implementationRelationships: 0,
                 durationMs: 0,
             });
         }
@@ -2975,7 +3052,7 @@ class WorkspaceIndex {
 
         const generation = this._astGeneration;
         this.log(
-            `Reverse interface prewarm started for ${this._packageFiles.size} workspace package(s)`
+            `Workspace interface relation prewarm started for ${this._packageFiles.size} package(s)`
         );
         let stale = false;
         let request;
@@ -2987,10 +3064,12 @@ class WorkspaceIndex {
                 }
                 this._reversePrewarm = state;
                 this.log(
-                    `Reverse interface prewarm complete: ${state.stats.workspaceFiles} file(s), ` +
+                    `Workspace interface relation prewarm complete: ${state.stats.workspaceFiles} file(s), ` +
                         `${state.stats.workspacePackages} package(s), ` +
+                        `${state.stats.workspaceInterfaces} interface(s), ` +
                         `${state.stats.receiverMethods} receiver method(s), ` +
-                        `${state.stats.relationships} relationship(s), ` +
+                        `${state.stats.relationships} reverse relationship(s), ` +
+                        `${state.stats.implementationRelationships} implementation relationship(s), ` +
                         `${state.stats.durationMs}ms`
                 );
                 return { ...state.stats, ready: true };
@@ -3044,8 +3123,27 @@ class WorkspaceIndex {
             WorkspaceIndex.REVERSE_PREWARM_PRIORITY
         );
         const view = aliasExpansion.view;
-        const { types } = view._merged();
+        const { interfaces, types } = view._merged();
         const locationsByType = new Map();
+        const resultsByInterface = new Map();
+        const forwardKeyByInterface = new Map();
+
+        for (const [interfaceKey, interfaceInfo] of interfaces) {
+            const declaration = view._interfaceDecls.get(interfaceKey);
+            if (
+                !declaration ||
+                interfaceInfo.externalSource ||
+                !workspaceFileSet.has(path.normalize(declaration.file))
+            ) {
+                continue;
+            }
+            const forwardKey = this._forwardPrewarmKey(
+                declaration.name || interfaceInfo.name,
+                declaration.file
+            );
+            forwardKeyByInterface.set(interfaceKey, forwardKey);
+            resultsByInterface.set(forwardKey, []);
+        }
 
         for (const [file, info] of aliasExpansion.astFiles) {
             const normalizedFile = path.normalize(file);
@@ -3064,11 +3162,14 @@ class WorkspaceIndex {
         const resultsByReceiver = new Map();
         let receiverMethods = 0;
         let relationships = 0;
+        let implementationRelationships = 0;
         let sliceStarted = Date.now();
         for (const [typeKey, locations] of locationsByType) {
             if (generation !== this._astGeneration || this._disposed) break;
             const typeInfo = types.get(typeKey);
             const methods = view._resolveTypeMethodsCached(typeKey, types);
+            const methodSets = view._resolveTypeMethodSetsCached(typeKey, types);
+            const matchedForwardInterfaces = new Set();
             const representativeFile = locations.values().next().value;
             for (const methodKey of methods.keys()) {
                 const methodName = bareMethodName(methodKey);
@@ -3079,6 +3180,51 @@ class WorkspaceIndex {
                     .results.filter((result) => !result.external);
                 receiverMethods += 1;
                 relationships += results.length;
+                for (const result of results) {
+                    if (result.external) continue;
+                    const interfaceKey = view._findInterfaceKey(result.name, result.file);
+                    const forwardKey = interfaceKey && forwardKeyByInterface.get(interfaceKey);
+                    if (!forwardKey || matchedForwardInterfaces.has(interfaceKey)) continue;
+                    const resolved = view._resolveInterfaceMethodsCached(interfaceKey, interfaces);
+                    const implementsWith = (methodSet) =>
+                        view._interfaceSatisfiedBy(
+                            resolved,
+                            methodSet,
+                            typeInfo,
+                            types,
+                            interfaces,
+                            { unresolved: resolved.unresolved }
+                        ) ||
+                        view._interfaceSatisfiedBy(
+                            resolved,
+                            methodSet,
+                            typeInfo,
+                            types,
+                            interfaces,
+                            { unresolved: resolved.unresolved, loose: true }
+                        );
+                    const valueImplements = implementsWith(methodSets.value);
+                    const pointerImplements =
+                        valueImplements || implementsWith(methodSets.pointer);
+                    if (!pointerImplements) continue;
+
+                    const allLocations = view._typesByLocation.get(typeKey) || [];
+                    const declarations = allLocations.filter(
+                        (location) => location.declared !== false
+                    );
+                    const implementationLocations =
+                        declarations.length > 0 ? declarations : allLocations;
+                    for (const declaration of implementationLocations) {
+                        resultsByInterface.get(forwardKey).push({
+                            name: valueImplements ? typeInfo.name : `*${typeInfo.name}`,
+                            file: declaration.file,
+                            line: declaration.line,
+                            external: false,
+                        });
+                    }
+                    matchedForwardInterfaces.add(interfaceKey);
+                    implementationRelationships += 1;
+                }
                 for (const file of locations) {
                     resultsByReceiver.set(
                         this._reversePrewarmKey(typeInfo.name, methodName, file),
@@ -3092,17 +3238,24 @@ class WorkspaceIndex {
             }
         }
 
+        for (const [key, results] of resultsByInterface) {
+            resultsByInterface.set(key, dedupeResults(results));
+        }
+
         return {
             generation,
             astFiles: aliasExpansion.astFiles,
             view,
             workspacePackages,
             resultsByReceiver,
+            resultsByInterface,
             stats: {
                 workspaceFiles: workspaceFileSet.size,
                 workspacePackages: workspacePackages.size,
+                workspaceInterfaces: resultsByInterface.size,
                 receiverMethods,
                 relationships,
+                implementationRelationships,
                 durationMs: Date.now() - started,
             },
         };

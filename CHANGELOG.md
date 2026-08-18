@@ -2,6 +2,19 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [1.2.10] - 2026-08-18
+
+### Added
+
+- Build the complete workspace `interface -> implementation` map during the
+  existing background relation prewarm, including empty results and method
+  navigation contexts.
+
+### Changed
+
+- Serve prewarmed workspace implementation queries without AST cache reads,
+  while continuing to append dependency implementations on demand.
+
 ## [1.2.9] - 2026-08-18
 
 ### Fixed

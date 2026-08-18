@@ -34,11 +34,24 @@ async function main() {
         );
     }
     const interfaceFile = path.join(apiDir, 'rare.go');
-    fs.writeFileSync(interfaceFile, 'package api\ntype Rare interface { RareMethod(value string) error }\n');
+    fs.writeFileSync(
+        interfaceFile,
+        [
+            'package api',
+            'type Rare interface { RareMethod(value string) error }',
+            'type WarmOnly interface { WarmMethod() error }',
+        ].join('\n') + '\n'
+    );
     const implementationFile = path.join(implDir, 'impl.go');
     fs.writeFileSync(
         implementationFile,
-        'package impl\ntype Impl struct{}\nfunc (Impl) RareMethod(value string) error { return nil }\n'
+        [
+            'package impl',
+            'type Impl struct{}',
+            'func (Impl) RareMethod(value string) error { return nil }',
+            'type WarmImpl struct{}',
+            'func (*WarmImpl) WarmMethod() error { return nil }',
+        ].join('\n') + '\n'
     );
 
     const config = () => ({
@@ -75,7 +88,12 @@ async function main() {
     const prewarmStarted = process.hrtime.bigint();
     const reversePrewarm = await index.prewarmReverseInterfaces();
     const prewarmMs = Number(process.hrtime.bigint() - prewarmStarted) / 1e6;
-    const readsBeforeReverse = { ...index.getAstStats() };
+    const readsBeforeForward = { ...index.getAstStats() };
+    const forwardStarted = process.hrtime.bigint();
+    const forward = await index.findImplementationsAst('WarmOnly', interfaceFile);
+    const forwardMs = Number(process.hrtime.bigint() - forwardStarted) / 1e6;
+    const readsAfterForward = { ...index.getAstStats() };
+    const readsBeforeReverse = { ...readsAfterForward };
     const reverseStarted = process.hrtime.bigint();
     const reverse = await index.findInterfacesAst('Impl', 'RareMethod', {
         receiverFile: implementationFile,
@@ -89,6 +107,7 @@ async function main() {
     console.log(`  AST cold query      : ${coldMs.toFixed(1)}ms`);
     console.log(`  AST cached query    : ${warmMs.toFixed(2)}ms`);
     console.log(`  reverse prewarm     : ${prewarmMs.toFixed(1)}ms`);
+    console.log(`  prewarmed forward   : ${forwardMs.toFixed(2)}ms`);
     console.log(`  prewarmed reverse   : ${reverseMs.toFixed(2)}ms`);
     console.log(`  AST files parsed    : ${index.getAstStats().parsed}`);
 
@@ -103,6 +122,17 @@ async function main() {
     assert('reverse prewarm covers the complete workspace', reversePrewarm.workspaceFiles === 402);
     assert('reverse prewarm uses multiple AST workers', index.getAstStats().maxActive > 1);
     assert('reverse prewarm stays within a broad background budget', prewarmMs < 5000);
+    assert(
+        'prewarmed forward query finds the implementation',
+        forward.length === 1 && forward[0].name === '*WarmImpl'
+    );
+    assert('prewarmed forward query stays responsive', forwardMs < 100);
+    assert(
+        'prewarmed forward query performs no AST reads',
+        readsAfterForward.parsed === readsBeforeForward.parsed &&
+            readsAfterForward.memoryHits === readsBeforeForward.memoryHits &&
+            readsAfterForward.diskHits === readsBeforeForward.diskHits
+    );
     assert('prewarmed reverse query finds the interface', reverse.length === 1 && reverse[0].name === 'Rare');
     assert('prewarmed reverse query stays responsive', reverseMs < 100);
     assert(

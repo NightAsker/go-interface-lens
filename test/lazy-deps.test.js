@@ -220,9 +220,23 @@ async function main() {
     assert('reverse lookup retains a matching workspace interface', mergedHandlerNames.includes('LocalHandler'));
     assert('reverse lookup also searches an unrelated dependency interface when a local match exists', mergedHandlerNames.includes('RemoteHandler'));
 
-    const dependencyImplementations = await index.findImplementationsAst(
-        'DependencyHandlerContract',
-        localInterfaceFile
+    await index.prewarmReverseInterfaces();
+    const buildWorkspaceImplementationContext = index._buildImplementationAstContext;
+    index._buildImplementationAstContext = async () => {
+        throw new Error('workspace implementation context was rebuilt after prewarm');
+    };
+    let dependencyImplementations;
+    try {
+        dependencyImplementations = await index.findImplementationsAst(
+            'DependencyHandlerContract',
+            localInterfaceFile
+        );
+    } finally {
+        index._buildImplementationAstContext = buildWorkspaceImplementationContext;
+    }
+    assert(
+        'dependency implementation lookup reuses the prewarmed workspace context',
+        Array.isArray(dependencyImplementations)
     );
     const dependencyImplementation = dependencyImplementations.find(
         (result) => result.name === '*DependencyHandler'

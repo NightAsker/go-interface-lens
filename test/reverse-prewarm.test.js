@@ -76,6 +76,8 @@ async function main() {
     writeGo(implementationDir, 'close.go', [
         'package implementation',
         'func (*MessageSyncHandler) Close() error { return nil }',
+        'type ValueLifecycle struct{}',
+        'func (ValueLifecycle) Close() error { return nil }',
     ]);
 
     // Enough independent files to force the adaptive worker pool above one
@@ -111,8 +113,15 @@ async function main() {
     const warmed = await firstWarm;
     assert('prewarm covers every workspace Go file', warmed.workspaceFiles >= 28);
     assert('prewarm computes concrete reverse relationships', warmed.relationships >= 3);
+    assert(
+        'prewarm computes concrete forward implementation relationships',
+        warmed.implementationRelationships >= 2
+    );
     assert('Tree-sitter prewarm uses multiple workers', index.getAstStats().maxActive > 1);
-    assert('prewarm completion is logged', logs.some((line) => line.includes('Reverse interface prewarm complete')));
+    assert(
+        'prewarm completion is logged',
+        logs.some((line) => line.includes('Workspace interface relation prewarm complete'))
+    );
 
     console.log('\n== prewarmed results are directly reusable ==');
     const beforeHandleQuery = astReads(index.getAstStats());
@@ -130,6 +139,64 @@ async function main() {
     eq('prewarmed Close query performs no AST reads', astReads(index.getAstStats()), beforeCloseQuery);
     assert('prewarm reports ready state', index.getReversePrewarmStats().ready === true);
 
+    const beforeForwardMethodQuery = astReads(index.getAstStats());
+    const lifecycleMethodImplementations = await index.findMethodImplementationsAst(
+        'Lifecycle',
+        'Close',
+        contractFile
+    );
+    eq(
+        'prewarmed interface method query resolves the concrete declaration',
+        lifecycleMethodImplementations.map((item) => `${item.name}:${item.file}`).sort(),
+        [`*MessageSyncHandler:${closeFile}`, `ValueLifecycle:${closeFile}`].sort()
+    );
+    eq(
+        'prewarmed interface method query performs no AST reads',
+        astReads(index.getAstStats()),
+        beforeForwardMethodQuery
+    );
+
+    const beforeForwardQuery = astReads(index.getAstStats());
+    const handlerImplementations = await index.findImplementationsAst('Handler', contractFile);
+    eq(
+        'prewarmed interface query returns its complete implementation set',
+        handlerImplementations.map((item) => item.name),
+        ['*MessageSyncHandler']
+    );
+    eq(
+        'prewarmed interface query performs no AST reads',
+        astReads(index.getAstStats()),
+        beforeForwardQuery
+    );
+
+    const beforeValueForwardQuery = astReads(index.getAstStats());
+    const lifecycleImplementations = await index.findImplementationsAst(
+        'Lifecycle',
+        contractFile
+    );
+    eq(
+        'prewarmed interface query preserves pointer and value method sets',
+        lifecycleImplementations.map((item) => item.name).sort(),
+        ['*MessageSyncHandler', 'ValueLifecycle'].sort()
+    );
+    eq(
+        'prewarmed value implementation query performs no AST reads',
+        astReads(index.getAstStats()),
+        beforeValueForwardQuery
+    );
+
+    const beforeNegativeForwardQuery = astReads(index.getAstStats());
+    eq(
+        'prewarmed interface query retains a complete negative result',
+        await index.findImplementationsAst('WrongHandler', contractFile),
+        []
+    );
+    eq(
+        'prewarmed negative interface query performs no AST reads',
+        astReads(index.getAstStats()),
+        beforeNegativeForwardQuery
+    );
+
     console.log('\n== edits invalidate and rebuild the complete relation map ==');
     const changedContract = [...contractSource];
     changedContract.splice(changedContract.indexOf('}'), 0, '    Reset() error');
@@ -144,6 +211,17 @@ async function main() {
     });
     eq('rebuilt relation map applies the complete changed method set', changedInterfaces, []);
     eq('rebuilt negative result also performs no AST reads', astReads(index.getAstStats()), beforeChangedQuery);
+    const beforeChangedForwardQuery = astReads(index.getAstStats());
+    eq(
+        'rebuilt forward relation map removes an implementation with a missing method',
+        await index.findImplementationsAst('Handler', contractFile),
+        []
+    );
+    eq(
+        'rebuilt forward negative result also performs no AST reads',
+        astReads(index.getAstStats()),
+        beforeChangedForwardQuery
+    );
 
     index.dispose();
     fs.rmSync(tmp, { recursive: true, force: true });

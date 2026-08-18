@@ -1,6 +1,6 @@
 # Go Interface Lens
 
-[![Version](https://img.shields.io/badge/version-1.2.9-blue.svg)](https://github.com/NightAsker/go-interface-lens)
+[![Version](https://img.shields.io/badge/version-1.2.10-blue.svg)](https://github.com/NightAsker/go-interface-lens)
 [![VSCode](https://img.shields.io/badge/VSCode-1.76+-green.svg)](https://code.visualstudio.com/)
 
 一个面向大型 Go 工程的 VS Code / Cursor 接口导航扩展。它在接口、接口方法和具体实现之间提供双向 CodeLens，同时使用轻量候选索引和按需 AST 校验兼顾响应速度与查找准确性。
@@ -12,7 +12,7 @@
 ### 快速启动，按需精确查找
 
 - 激活主路径只建立轻量的方法名候选索引，不阻塞编辑器和 CodeLens 展示。
-- 轻量索引完成后，后台 AST worker pool 低优先级并发预热完整 workspace，预计算 `implementation -> interface` 关系；预热会保留已初始化 worker 和 I/O 容量给前台首次查询。
+- 轻量索引完成后，后台 AST worker pool 低优先级并发预热完整 workspace，同时预计算 `implementation -> interface` 和 `interface -> implementation` 双向关系；预热会保留已初始化 worker 和 I/O 容量给前台首次查询。
 - 点击查询命中排队中的预热文件时会提升该任务优先级，并继续复用同一次解析。
 - 点击 CodeLens 后，仅解析接口所在包、可能包含实现的候选包，以及按需命中的锁定依赖包。
 - 优先使用接口中出现频率最低的方法缩小候选范围。
@@ -29,7 +29,7 @@
 - 值接收者、指针接收者及其不同的方法集。
 - 本地或跨包嵌入的 struct、interface 和类型别名。
 - 标准库接口、`go.mod` 锁定依赖中的接口与具体实现、local replace、module replace 和 GOROOT 源码。
-- workspace 内的 `goto interface` 关系会在后台完整预热；预热完成后直接查询关系表，依赖接口仍按需搜索。
+- workspace 内的双向接口关系会在后台完整预热；预热完成后 `implementations` 和 `goto interface` 都直接查询内存关系，依赖包结果仍按需补充。
 - import 别名、包内别名、跨包别名链和复合别名。
 - `byte`/`uint8`、`rune`/`int32`、`any`/`interface{}` 等价关系，并尊重包级同名声明遮蔽。
 - 多行声明、分组参数、泛型接口与实现、泛型嵌入、泛型实例、匿名接口和嵌套函数类型。

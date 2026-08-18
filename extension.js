@@ -115,7 +115,7 @@ function prewarmRoots(roots, reason) {
             try {
                 await workspaceIndex.prewarmReverseInterfaces();
             } catch (err) {
-                log(`${reason} reverse interface prewarm failed: ${err && err.message}`);
+                log(`${reason} workspace interface relation prewarm failed: ${err && err.message}`);
             }
         }
     };
