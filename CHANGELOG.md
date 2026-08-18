@@ -2,6 +2,14 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [1.2.9] - 2026-08-18
+
+### Fixed
+
+- Reserve an initialized AST worker for foreground navigation while reverse
+  prewarming is active, and bound background cache-file fan-out so a first
+  `implementations` query is not delayed by workspace-wide prewarm work.
+
 ## [1.2.8] - 2026-08-18
 
 ### Added

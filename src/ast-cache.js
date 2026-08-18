@@ -16,6 +16,7 @@ const DEFAULT_MEMORY_CACHE_ENTRIES = 512;
 const DEFAULT_DISK_CACHE_ENTRIES = 4096;
 const DEFAULT_DISK_CACHE_BYTES = 256 * 1024 * 1024;
 const CACHE_WRITE_CONCURRENCY = 8;
+const BACKGROUND_PRIORITY_MAX = 10;
 
 function availableParallelism() {
     if (typeof os.availableParallelism === 'function') return os.availableParallelism();
@@ -46,6 +47,17 @@ class AstWorkerPool {
             this.warmConcurrency,
             Math.min(this.concurrency, Math.max(1, Math.floor((parallelism * 2) / 3)))
         );
+        // Background prewarming stays inside the already-warmed baseline and
+        // keeps one initialized worker idle for the first interactive query.
+        // Foreground batches can still grow the pool to effectiveConcurrency.
+        this.backgroundConcurrency =
+            this.effectiveConcurrency > 1
+                ? Math.max(
+                      1,
+                      Math.min(this.effectiveConcurrency - 1, this.warmConcurrency - 1)
+                  )
+                : 1;
+        this.foregroundReserve = this.effectiveConcurrency - this.backgroundConcurrency;
         this.idleTimeoutMs = Number.isFinite(opts.idleTimeoutMs)
             ? Math.max(0, Math.trunc(opts.idleTimeoutMs))
             : DEFAULT_IDLE_TIMEOUT_MS;
@@ -354,7 +366,22 @@ class AstWorkerPool {
             [this.queue[parent], this.queue[current]] = [this.queue[current], this.queue[parent]];
             current = parent;
         }
+        // Background dispatch deliberately leaves ready workers idle. Wake one
+        // immediately when that exact job becomes foreground work.
+        this._dispatch();
         return true;
+    }
+
+    _isBackgroundJob(job) {
+        return !!job && job.priority <= BACKGROUND_PRIORITY_MAX;
+    }
+
+    _activeBackgroundJobs() {
+        let active = 0;
+        for (const state of this.workers) {
+            if (state.busy && this._isBackgroundJob(state.job)) active += 1;
+        }
+        return active;
     }
 
     _dequeue() {
@@ -406,11 +433,20 @@ class AstWorkerPool {
 
     _dispatch() {
         if (this.disposed) return;
+        let backgroundActive = this._activeBackgroundJobs();
         for (const state of this.workers) {
             if (state.busy || this.queue.length === 0) continue;
+            const next = this.queue[0];
+            if (
+                this._isBackgroundJob(next) &&
+                backgroundActive >= this.backgroundConcurrency
+            ) {
+                continue;
+            }
             const job = this._dequeue();
             state.busy = true;
             state.job = job;
+            if (this._isBackgroundJob(job)) backgroundActive += 1;
             this.stats.active += 1;
             this.stats.maxActive = Math.max(this.stats.maxActive, this.stats.active);
             state.worker.postMessage({ id: job.id, file: job.file, text: job.text });
@@ -509,10 +545,28 @@ class AstWorkerPool {
     }
 
     async parseFiles(requests, priority) {
+        const requestedPriority = Number.isFinite(priority) ? priority : 100;
+        if (requestedPriority <= BACKGROUND_PRIORITY_MAX) {
+            const results = new Array(requests.length);
+            let next = 0;
+            const run = async () => {
+                while (next < requests.length) {
+                    const index = next++;
+                    const request = requests[index];
+                    results[index] = [
+                        request.file,
+                        await this.parseFile(request.file, request.text, requestedPriority),
+                    ];
+                }
+            };
+            const runners = Math.min(requests.length, this.backgroundConcurrency);
+            await Promise.all(Array.from({ length: runners }, () => run()));
+            return new Map(results);
+        }
         const results = await Promise.all(
             requests.map(async (request) => [
                 request.file,
-                await this.parseFile(request.file, request.text, priority),
+                await this.parseFile(request.file, request.text, requestedPriority),
             ])
         );
         return new Map(results);

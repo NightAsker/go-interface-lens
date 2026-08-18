@@ -1,6 +1,6 @@
 # Go Interface Lens
 
-[![Version](https://img.shields.io/badge/version-1.2.8-blue.svg)](https://github.com/NightAsker/go-interface-lens)
+[![Version](https://img.shields.io/badge/version-1.2.9-blue.svg)](https://github.com/NightAsker/go-interface-lens)
 [![VSCode](https://img.shields.io/badge/VSCode-1.76+-green.svg)](https://code.visualstudio.com/)
 
 一个面向大型 Go 工程的 VS Code / Cursor 接口导航扩展。它在接口、接口方法和具体实现之间提供双向 CodeLens，同时使用轻量候选索引和按需 AST 校验兼顾响应速度与查找准确性。
@@ -12,7 +12,7 @@
 ### 快速启动，按需精确查找
 
 - 激活主路径只建立轻量的方法名候选索引，不阻塞编辑器和 CodeLens 展示。
-- 轻量索引完成后，后台 AST worker pool 低优先级并发预热完整 workspace，预计算 `implementation -> interface` 关系。
+- 轻量索引完成后，后台 AST worker pool 低优先级并发预热完整 workspace，预计算 `implementation -> interface` 关系；预热会保留已初始化 worker 和 I/O 容量给前台首次查询。
 - 点击查询命中排队中的预热文件时会提升该任务优先级，并继续复用同一次解析。
 - 点击 CodeLens 后，仅解析接口所在包、可能包含实现的候选包，以及按需命中的锁定依赖包。
 - 优先使用接口中出现频率最低的方法缩小候选范围。

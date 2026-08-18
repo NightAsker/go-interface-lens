@@ -47,7 +47,9 @@ async function main() {
         excludedTypePatterns: [],
         searchDependencies: false,
         goModCache: '',
-        astConcurrency: 2,
+        // Keep one ready worker for foreground navigation while verifying that
+        // the reverse prewarm still parses concurrently on the remaining pool.
+        astConcurrency: 4,
     });
     const index = new WorkspaceIndex(config, () => {}, { cacheDir: path.join(tmp, 'cache') });
 
