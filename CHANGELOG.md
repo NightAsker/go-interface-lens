@@ -2,6 +2,16 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [1.2.11] - 2026-08-18
+
+### Fixed
+
+- Include locked dependency implementations and exact method locations in the
+  background relation prewarm, so a completed prewarm never falls back to a
+  synchronous dependency AST scan on the first `implementations` query.
+- Keep dependency parsing at background priority while allowing an explicit
+  foreground query to promote the same in-flight external package work.
+
 ## [1.2.10] - 2026-08-18
 
 ### Added

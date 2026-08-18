@@ -15,6 +15,14 @@ Module._resolveFilename = function (request, ...rest) {
 const { WorkspaceIndex } = require('../src/indexer');
 const { assert, eq, done } = require('./harness');
 
+function astReads(stats) {
+    return {
+        parsed: stats.parsed,
+        memoryHits: stats.memoryHits,
+        diskHits: stats.diskHits,
+    };
+}
+
 async function main() {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'go-interface-lazy-deps-'));
     const root = path.join(tmp, 'project');
@@ -220,19 +228,63 @@ async function main() {
     assert('reverse lookup retains a matching workspace interface', mergedHandlerNames.includes('LocalHandler'));
     assert('reverse lookup also searches an unrelated dependency interface when a local match exists', mergedHandlerNames.includes('RemoteHandler'));
 
-    await index.prewarmReverseInterfaces();
+    const dependencyPrewarmPriorities = [];
+    const loadExternalDirectoryForPrewarm = index._loadExternalDirectory.bind(index);
+    index._loadExternalDirectory = (directory, importPath, priority) => {
+        dependencyPrewarmPriorities.push(priority);
+        return loadExternalDirectoryForPrewarm(directory, importPath, priority);
+    };
+    try {
+        await index.prewarmReverseInterfaces();
+    } finally {
+        index._loadExternalDirectory = loadExternalDirectoryForPrewarm;
+    }
+    const prewarmStats = index.getReversePrewarmStats();
+    assert(
+        'locked dependency implementation prewarm stays at background priority',
+        dependencyPrewarmPriorities.length > 0 &&
+            dependencyPrewarmPriorities.every(
+                (priority) => Number.isFinite(priority) && priority <= 10
+            )
+    );
+    assert(
+        'complete relation prewarm includes locked dependency implementation files',
+        prewarmStats.dependencyFiles > 0
+    );
+    const astReadsAfterPrewarm = astReads(index.getAstStats());
     const buildWorkspaceImplementationContext = index._buildImplementationAstContext;
+    const dependencyImplementationCandidates = index._dependencyImplementationCandidates;
+    const dependencyInterfaceCandidates = index._dependencyInterfaceCandidates;
+    const dependencyTypeReferenceCandidates = index._dependencyTypeReferenceCandidates;
     index._buildImplementationAstContext = async () => {
         throw new Error('workspace implementation context was rebuilt after prewarm');
     };
+    index._dependencyImplementationCandidates = async () => {
+        throw new Error('dependency implementations were scanned after complete prewarm');
+    };
+    index._dependencyInterfaceCandidates = async () => {
+        throw new Error('dependency interfaces were scanned after complete prewarm');
+    };
+    index._dependencyTypeReferenceCandidates = async () => {
+        throw new Error('dependency type references were scanned after complete prewarm');
+    };
     let dependencyImplementations;
+    let dependencyMethodImplementations;
     try {
         dependencyImplementations = await index.findImplementationsAst(
             'DependencyHandlerContract',
             localInterfaceFile
         );
+        dependencyMethodImplementations = await index.findMethodImplementationsAst(
+            'DependencyHandlerContract',
+            'HandleMessage',
+            localInterfaceFile
+        );
     } finally {
         index._buildImplementationAstContext = buildWorkspaceImplementationContext;
+        index._dependencyImplementationCandidates = dependencyImplementationCandidates;
+        index._dependencyInterfaceCandidates = dependencyInterfaceCandidates;
+        index._dependencyTypeReferenceCandidates = dependencyTypeReferenceCandidates;
     }
     assert(
         'dependency implementation lookup reuses the prewarmed workspace context',
@@ -248,11 +300,10 @@ async function main() {
     assert('dependency implementation rejects a wrong anchor signature', !dependencyImplementations.some((result) => result.name === '*WrongHandler'));
     assert('dependency implementation excludes an unlocked cached module version', !dependencyImplementations.some((result) => result.name === '*StaleHandler'));
     assert('dependency implementation includes a type using promoted methods from another dependency', dependencyImplementations.some((result) => result.name === 'EmbeddedDependencyHandler'));
-
-    const dependencyMethodImplementations = await index.findMethodImplementationsAst(
-        'DependencyHandlerContract',
-        'HandleMessage',
-        localInterfaceFile
+    eq(
+        'prewarmed dependency implementation queries perform no AST reads',
+        astReads(index.getAstStats()),
+        astReadsAfterPrewarm
     );
     const dependencyMethod = dependencyMethodImplementations.find(
         (result) => result.name === '*DependencyHandler'
