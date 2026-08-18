@@ -36,6 +36,7 @@ async function main() {
     const noiseAliasDir = path.join(modCache, 'example.com', 'noisealias@v1.0.0');
     const anchorNoiseDir = path.join(modCache, 'example.com', 'anchornoise@v1.0.0');
     const ordinaryRefDir = path.join(modCache, 'example.com', 'ordinaryref@v1.0.0');
+    const callNoiseDir = path.join(modCache, 'example.com', 'callnoise@v1.0.0');
     const goRoot = path.join(tmp, 'goroot');
     const standardDir = path.join(goRoot, 'src', 'standard', 'sort');
     fs.mkdirSync(root, { recursive: true });
@@ -48,10 +49,11 @@ async function main() {
     fs.mkdirSync(noiseAliasDir, { recursive: true });
     fs.mkdirSync(anchorNoiseDir, { recursive: true });
     fs.mkdirSync(ordinaryRefDir, { recursive: true });
+    fs.mkdirSync(callNoiseDir, { recursive: true });
     fs.mkdirSync(standardDir, { recursive: true });
     fs.writeFileSync(
         path.join(root, 'go.mod'),
-        'module example.com/project\n\ngo 1.22\n\nrequire (\n\texample.com/dep v1.0.0\n\texample.com/aliasdep v1.0.0\n\texample.com/depimpl v1.0.0\n\texample.com/iface v1.0.0\n\texample.com/wrapper v1.0.0\n\texample.com/noisealias v1.0.0\n\texample.com/anchornoise v1.0.0\n\texample.com/ordinaryref v1.0.0\n)\n'
+        'module example.com/project\n\ngo 1.22\n\nrequire (\n\texample.com/dep v1.0.0\n\texample.com/aliasdep v1.0.0\n\texample.com/depimpl v1.0.0\n\texample.com/iface v1.0.0\n\texample.com/wrapper v1.0.0\n\texample.com/noisealias v1.0.0\n\texample.com/anchornoise v1.0.0\n\texample.com/ordinaryref v1.0.0\n\texample.com/callnoise v1.0.0\n)\n'
     );
     const implementationFile = path.join(root, 'impl.go');
     fs.writeFileSync(
@@ -85,6 +87,7 @@ async function main() {
     fs.writeFileSync(path.join(noiseAliasDir, 'go.mod'), 'module example.com/noisealias\n\ngo 1.22\n');
     fs.writeFileSync(path.join(anchorNoiseDir, 'go.mod'), 'module example.com/anchornoise\n\ngo 1.22\n');
     fs.writeFileSync(path.join(ordinaryRefDir, 'go.mod'), 'module example.com/ordinaryref\n\ngo 1.22\n');
+    fs.writeFileSync(path.join(callNoiseDir, 'go.mod'), 'module example.com/callnoise\n\ngo 1.22\n');
     fs.writeFileSync(path.join(noiseAliasDir, 'noise.go'), 'package noisealias\ntype Payload struct{}\n');
     for (let i = 0; i < 8; i++) {
         fs.writeFileSync(
@@ -98,6 +101,15 @@ async function main() {
             'package ordinaryref',
             'import impl "example.com/depimpl"',
             'func Observe(handler *impl.DependencyHandler) {}',
+        ].join('\n') + '\n'
+    );
+    fs.writeFileSync(
+        path.join(callNoiseDir, 'calls.go'),
+        [
+            'package callnoise',
+            'func Observe() {',
+            '    RareDep()',
+            '}',
         ].join('\n') + '\n'
     );
     fs.writeFileSync(
@@ -138,7 +150,9 @@ async function main() {
             'import dep "example.com/dep"',
             'type ConsumeMessage = dep.MessageExt',
             'type DependencyHandler struct{}',
-            'func (*DependencyHandler) HandleMessage(ctx context.Context, msg *ConsumeMessage) error { return nil }',
+            'func (',
+            '    handler *DependencyHandler',
+            ') HandleMessage(ctx context.Context, msg *ConsumeMessage) error { return nil }',
             'type PartialHandler struct{}',
             'func (*PartialHandler) HandleMessage(ctx context.Context, msg *ConsumeMessage) error { return nil }',
             'type WrongHandler struct{}',
@@ -268,6 +282,7 @@ async function main() {
     const individualImplementationCandidates = index._dependencyImplementationCandidates;
     const individualInterfaceCandidates = index._dependencyInterfaceCandidates;
     let batchCandidateScans = 0;
+    const batchScannedMethods = new Set();
     assert(
         'dependency prewarm exposes one batched multi-method candidate scan',
         typeof batchDependencyCandidates === 'function'
@@ -279,6 +294,7 @@ async function main() {
     };
     index._dependencyImplementationBatchCandidates = async (...args) => {
         batchCandidateScans += 1;
+        for (const methodName of args[1]) batchScannedMethods.add(methodName);
         return batchDependencyCandidates.apply(index, args);
     };
     index._buildDependencyImplementationAstContext = async () => {
@@ -303,12 +319,24 @@ async function main() {
     eq('all workspace interfaces share one dependency candidate scan', batchCandidateScans, 1);
     eq('prewarm reports one batched dependency scan', prewarmStats.dependencyCandidateScans, 1);
     assert(
+        'dependency prewarm scans at most one anchor per workspace interface',
+        batchScannedMethods.size <= prewarmStats.workspaceInterfaces
+    );
+    assert(
+        'single-anchor selection searches the rare method instead of Common',
+        batchScannedMethods.has('RareDep') && !batchScannedMethods.has('Common')
+    );
+    assert(
         'unrelated receiver signatures do not load dependency packages during relation prewarm',
         !dependencyPrewarmDirectories.includes(path.normalize(noiseAliasDir))
     );
     assert(
         'dependency anchor selection uses dependency-side rarity instead of workspace counts',
         !dependencyPrewarmDirectories.includes(path.normalize(anchorNoiseDir))
+    );
+    assert(
+        'same-named function calls do not load a false dependency package candidate',
+        !dependencyPrewarmDirectories.includes(path.normalize(callNoiseDir))
     );
     assert(
         'type-reference expansion ignores ordinary parameter and expression references',
@@ -508,6 +536,11 @@ async function main() {
         'dependency-enabled restart restores the complete relationship snapshot',
         dependencySnapshot.snapshotRestored
     );
+    eq(
+        'restored relationship snapshot reports no dependency candidate scan',
+        dependencySnapshot.dependencyCandidateScans,
+        0
+    );
     const beforeSnapshotImplementation = astReads(dependencySnapshotIndex.getAstStats());
     const snapshotImplementations = await dependencySnapshotIndex.findImplementationsAst(
         'DependencyHandlerContract',
@@ -533,10 +566,45 @@ async function main() {
             snapshotInterfaces.some((result) => result.name === 'RemoteHandler')
     );
 
+    console.log('\n== incomplete dependency prewarm ==');
+    const incompleteLogs = [];
+    const incompleteCacheDir = path.join(tmp, 'incomplete-cache');
+    const incompleteIndex = new WorkspaceIndex(config, (message) => incompleteLogs.push(message), {
+        cacheDir: incompleteCacheDir,
+    });
+    await incompleteIndex.ensureBuilt(root);
+    incompleteIndex._dependencyImplementationBatchCandidates = async (
+        _cacheRoot,
+        methodNames
+    ) => ({
+        files: [],
+        filesByMethod: new Map([...methodNames].map((name) => [name, new Set()])),
+        complete: false,
+        timedOut: true,
+    });
+    const incompletePrewarm = await incompleteIndex.prewarmReverseInterfaces();
+    assert('workspace relationships remain ready after dependency timeout', incompletePrewarm.ready);
+    assert(
+        'dependency timeout is not reported as a complete dependency prewarm',
+        incompleteIndex._reversePrewarm && !incompleteIndex._reversePrewarm.dependenciesPrewarmed
+    );
+    assert(
+        'dependency timeout is logged as incomplete',
+        incompleteLogs.some((line) => line.includes('dependency candidate scan incomplete'))
+    );
+    const incompleteCacheFiles = fs.existsSync(incompleteCacheDir)
+        ? fs.readdirSync(incompleteCacheDir)
+        : [];
+    assert(
+        'incomplete dependency relationships are not persisted as a complete snapshot',
+        !incompleteCacheFiles.some((file) => file.startsWith('interface-relations-'))
+    );
+
     index.dispose();
     localOnlyIndex.dispose();
     dependencyCacheIndex.dispose();
     dependencySnapshotIndex.dispose();
+    incompleteIndex.dispose();
     if (previousGoRoot === undefined) delete process.env.GOROOT;
     else process.env.GOROOT = previousGoRoot;
     fs.rmSync(tmp, { recursive: true, force: true });

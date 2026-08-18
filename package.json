@@ -2,7 +2,7 @@
   "name": "go-interface-lens",
   "displayName": "Go Interface Lens",
   "description": "Fast bidirectional CodeLens navigation between Go interfaces and their implementations",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "publisher": "xiaoyao",
   "author": {
     "name": "xiaoyao"
@@ -106,16 +106,16 @@
         },
         "goInterfaceLens.astConcurrency": {
           "type": "integer",
-          "default": 16,
+          "default": 32,
           "minimum": 1,
           "maximum": 32,
-          "description": "Maximum worker threads used to parse candidate Go packages for precise implementation matching."
+          "description": "Maximum worker threads used to parse candidate Go packages. Actual warm and background concurrency adapts to the CPUs available to the extension host."
         }
       }
     }
   },
   "scripts": {
-    "test": "node test/tree-sitter.test.js && node test/ast.test.js && node test/signatures.test.js && node test/ast-cache.test.js && node test/candidate-cache.test.js && node test/indexer.test.js && node test/lazy-index.test.js && node test/reverse-prewarm.test.js && node test/method-set-edgecases.test.js && node test/generics.test.js && node test/lazy-deps.test.js && node test/performance.test.js && node test/build.test.js && node test/search.test.js && node test/multiroot.test.js && node test/deps.test.js && node test/gomod.test.js && node test/deps-version.test.js && node test/deps-crosspkg.test.js && node test/progress.test.js && node test/gotolens.test.js",
+    "test": "node test/tree-sitter.test.js && node test/ast.test.js && node test/signatures.test.js && node test/ast-cache.test.js && node test/candidate-cache.test.js && node test/indexer.test.js && node test/lazy-index.test.js && node test/reverse-prewarm.test.js && node test/method-set-edgecases.test.js && node test/generics.test.js && node test/dependency-scan.test.js && node test/lazy-deps.test.js && node test/performance.test.js && node test/build.test.js && node test/search.test.js && node test/multiroot.test.js && node test/deps.test.js && node test/gomod.test.js && node test/deps-version.test.js && node test/deps-crosspkg.test.js && node test/progress.test.js && node test/gotolens.test.js",
     "package": "vsce package --no-dependencies",
     "publish": "vsce publish --no-dependencies"
   },

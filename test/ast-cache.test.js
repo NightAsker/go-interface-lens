@@ -20,12 +20,46 @@ async function main() {
 
     console.log('== concurrent declaration AST cache ==');
     const defaults = new AstWorkerPool();
-    eq('worker concurrency defaults to 16', defaults.concurrency, 16);
-    eq('default warmup starts only the baseline workers', await defaults.warmup(), 4);
-    eq('default warmup keeps the remaining capacity lazy', defaults.stats.maxWorkers, 4);
+    eq('worker concurrency defaults to 32', defaults.concurrency, 32);
     defaults.dispose();
-    const maximum = new AstWorkerPool({ concurrency: 100 });
+    const cpuProfiles = [
+        { parallelism: 1, warm: 1, background: 1, foreground: 0 },
+        { parallelism: 4, warm: 2, background: 1, foreground: 1 },
+        { parallelism: 8, warm: 5, background: 3, foreground: 2 },
+        { parallelism: 12, warm: 8, background: 5, foreground: 3 },
+        { parallelism: 32, warm: 21, background: 14, foreground: 7 },
+        { parallelism: 64, warm: 32, background: 16, foreground: 16 },
+    ];
+    for (const profile of cpuProfiles) {
+        const pool = new AstWorkerPool({ parallelism: profile.parallelism });
+        eq(
+            `${profile.parallelism} CPU profile derives its warm worker baseline`,
+            pool.warmConcurrency,
+            profile.warm
+        );
+        eq(
+            `${profile.parallelism} CPU profile derives its background parser lane`,
+            pool.backgroundConcurrency,
+            profile.background
+        );
+        eq(
+            `${profile.parallelism} CPU profile retains foreground capacity`,
+            pool.foregroundReserve,
+            profile.foreground
+        );
+        pool.dispose();
+    }
+    const twelveCpu = new AstWorkerPool({ parallelism: 12 });
+    eq('12 CPU warmup starts the adaptive baseline', await twelveCpu.warmup(), 8);
+    eq('adaptive warmup does not grow to the configured ceiling', twelveCpu.stats.maxWorkers, 8);
+    twelveCpu.dispose();
+    const configuredCeiling = new AstWorkerPool({ concurrency: 6, parallelism: 64 });
+    eq('configured concurrency remains an adaptive worker ceiling', configuredCeiling.warmConcurrency, 6);
+    eq('configured ceiling keeps a proportional background lane', configuredCeiling.backgroundConcurrency, 4);
+    configuredCeiling.dispose();
+    const maximum = new AstWorkerPool({ concurrency: 100, parallelism: 64 });
     eq('worker concurrency is capped at 32', maximum.concurrency, 32);
+    eq('CPU-derived warm concurrency is capped at 32', maximum.warmConcurrency, 32);
     maximum.dispose();
     const minimum = new AstWorkerPool({ concurrency: 0 });
     eq('worker concurrency is clamped to at least 1', minimum.concurrency, 1);

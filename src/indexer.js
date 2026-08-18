@@ -31,6 +31,7 @@ const { AstWorkerPool, DEFAULT_AST_CONCURRENCY } = require('./ast-cache');
 const CANDIDATE_CACHE_SCHEMA = 1;
 const CANDIDATE_CACHE_WRITE_DELAY_MS = 500;
 const RELATION_CACHE_SCHEMA = 1;
+const DEPENDENCY_CANDIDATE_CACHE_SCHEMA = 1;
 
 const NON_METHOD_CALLS = new Set([
     'if',
@@ -546,6 +547,7 @@ class WorkspaceIndex {
         this._dependencyCandidateCache = new Map();
         this._dependencyImplementationCandidateCache = new Map();
         this._dependencyImplementationBatchCandidateCache = new Map();
+        this._dependencyCandidateCacheFiles = new Set();
         this._dependencyTypeReferenceCandidateCache = new Map();
         this._goRootPromise = null;
         this._candidateCacheDir = this.options.cacheDir || '';
@@ -867,7 +869,7 @@ class WorkspaceIndex {
         const cacheFile = this._relationCacheFile();
         const fingerprint = this._relationCacheFingerprint();
         if (!cacheFile || !fingerprint) return;
-        const temporary = `${cacheFile}.${process.pid}.tmp`;
+        const temporary = `${cacheFile}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
         const payload = JSON.stringify(this._serializeRelationState(state, fingerprint));
         try {
             await fs.promises.mkdir(this._candidateCacheDir, { recursive: true });
@@ -920,6 +922,8 @@ class WorkspaceIndex {
                 snapshotRestored: true,
                 stats: {
                     ...(payload.stats || {}),
+                    dependencyCandidateScans: 0,
+                    dependencyReferenceScans: 0,
                     snapshotRestored: true,
                     phaseTimings: { snapshotReadMs: Date.now() - started },
                     durationMs: Date.now() - started,
@@ -3340,7 +3344,11 @@ class WorkspaceIndex {
         request = this._loadRelationSnapshot(generation)
             .then((restored) => restored || this._buildReversePrewarm(generation))
             .then(async (state) => {
-                if (!state.snapshotRestored && generation === this._astGeneration) {
+                if (
+                    !state.snapshotRestored &&
+                    generation === this._astGeneration &&
+                    (this.getConfig().searchDependencies === false || state.dependenciesPrewarmed)
+                ) {
                     await this._writeRelationSnapshot(state);
                 }
                 return state;
@@ -3922,9 +3930,20 @@ class WorkspaceIndex {
             if (!methodKeys.every((methodKey) => isExportedIdentifier(bareMethodName(methodKey)))) {
                 continue;
             }
-            for (const methodKey of methodKeys) {
-                searchableMethodNames.add(bareMethodName(methodKey));
-            }
+            const anchorMethod = [...new Set(methodKeys.map(bareMethodName))].sort(
+                (left, right) => {
+                    const leftCount = (this._candidateFilesByMethod.get(left) || new Set()).size;
+                    const rightCount = (this._candidateFilesByMethod.get(right) || new Set()).size;
+                    return (
+                        leftCount - rightCount ||
+                        right.length - left.length ||
+                        left.localeCompare(right)
+                    );
+                }
+            )[0];
+            if (!anchorMethod) continue;
+            prepared.anchorMethod = anchorMethod;
+            searchableMethodNames.add(anchorMethod);
             searchableTargets.push(prepared);
         }
 
@@ -3952,19 +3971,18 @@ class WorkspaceIndex {
             dependencyDirs
         );
         const dependencyCandidateMs = Date.now() - candidateStarted;
+        const dependencyCandidatesComplete = dependencyCandidates.complete !== false;
+        if (!dependencyCandidatesComplete) {
+            this.log(
+                `AST dependency candidate scan incomplete: ` +
+                    `${dependencyCandidates.timedOut ? 'timed out, ' : ''}` +
+                    `${dependencyCandidates.files.length} partial candidate file(s)`
+            );
+        }
         const candidateFiles = new Set();
         for (const target of searchableTargets) {
-            const anchors = target.methodKeys
-                .map(bareMethodName)
-                .sort((left, right) => {
-                    const leftCount = (dependencyCandidates.filesByMethod.get(left) || new Set())
-                        .size;
-                    const rightCount = (dependencyCandidates.filesByMethod.get(right) || new Set())
-                        .size;
-                    return leftCount - rightCount || left.localeCompare(right);
-                });
-            if (anchors.length === 0) continue;
-            const anchor = anchors[0];
+            const anchor = target.anchorMethod;
+            if (!anchor) continue;
             anchorMethods.add(anchor);
             for (const file of dependencyCandidates.filesByMethod.get(anchor) || []) {
                 candidateFiles.add(file);
@@ -4073,16 +4091,21 @@ class WorkspaceIndex {
         this.log(
             `AST dependency implementation batch: ${preparedTargets.length} interface(s), ` +
                 `${anchorMethods.size} anchor method(s), ${candidateFiles.size} candidate file(s), ` +
-                `${dependencyPackages.size} package(s), ${dependencyReferenceScans} reference scan(s)`
+                `${dependencyPackages.size} package(s), ${dependencyReferenceScans} reference scan(s)` +
+                (dependencyCandidates.cached ? ' (candidate-cache)' : '')
         );
         return {
-            complete: generation === this._astGeneration && !this._disposed,
+            complete:
+                dependencyCandidatesComplete &&
+                generation === this._astGeneration &&
+                !this._disposed,
             configKey,
             astFiles,
             view,
             dependencyFiles: dependencyFiles.size,
-            dependencyCandidateScans: 1,
+            dependencyCandidateScans: dependencyCandidates.cached ? 0 : 1,
             dependencyReferenceScans,
+            dependencyCandidateTimedOut: !!dependencyCandidates.timedOut,
             phaseTimings: {
                 dependencyCandidateMs,
                 dependencyLoadMs,
@@ -4363,15 +4386,17 @@ class WorkspaceIndex {
     _dependencyImplementationBatchCandidates(cacheRoot, methodNames, lockedDirs) {
         const normalizedDirs = [...(lockedDirs || [])].map(path.normalize).sort();
         const names = [...new Set(methodNames)].map(bareMethodName).filter(Boolean).sort();
-        const key = `${path.normalize(cacheRoot)}\0${names.join(',')}\0${normalizedDirs.join('\0')}`;
+        const key =
+            `${DEPENDENCY_CANDIDATE_CACHE_SCHEMA}\0${path.normalize(cacheRoot)}\0` +
+            `${names.join(',')}\0${normalizedDirs.join('\0')}`;
         if (this._dependencyImplementationBatchCandidateCache.has(key)) {
             return this._dependencyImplementationBatchCandidateCache.get(key);
         }
         let request;
-        request = scanDependencyFilesForMethods(
+        request = this._loadOrScanDependencyBatchCandidates(
+            key,
             cacheRoot,
             names,
-            normalizedDirs.length > 0 ? Number.MAX_SAFE_INTEGER : undefined,
             normalizedDirs
         ).catch((error) => {
             if (this._dependencyImplementationBatchCandidateCache.get(key) === request) {
@@ -4381,6 +4406,95 @@ class WorkspaceIndex {
         });
         this._dependencyImplementationBatchCandidateCache.set(key, request);
         return request;
+    }
+
+    _dependencyBatchCandidateCacheFile(key, cacheRoot, normalizedDirs) {
+        if (!this._candidateCacheDir || normalizedDirs.length === 0) return '';
+        const normalizedRoot = path.resolve(cacheRoot);
+        for (const directory of normalizedDirs) {
+            const resolved = path.resolve(directory);
+            const relative = path.relative(normalizedRoot, resolved);
+            if (
+                relative === '' ||
+                path.isAbsolute(relative) ||
+                relative === '..' ||
+                relative.startsWith(`..${path.sep}`) ||
+                !path.basename(resolved).includes('@')
+            ) {
+                return '';
+            }
+        }
+        const hash = crypto.createHash('sha1').update(key).digest('hex').slice(0, 20);
+        const file = path.join(
+            this._candidateCacheDir,
+            `dependency-candidates-v${DEPENDENCY_CANDIDATE_CACHE_SCHEMA}-${hash}.json`
+        );
+        this._dependencyCandidateCacheFiles.add(file);
+        return file;
+    }
+
+    async _loadOrScanDependencyBatchCandidates(key, cacheRoot, names, normalizedDirs) {
+        const cacheFile = this._dependencyBatchCandidateCacheFile(
+            key,
+            cacheRoot,
+            normalizedDirs
+        );
+        if (cacheFile) {
+            try {
+                const payload = JSON.parse(await fs.promises.readFile(cacheFile, 'utf8'));
+                if (
+                    payload.schema === DEPENDENCY_CANDIDATE_CACHE_SCHEMA &&
+                    payload.key === key &&
+                    Array.isArray(payload.files) &&
+                    Array.isArray(payload.filesByMethod)
+                ) {
+                    return {
+                        files: payload.files,
+                        filesByMethod: new Map(
+                            payload.filesByMethod.map(([name, files]) => [name, new Set(files)])
+                        ),
+                        complete: true,
+                        timedOut: false,
+                        multilineFiles: payload.multilineFiles || 0,
+                        cached: true,
+                    };
+                }
+            } catch (error) {
+                if (error.code !== 'ENOENT') {
+                    this.log(`Dependency candidate cache read failed: ${error.message}`);
+                }
+            }
+        }
+
+        const result = await scanDependencyFilesForMethods(
+            cacheRoot,
+            names,
+            normalizedDirs.length > 0 ? Number.MAX_SAFE_INTEGER : undefined,
+            normalizedDirs
+        );
+        if (!cacheFile || result.complete === false) return result;
+
+        const temporary = `${cacheFile}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+        const payload = JSON.stringify({
+            schema: DEPENDENCY_CANDIDATE_CACHE_SCHEMA,
+            key,
+            files: result.files,
+            filesByMethod: [...result.filesByMethod].map(([name, files]) => [name, [...files]]),
+            multilineFiles: result.multilineFiles || 0,
+        });
+        try {
+            await fs.promises.mkdir(this._candidateCacheDir, { recursive: true });
+            await fs.promises.writeFile(temporary, payload);
+            await fs.promises.rename(temporary, cacheFile);
+        } catch (error) {
+            this.log(`Dependency candidate cache write failed: ${error.message}`);
+            try {
+                await fs.promises.unlink(temporary);
+            } catch (_) {
+                // Best-effort cleanup of an incomplete atomic write.
+            }
+        }
+        return result;
     }
 
     _dependencyTypeReferenceCandidates(cacheRoot, typeNames, lockedDirs) {
@@ -4966,6 +5080,29 @@ class WorkspaceIndex {
             }
         }
         this._relationCacheFiles.clear();
+        const dependencyCacheFiles = new Set(this._dependencyCandidateCacheFiles);
+        if (this._candidateCacheDir) {
+            try {
+                for (const name of fs.readdirSync(this._candidateCacheDir)) {
+                    if (!name.startsWith('dependency-candidates-')) continue;
+                    dependencyCacheFiles.add(path.join(this._candidateCacheDir, name));
+                }
+            } catch (error) {
+                if (error.code !== 'ENOENT') {
+                    this.log(`Dependency candidate cache list failed: ${error.message}`);
+                }
+            }
+        }
+        for (const cacheFile of dependencyCacheFiles) {
+            try {
+                fs.unlinkSync(cacheFile);
+            } catch (error) {
+                if (error.code !== 'ENOENT') {
+                    this.log(`Dependency candidate cache clear failed: ${error.message}`);
+                }
+            }
+        }
+        this._dependencyCandidateCacheFiles.clear();
         if (this.astPool) this.astPool.clear();
         this._invalidateMerged();
         this._builds.clear();

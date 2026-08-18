@@ -2,6 +2,30 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## Unreleased
+
+## [2.0.1] - 2026-08-18
+
+### Changed
+
+- Derive warm and background AST worker concurrency from the CPUs available to
+  the extension host, while treating the configured value as a ceiling of 32.
+- Search at most one dependency method anchor per workspace interface with a
+  line-oriented ripgrep pass, then compensate only the small set of files that
+  contain multiline receiver declarations.
+- Persist complete candidate results for immutable locked module versions so a
+  relationship rebuild can skip dependency discovery after workspace edits.
+- Filter line-start method-call noise before loading complete dependency
+  packages while retaining interface, alias, embedding, and split-file recall.
+
+### Fixed
+
+- Treat timed-out dependency searches with partial stdout as incomplete, keep
+  them out of complete relationship snapshots, and fall back to an exact
+  foreground query instead of returning a cached false negative.
+- Report zero dependency scans when a complete relationship snapshot is
+  restored without running dependency discovery in the current activation.
+
 ## [2.0.0] - 2026-08-18
 
 ### Changed

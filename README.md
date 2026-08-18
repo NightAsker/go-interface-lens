@@ -1,6 +1,6 @@
 # Go Interface Lens
 
-[![Version](https://img.shields.io/badge/version-2.0.0-blue.svg)](https://github.com/NightAsker/go-interface-lens)
+[![Version](https://img.shields.io/badge/version-2.0.1-blue.svg)](https://github.com/NightAsker/go-interface-lens)
 [![VSCode](https://img.shields.io/badge/VSCode-1.76+-green.svg)](https://code.visualstudio.com/)
 
 一个面向大型 Go 工程的 VS Code / Cursor 接口导航扩展。它在接口、接口方法和具体实现之间提供双向 CodeLens，同时使用轻量候选索引和按需 AST 校验兼顾响应速度与查找准确性。
@@ -15,7 +15,7 @@
 - 轻量索引完成后，后台 AST worker pool 低优先级并发预热完整 workspace，同时预计算 `implementation -> interface` 和 `interface -> implementation` 双向关系；预热会保留已初始化 worker 和 I/O 容量给前台首次查询。
 - 点击查询命中排队中的预热文件时会提升该任务优先级，并继续复用同一次解析。
 - 点击 CodeLens 后，仅解析接口所在包、可能包含实现的候选包，以及按需命中的锁定依赖包。
-- 优先使用接口中出现频率最低的方法缩小候选范围。
+- 每个接口只选择一个低频方法作为依赖候选锚点，避免为完整方法集重复扫描模块缓存。
 - 已完成的查询直接使用内存缓存，未变化的文件可从持久化 AST 缓存恢复。
 
 ### Tree-sitter Go WASM 精确解析
@@ -30,7 +30,8 @@
 - 本地或跨包嵌入的 struct、interface 和类型别名。
 - 标准库接口、`go.mod` 锁定依赖中的接口与具体实现、local replace、module replace 和 GOROOT 源码。
 - workspace 内的双向接口关系和 workspace 接口对应的锁定依赖实现会在后台完整预热；预热完成后 `implementations` 直接查询包含依赖结果及方法位置的内存关系，依赖接口的 `goto interface` 结果仍按需补充。
-- 依赖实现预热会合并所有 workspace 接口的方法锚点，只扫描一次锁定依赖，并复用同一份 AST view 解析 alias、embed 和方法位置。
+- 依赖实现预热会合并每个 workspace 接口的单个方法锚点，以逐行模式只扫描一次锁定依赖；跨行 receiver 只对命中的少量文件做补偿，并复用同一份 AST view 解析 alias、embed 和方法位置。
+- 完整的锁定依赖候选会按不可变 `module@version` 查询持久化；workspace 关系失效后可直接复用，超时或部分扫描结果不会写入完整关系快照。
 - 完整关系会持久化为 workspace 快照；未变化的 workspace 再次启动时可直接回答 implementations。AST 缓存按 pack 合并读取，依赖源码和单包编辑也会增量复用。
 - import 别名、包内别名、跨包别名链和复合别名。
 - `byte`/`uint8`、`rune`/`int32`、`any`/`interface{}` 等价关系，并尊重包级同名声明遮蔽。
@@ -116,7 +117,7 @@ WASM、Go grammar WASM 和 MIT 许可证；依赖包里的其他语言 grammar �
 
 | 配置项 | 默认值 | 作用 |
 | --- | --- | --- |
-| `goInterfaceLens.astConcurrency` | `16` | 候选包 AST Worker 数量，可设置为 `1-32` |
+| `goInterfaceLens.astConcurrency` | `32` | 候选包 AST Worker 上限，可设置为 `1-32`；实际预热和后台并发按可用 CPU 自适应 |
 | `goInterfaceLens.excludedFolders` | `mocks, mock, testdata, vendor` | 排除指定目录 |
 | `goInterfaceLens.excludedFilePatterns` | `_mock.go, mock_, .pb.go, _test.go` | 排除文件名中包含指定文本的文件 |
 | `goInterfaceLens.excludedTypePatterns` | `Mock, mock, Stub, Fake` | 排除名称中包含指定文本的类型 |
@@ -127,7 +128,7 @@ WASM、Go grammar WASM 和 MIT 许可证；依赖包里的其他语言 grammar �
 
 ```json
 {
-  "goInterfaceLens.astConcurrency": 16,
+  "goInterfaceLens.astConcurrency": 32,
   "goInterfaceLens.searchDependencies": true,
   "goInterfaceLens.goModCache": "",
   "goInterfaceLens.excludedFolders": [
@@ -152,6 +153,8 @@ WASM、Go grammar WASM 和 MIT 许可证；依赖包里的其他语言 grammar �
   ]
 }
 ```
+
+AST Worker 使用 `os.availableParallelism()` 感知宿主机或容器可用 CPU。预热默认使用可用 CPU 的约三分之二，后台解析再使用其中约三分之二，并为编辑器和前台导航保留容量。
 
 类型名以 `_` 开头时始终从实现结果中排除。
 

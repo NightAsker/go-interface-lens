@@ -8,9 +8,11 @@ const { Worker } = require('worker_threads');
 const { deserializeParsedFile } = require('./ast');
 
 const CACHE_SCHEMA = 10;
-const DEFAULT_AST_CONCURRENCY = 16;
+const DEFAULT_AST_CONCURRENCY = 32;
 const MAX_AST_CONCURRENCY = 32;
-const DEFAULT_WARM_CONCURRENCY = 4;
+const DEFAULT_BACKGROUND_CONCURRENCY = 16;
+const CPU_CONCURRENCY_RATIO = 2 / 3;
+const BACKGROUND_CONCURRENCY_RATIO = 2 / 3;
 const DEFAULT_IDLE_TIMEOUT_MS = 30_000;
 const DEFAULT_MEMORY_CACHE_ENTRIES = 512;
 const DEFAULT_DISK_CACHE_ENTRIES = 4096;
@@ -32,33 +34,33 @@ class AstWorkerPool {
             ? Math.trunc(opts.concurrency)
             : DEFAULT_AST_CONCURRENCY;
         this.concurrency = Math.max(1, Math.min(MAX_AST_CONCURRENCY, requested));
-        const requestedWarmConcurrency = Number.isFinite(opts.warmConcurrency)
-            ? Math.trunc(opts.warmConcurrency)
-            : DEFAULT_WARM_CONCURRENCY;
-        this.warmConcurrency = Math.max(
-            1,
-            Math.min(this.concurrency, requestedWarmConcurrency)
-        );
         const parallelism = Number.isFinite(opts.parallelism)
             ? Math.max(1, Math.trunc(opts.parallelism))
             : availableParallelism();
-        // WASM workers each own a parser runtime. Leaving headroom for the
-        // extension host and OS is faster than saturating every logical CPU,
-        // especially while new workers are compiling their WASM modules.
+        // availableParallelism accounts for container CPU quotas. Keep a third
+        // of the available CPUs free for the extension host, editor, and OS.
         this.effectiveConcurrency = Math.max(
-            this.warmConcurrency,
-            Math.min(this.concurrency, Math.max(1, Math.floor((parallelism * 2) / 3)))
+            1,
+            Math.min(this.concurrency, Math.floor(parallelism * CPU_CONCURRENCY_RATIO))
+        );
+        const requestedWarmConcurrency = Number.isFinite(opts.warmConcurrency)
+            ? Math.trunc(opts.warmConcurrency)
+            : this.effectiveConcurrency;
+        this.warmConcurrency = Math.max(
+            1,
+            Math.min(this.effectiveConcurrency, requestedWarmConcurrency)
         );
         // Background prewarming stays inside the already-warmed baseline and
-        // keeps one initialized worker idle for the first interactive query.
-        // Foreground batches can still grow the pool to effectiveConcurrency.
-        this.backgroundConcurrency =
-            this.effectiveConcurrency > 1
-                ? Math.max(
-                      1,
-                      Math.min(this.effectiveConcurrency - 1, this.warmConcurrency - 1)
-                  )
-                : 1;
+        // has its own cap so the remaining workers are available to foreground
+        // queries without waiting for background parser jobs.
+        this.backgroundConcurrency = Math.max(
+            1,
+            Math.min(
+                DEFAULT_BACKGROUND_CONCURRENCY,
+                this.warmConcurrency,
+                Math.floor(this.warmConcurrency * BACKGROUND_CONCURRENCY_RATIO)
+            )
+        );
         this.foregroundReserve = this.effectiveConcurrency - this.backgroundConcurrency;
         this.backgroundIOConcurrency = Math.max(
             this.backgroundConcurrency,
@@ -860,8 +862,8 @@ module.exports = {
     AstWorkerPool,
     CACHE_SCHEMA,
     DEFAULT_AST_CONCURRENCY,
+    DEFAULT_BACKGROUND_CONCURRENCY,
     MAX_AST_CONCURRENCY,
-    DEFAULT_WARM_CONCURRENCY,
     DEFAULT_IDLE_TIMEOUT_MS,
     DEFAULT_MEMORY_CACHE_ENTRIES,
     DEFAULT_DISK_CACHE_ENTRIES,
