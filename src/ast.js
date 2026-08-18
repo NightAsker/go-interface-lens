@@ -230,6 +230,7 @@ function newTypeEntry(line, character) {
         methodLines: new Map(),
         methodCharacters: new Map(),
         pointerMethods: new Set(),
+        fieldNames: new Set(),
         embeds: [],
         pointerEmbeds: new Set(),
         genericEmbeds: new Set(),
@@ -364,17 +365,23 @@ function parseInterfaceType(typeNode, typeParameters, packageName, imports, type
 
 function parseStructType(typeNode, packageName, imports, typeVariables) {
     const embeds = [];
+    const fieldNames = new Set();
     const pointerEmbeds = new Set();
     const genericEmbeds = new Set();
     const embedArguments = new Map();
     const list = namedChildren(typeNode).find((child) => child.type === 'field_declaration_list');
     for (const declaration of namedChildren(list)) {
-        if (declaration.type !== 'field_declaration' || fields(declaration, 'name').length > 0) {
+        if (declaration.type !== 'field_declaration') continue;
+        const names = fields(declaration, 'name');
+        if (names.length > 0) {
+            for (const name of names) fieldNames.add(name.text);
             continue;
         }
         const reference = canonicalNamedReference(field(declaration, 'type'), imports);
         if (!reference) continue;
         if (declaration.text.trimStart().startsWith('*')) reference.pointer = true;
+        const qualifiedName = reference.name.match(/\.([_\p{L}][_\p{L}\p{N}]*)$/u);
+        fieldNames.add(qualifiedName ? qualifiedName[1] : reference.name);
         embeds.push(reference.name);
         if (reference.pointer) pointerEmbeds.add(reference.name);
         if (reference.generic) {
@@ -390,7 +397,7 @@ function parseStructType(typeNode, packageName, imports, typeVariables) {
             );
         }
     }
-    return { embeds, pointerEmbeds, genericEmbeds, embedArguments };
+    return { fieldNames, embeds, pointerEmbeds, genericEmbeds, embedArguments };
 }
 
 function receiverTypeVariables(receiverType) {
@@ -581,6 +588,7 @@ function serializeParsedFile(parsed) {
         methodLines: mapToEntries(info.methodLines),
         methodCharacters: mapToEntries(info.methodCharacters),
         pointerMethods: [...(info.pointerMethods || [])],
+        fieldNames: [...(info.fieldNames || [])],
         pointerEmbeds: [...(info.pointerEmbeds || [])],
         genericEmbeds: [...(info.genericEmbeds || [])],
         embedArguments: mapToEntries(info.embedArguments),
@@ -609,6 +617,7 @@ function deserializeParsedFile(serialized) {
         methodLines: new Map(info.methodLines || []),
         methodCharacters: new Map(info.methodCharacters || []),
         pointerMethods: new Set(info.pointerMethods || []),
+        fieldNames: new Set(info.fieldNames || []),
         pointerEmbeds: new Set(info.pointerEmbeds || []),
         genericEmbeds: new Set(info.genericEmbeds || []),
         embedArguments: new Map(info.embedArguments || []),

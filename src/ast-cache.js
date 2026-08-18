@@ -7,7 +7,7 @@ const os = require('os');
 const { Worker } = require('worker_threads');
 const { deserializeParsedFile } = require('./ast');
 
-const CACHE_SCHEMA = 8;
+const CACHE_SCHEMA = 9;
 const DEFAULT_AST_CONCURRENCY = 16;
 const MAX_AST_CONCURRENCY = 32;
 const DEFAULT_WARM_CONCURRENCY = 4;

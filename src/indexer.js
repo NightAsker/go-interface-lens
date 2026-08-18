@@ -253,6 +253,19 @@ function locationKeyFor(file, name) {
     return `${path.normalize(file)}\0${name}`;
 }
 
+function isExportedIdentifier(name) {
+    return /^\p{Lu}/u.test(name || '');
+}
+
+function methodKeyFor(name, packageKey) {
+    return isExportedIdentifier(name) || !packageKey ? name : `\0${packageKey}\0${name}`;
+}
+
+function bareMethodName(methodKey) {
+    const separator = (methodKey || '').lastIndexOf('\0');
+    return separator === -1 ? methodKey : methodKey.slice(separator + 1);
+}
+
 function importedReferenceIdentity(reference) {
     const match = reference && reference.match(/^@\{([^}]+)\}\.([A-Z_a-z]\w*)$/);
     return match ? { importPath: match[1], name: match[2] } : null;
@@ -425,6 +438,27 @@ function instantiateMethods(methods, typeParameters, typeArguments) {
         [...methods].map(([name, signature]) => [
             name,
             substituteTypeParameters(signature, bindings),
+        ])
+    );
+}
+
+function instantiateSelectors(selectors, typeParameters, typeArguments) {
+    const parameters = typeParameters || [];
+    const argumentsList = typeArguments || [];
+    if (parameters.length === 0) return new Map(selectors);
+    if (parameters.length !== argumentsList.length) return null;
+    const bindings = new Map(
+        parameters.map((parameter, index) => [parameter.marker, argumentsList[index]])
+    );
+    return new Map(
+        [...selectors].map(([name, selector]) => [
+            name,
+            selector.signature
+                ? {
+                      ...selector,
+                      signature: substituteTypeParameters(selector.signature, bindings),
+                  }
+                : { ...selector },
         ])
     );
 }
@@ -1591,20 +1625,62 @@ class WorkspaceIndex {
         if (!this._resolvedTypeSetCache) this._resolvedTypeSetCache = new Map();
         const cached = this._resolvedTypeSetCache.get(typeKey);
         if (cached) return cached;
+        const empty = () => ({
+            value: new Map(),
+            pointer: new Map(),
+            valueSelectors: new Map(),
+            pointerSelectors: new Map(),
+        });
         const visiting = seen || new Set();
-        if (visiting.has(typeKey)) return { value: new Map(), pointer: new Map() };
+        if (visiting.has(typeKey)) return empty();
         visiting.add(typeKey);
 
         const type = types.get(typeKey);
-        if (!type) return { value: new Map(), pointer: new Map() };
-        const value = new Map();
-        const pointer = new Map(type.methods);
-        for (const [name, signature] of type.methods) {
-            if (!type.pointerOnlyMethods || !type.pointerOnlyMethods.has(name)) value.set(name, signature);
-        }
+        if (!type) return empty();
 
-        const promote = (target, mode) => {
-            const candidates = new Map();
+        const mergeSelector = (target, name, selector, depthOffset) => {
+            const candidate = {
+                ...selector,
+                depth: selector.depth + depthOffset,
+            };
+            const current = target.get(name);
+            if (!current || candidate.depth < current.depth) {
+                target.set(name, candidate);
+                return;
+            }
+            if (candidate.depth !== current.depth) return;
+            target.set(name, {
+                depth: current.depth,
+                count: current.count + candidate.count,
+                kind: 'ambiguous',
+            });
+        };
+
+        const directSelectors = (mode) => {
+            const selectors = new Map();
+            for (const [name, signature] of type.methods) {
+                const pointerOnly = type.pointerOnlyMethods && type.pointerOnlyMethods.has(name);
+                selectors.set(name, {
+                    depth: 0,
+                    count: 1,
+                    kind: mode === 'pointer' || !pointerOnly ? 'method' : 'blocked',
+                    signature,
+                    origin: { kind: 'type', key: typeKey },
+                });
+            }
+            for (const name of type.fieldNames || []) {
+                mergeSelector(
+                    selectors,
+                    name,
+                    { depth: 0, count: 1, kind: 'field' },
+                    0
+                );
+            }
+            return selectors;
+        };
+
+        const promote = (mode) => {
+            const selectors = directSelectors(mode);
             for (const embed of type.embeds) {
                 const canPromoteInterface = type.struct || type.interfaceAlias;
                 const imported = importedReferenceIdentity(embed);
@@ -1630,15 +1706,18 @@ class WorkspaceIndex {
                         embeddedInterfaceKey = localKey;
                     }
                 }
-                let source;
+                let sourceSelectors;
                 if (embeddedKey) {
-                    const methods = this._resolveTypeMethodSetsCached(
+                    const methodSets = this._resolveTypeMethodSetsCached(
                         embeddedKey,
                         types,
                         new Set(visiting)
                     );
                     const pointerEmbed = type.pointerEmbeds && type.pointerEmbeds.has(embed);
-                    source = pointerEmbed || mode === 'pointer' ? methods.pointer : methods.value;
+                    sourceSelectors =
+                        pointerEmbed || mode === 'pointer'
+                            ? methodSets.pointerSelectors
+                            : methodSets.valueSelectors;
                 } else if (embeddedInterfaceKey) {
                     const embeddedInterface = this._mergedInterfaces.get(embeddedInterfaceKey);
                     if (
@@ -1647,46 +1726,73 @@ class WorkspaceIndex {
                     ) {
                         continue;
                     }
-                    source = this._resolveInterfaceMethodsCached(
+                    const methods = this._resolveInterfaceMethodsCached(
                         embeddedInterfaceKey,
                         this._mergedInterfaces
                     ).methods;
+                    sourceSelectors = new Map(
+                        [...methods].map(([name, signature]) => [
+                            name,
+                            {
+                                depth: 0,
+                                count: 1,
+                                kind: 'method',
+                                signature,
+                                origin: { kind: 'interface', key: embeddedInterfaceKey },
+                            },
+                        ])
+                    );
                 } else if (canPromoteInterface && BUILTIN_INTERFACES.has(embed)) {
-                    source = CANONICAL_BUILTIN_INTERFACES.get(embed);
+                    sourceSelectors = new Map(
+                        [...CANONICAL_BUILTIN_INTERFACES.get(embed)].map(
+                            ([name, signature]) => [
+                                name,
+                                {
+                                    depth: 0,
+                                    count: 1,
+                                    kind: 'method',
+                                    signature,
+                                    origin: { kind: 'builtin', name: embed },
+                                },
+                            ]
+                        )
+                    );
                 } else {
                     continue;
                 }
                 if (type.genericEmbeds && type.genericEmbeds.has(embed)) {
-                    const target = embeddedKey
+                    const embeddedDeclaration = embeddedKey
                         ? types.get(embeddedKey)
                         : this._mergedInterfaces.get(embeddedInterfaceKey);
-                    source = instantiateMethods(
-                        source,
-                        target && target.typeParameters,
+                    sourceSelectors = instantiateSelectors(
+                        sourceSelectors,
+                        embeddedDeclaration && embeddedDeclaration.typeParameters,
                         type.embedArguments && type.embedArguments.get(embed)
                     );
-                    if (!source) continue;
+                    if (!sourceSelectors) continue;
                 }
-                for (const [name, signature] of source) {
-                    const candidate = candidates.get(name);
-                    if (candidate) candidate.count += 1;
-                    else candidates.set(name, { signature, count: 1 });
-                }
-            }
-            for (const [name, candidate] of candidates) {
-                // A method declared directly on T or *T shadows every promoted
-                // method with the same name. A pointer-only method is absent
-                // from T's value method set, but it still blocks an embedded
-                // interface method from being promoted into that set.
-                if (candidate.count === 1 && !type.methods.has(name) && !target.has(name)) {
-                    target.set(name, candidate.signature);
+                const depthOffset = type.aliasTarget ? 0 : 1;
+                for (const [name, selector] of sourceSelectors) {
+                    mergeSelector(selectors, name, selector, depthOffset);
                 }
             }
+            const methods = new Map();
+            for (const [name, selector] of selectors) {
+                if (selector.count === 1 && selector.kind === 'method') {
+                    methods.set(name, selector.signature);
+                }
+            }
+            return { methods, selectors };
         };
 
-        promote(value, 'value');
-        promote(pointer, 'pointer');
-        const resolved = { value, pointer };
+        const value = promote('value');
+        const pointer = promote('pointer');
+        const resolved = {
+            value: value.methods,
+            pointer: pointer.methods,
+            valueSelectors: value.selectors,
+            pointerSelectors: pointer.selectors,
+        };
         this._resolvedTypeSetCache.set(typeKey, resolved);
         return resolved;
     }
@@ -1846,18 +1952,31 @@ class WorkspaceIndex {
                     canonicalizeWithinPackage(signature, packageKey),
                     resolveQualifiedAlias
                 ).replace(/\s+/g, '');
+            const canonicalMethods = (methods) =>
+                new Map(
+                    [...(methods || new Map())].map(([methodName, signature]) => [
+                        methodKeyFor(methodName, packageKey),
+                        canonicalSignature(signature),
+                    ])
+                );
+            const canonicalMethodMap = (values) =>
+                new Map(
+                    [...(values || new Map())].map(([methodName, value]) => [
+                        methodKeyFor(methodName, packageKey),
+                        value,
+                    ])
+                );
+            const canonicalMethodSet = (values) =>
+                new Set(
+                    [...(values || new Set())].map((methodName) =>
+                        methodKeyFor(methodName, packageKey)
+                    )
+                );
             const canonicalTypeParameters = (parameters) =>
                 (parameters || []).map((parameter) => ({
                     ...parameter,
                     constraint: canonicalSignature(parameter.constraint || 'any'),
-                    constraintMethods: new Map(
-                        [...(parameter.constraintMethods || new Map())].map(
-                            ([methodName, signature]) => [
-                                methodName,
-                                canonicalSignature(signature),
-                            ]
-                        )
-                    ),
+                    constraintMethods: canonicalMethods(parameter.constraintMethods),
                     constraintTypeElements: (
                         parameter.constraintTypeElements || []
                     ).map(canonicalSignature),
@@ -1879,9 +1998,9 @@ class WorkspaceIndex {
                         packageKey,
                         file,
                         line: info.line,
-                        methods: info.methods,
+                        methods: canonicalMethods(info.methods),
                         embeds: info.embeds,
-                        methodLines: info.methodLines || new Map(),
+                        methodLines: canonicalMethodMap(info.methodLines),
                         constraint: !!info.constraint,
                         generic: !!info.generic,
                         typeParameters: canonicalTypeParameters(info.typeParameters),
@@ -1907,7 +2026,7 @@ class WorkspaceIndex {
                     });
                 }
                 const flat = interfacesFlat.get(symbolKey);
-                for (const [m, s] of info.methods) flat.methods.set(m, canonicalSignature(s));
+                for (const [m, s] of canonicalMethods(info.methods)) flat.methods.set(m, s);
                 flat.embeds.push(...info.embeds);
                 flat.constraint = flat.constraint || !!info.constraint;
                 flat.generic = flat.generic || !!info.generic;
@@ -1931,11 +2050,12 @@ class WorkspaceIndex {
                     packageKey,
                     file,
                     line: info.line,
-                    methods: info.methods,
+                    methods: canonicalMethods(info.methods),
                     embeds: info.embeds,
-                    methodLines: info.methodLines || new Map(),
-                    methodCharacters: info.methodCharacters || new Map(),
-                    pointerMethods: info.pointerMethods || new Set(),
+                    methodLines: canonicalMethodMap(info.methodLines),
+                    methodCharacters: canonicalMethodMap(info.methodCharacters),
+                    pointerMethods: canonicalMethodSet(info.pointerMethods),
+                    fieldNames: canonicalMethodSet(info.fieldNames),
                     pointerEmbeds: info.pointerEmbeds || new Set(),
                     genericEmbeds: info.genericEmbeds || new Set(),
                     embedArguments: canonicalEmbedArguments(info.embedArguments),
@@ -1952,6 +2072,7 @@ class WorkspaceIndex {
                         name,
                         packageKey,
                         methods: new Map(),
+                        fieldNames: new Set(),
                         embeds: [],
                         pointerOnlyMethods: new Set(),
                         pointerEmbeds: new Set(),
@@ -1967,13 +2088,17 @@ class WorkspaceIndex {
                     });
                 }
                 const flat = typesFlat.get(symbolKey);
-                for (const [m, s] of info.methods) {
-                    flat.methods.set(m, canonicalSignature(s));
-                    if (info.pointerMethods && info.pointerMethods.has(m)) {
+                for (const [m, s] of canonicalMethods(info.methods)) {
+                    flat.methods.set(m, s);
+                    const bareName = bareMethodName(m);
+                    if (info.pointerMethods && info.pointerMethods.has(bareName)) {
                         flat.pointerOnlyMethods.add(m);
                     } else {
                         flat.pointerOnlyMethods.delete(m);
                     }
+                }
+                for (const fieldName of info.fieldNames || []) {
+                    flat.fieldNames.add(methodKeyFor(fieldName, packageKey));
                 }
                 flat.embeds.push(...info.embeds);
                 for (const embed of info.pointerEmbeds || []) flat.pointerEmbeds.add(embed);
@@ -2204,7 +2329,8 @@ class WorkspaceIndex {
         const embeddedGraph = this._buildEmbeddedPackageGraph();
 
         const sets = [];
-        for (const methodName of methodNames) {
+        for (const methodKey of methodNames) {
+            const methodName = bareMethodName(methodKey);
             const packages = new Set(embeddedGraph.external);
             for (const packageKey of embeddedGraph.builtinByMethod.get(methodName) || []) {
                 packages.add(packageKey);
@@ -2693,13 +2819,17 @@ class WorkspaceIndex {
         );
         const view = aliasExpansion.view;
         const { interfaces } = view._merged();
-        for (const interfaceKey of view._interfacesByMethod.get(methodName) || []) {
+        for (const interfaceKey of interfaces.keys()) {
             const declaration = view._interfaceDecls.get(interfaceKey);
             const info = interfaces.get(interfaceKey);
             if (!declaration || !info || info.constraint) continue;
+            const resolved = view._resolveInterfaceMethodsCached(interfaceKey, interfaces);
+            if (![...resolved.methods.keys()].some((key) => bareMethodName(key) === methodName)) {
+                continue;
+            }
             local.consider(
                 interfaceKey,
-                view._resolveInterfaceMethodsCached(interfaceKey, interfaces),
+                resolved,
                 declaration,
                 true
             );
@@ -2832,7 +2962,8 @@ class WorkspaceIndex {
         if (!interfaceKey) return [];
         const resolved = this._resolveInterfaceMethodsCached(interfaceKey, interfaces);
         if (resolved.constraint) return [];
-        const wantSig = resolved.methods.get(methodName);
+        const methodKey = methodKeyFor(methodName, resolved.packageKey);
+        const wantSig = resolved.methods.get(methodKey);
 
         // Run both strict and loose passes and merge (deduped). A cross-package
         // implementation qualifies the interface's types while the interface
@@ -2843,7 +2974,7 @@ class WorkspaceIndex {
         const strict = this._collectMethodImplementations(
             resolved,
             wantSig,
-            methodName,
+            methodKey,
             types,
             interfaces,
             false
@@ -2851,7 +2982,7 @@ class WorkspaceIndex {
         const loose = this._collectMethodImplementations(
             resolved,
             wantSig,
-            methodName,
+            methodKey,
             types,
             interfaces,
             true
@@ -2859,7 +2990,7 @@ class WorkspaceIndex {
         return dedupeResults([...strict, ...loose]);
     }
 
-    _collectMethodImplementations(resolved, wantSig, methodName, types, interfaces, loose) {
+    _collectMethodImplementations(resolved, wantSig, methodKey, types, interfaces, loose) {
         const results = [];
         const sigMatches = (a, b) => {
             if (a === b) return true;
@@ -2871,7 +3002,7 @@ class WorkspaceIndex {
             if (typeInfo.interfaceAlias || typeInfo.externalSource) continue;
             const methodSets = this._resolveTypeMethodSetsCached(typeKey, types);
             const implementsWith = (methods) => {
-                const sig = methods.get(methodName);
+                const sig = methods.get(methodKey);
                 if (sig === undefined) return false;
                 if (
                     (!resolved.typeParameters || resolved.typeParameters.length === 0) &&
@@ -2896,11 +3027,12 @@ class WorkspaceIndex {
             const valueImplements = implementsWith(methodSets.value);
             const pointerImplements = valueImplements || implementsWith(methodSets.pointer);
             if (!pointerImplements) continue;
-            const sig = (valueImplements ? methodSets.value : methodSets.pointer).get(methodName);
+            const mode = valueImplements ? 'value' : 'pointer';
+            const sig = methodSets[mode].get(methodKey);
 
             // Locations are already package-scoped by typeKey. Emit the direct
             // declaration(s) for this method and dedupe the strict/loose passes.
-            for (const loc of this._findMethodLocations(typeKey, methodName)) {
+            for (const loc of this._findMethodLocations(typeKey, methodKey, mode)) {
                 results.push({
                     name: valueImplements ? typeInfo.name : `*${typeInfo.name}`,
                     ...loc,
@@ -2968,15 +3100,17 @@ class WorkspaceIndex {
         const stopAfterFirst = !!(opts && opts.stopAfterFirst);
         const { interfaces, types } = this._merged();
         const typeKey = this._findTypeKey(receiverType, opts && opts.receiverFile);
+        const typeInfo = typeKey && types.get(typeKey);
         const typeMethods = typeKey ? this._resolveTypeMethodsCached(typeKey, types) : new Map();
-        const mySig = typeMethods.get(methodName);
+        const methodKey = methodKeyFor(methodName, typeInfo && typeInfo.packageKey);
+        const mySig = typeMethods.get(methodKey);
 
         const results = [];
         const seenInterfaces = new Set();
 
         const consider = (interfaceKey, resolved, decl, external) => {
             if (resolved.constraint) return false;
-            const sig = resolved.methods.get(methodName);
+            const sig = resolved.methods.get(methodKey);
             if (sig === undefined) return false;
 
             // An interface names types by its OWN package-local names (bare
@@ -2991,38 +3125,36 @@ class WorkspaceIndex {
             // positives — it only recovers the genuine bare-vs-qualified case.
             let sigEqual = false;
             let matchedLoose = false;
-            if (mySig !== undefined) {
-                if (resolved.typeParameters && resolved.typeParameters.length > 0) {
-                    const wantedMethod = new Map([[methodName, sig]]);
-                    const actualMethod = new Map([[methodName, mySig]]);
+            if (mySig === undefined) return false;
+            if (resolved.typeParameters && resolved.typeParameters.length > 0) {
+                const wantedMethod = new Map([[methodKey, sig]]);
+                const actualMethod = new Map([[methodKey, mySig]]);
+                sigEqual = !!inferTypeParameterBindings(
+                    wantedMethod,
+                    actualMethod,
+                    resolved.typeParameters
+                );
+                if (!sigEqual) {
                     sigEqual = !!inferTypeParameterBindings(
                         wantedMethod,
                         actualMethod,
-                        resolved.typeParameters
+                        resolved.typeParameters,
+                        { loose: true }
                     );
-                    if (!sigEqual) {
-                        sigEqual = !!inferTypeParameterBindings(
-                            wantedMethod,
-                            actualMethod,
-                            resolved.typeParameters,
-                            { loose: true }
-                        );
-                        matchedLoose = sigEqual;
-                    }
-                } else if (sig === mySig) {
-                    sigEqual = true;
-                } else if (looseSignatureEqual(sig, mySig)) {
-                    sigEqual = true;
-                    matchedLoose = true;
+                    matchedLoose = sigEqual;
                 }
-                if (!sigEqual) return false;
+            } else if (sig === mySig) {
+                sigEqual = true;
+            } else if (looseSignatureEqual(sig, mySig)) {
+                sigEqual = true;
+                matchedLoose = true;
             }
+            if (!sigEqual) return false;
             // Whole-interface satisfaction check. Use loose matching whenever the
             // anchoring method matched loosely (or the interface is external), so
             // the other methods' cross-package qualifiers do not veto a genuine
             // implementation.
             if (
-                typeMethods.size > 0 &&
                 !this._interfaceSatisfiedBy(
                     resolved,
                     typeMethods,
@@ -3036,7 +3168,7 @@ class WorkspaceIndex {
                     }
                 )
             ) {
-                if (mySig === undefined || !sigEqual) return false;
+                return false;
             }
             if (!decl) return false;
             const key = `${interfaceKey}:${decl.file}`;
@@ -3051,7 +3183,7 @@ class WorkspaceIndex {
             return true;
         };
 
-        const candidates = this._interfacesByMethod.get(methodName) || [];
+        const candidates = this._interfacesByMethod.get(methodKey) || [];
         for (const interfaceKey of candidates) {
             const declaration = this._interfaceDecls.get(interfaceKey);
             const matched = consider(
@@ -3136,103 +3268,59 @@ class WorkspaceIndex {
         return [...dirs];
     }
 
-    _findMethodLocation(typeKey, methodName) {
-        const all = this._findMethodLocations(typeKey, methodName);
+    _findMethodLocation(typeKey, methodKey, mode) {
+        const all = this._findMethodLocations(typeKey, methodKey, mode);
         return all.length > 0 ? all[0] : null;
     }
 
     /**
-     * All declaration locations of `methodName` on one package-qualified type.
+     * All declaration locations of `methodKey` on one package-qualified type.
      * @param {string} typeKey
-     * @param {string} methodName
+     * @param {string} methodKey
+     * @param {'value'|'pointer'} [mode]
      * @returns {{file:string, line:number}[]}
      */
-    _findMethodLocations(typeKey, methodName) {
+    _findMethodLocations(typeKey, methodKey, mode) {
         if (!this._methodLocationCache) this._methodLocationCache = new Map();
-        const cacheKey = `${typeKey}\0${methodName}`;
+        const methodMode = mode || 'pointer';
+        const cacheKey = `${typeKey}\0${methodKey}\0${methodMode}`;
         const cached = this._methodLocationCache.get(cacheKey);
         if (cached) return cached;
-        const found = this._findMethodLocationsRecursive(typeKey, methodName, new Set());
-        this._methodLocationCache.set(cacheKey, found);
-        return found;
-    }
-
-    _findMethodLocationsRecursive(typeKey, methodName, seen) {
-        if (seen.has(typeKey)) return [];
-        seen.add(typeKey);
-        const locations = this._typesByLocation.get(typeKey) || [];
-        const out = [];
-        for (const loc of locations) {
-            if (loc.methods.has(methodName)) {
-                const recorded = loc.methodLines && loc.methodLines.get(methodName);
-                out.push({ file: loc.file, line: typeof recorded === 'number' ? recorded : loc.line });
-            }
-        }
-        if (out.length > 0) return out;
-
-        const typeInfo = this._mergedTypes && this._mergedTypes.get(typeKey);
-        if (!typeInfo) return out;
-        for (const embed of typeInfo.embeds) {
-            const canPromoteInterface = typeInfo.struct || typeInfo.interfaceAlias;
-            const imported = importedReferenceIdentity(embed);
-            let embeddedKey = null;
-            let embeddedInterfaceKey = null;
-            if (imported && this._typeKeyByImportIdentity) {
-                embeddedKey = this._typeKeyByImportIdentity.get(
-                    `${imported.importPath}\0${imported.name}`
-                );
-                if (!embeddedKey && canPromoteInterface && this._interfaceKeyByImportIdentity) {
-                    embeddedInterfaceKey = this._interfaceKeyByImportIdentity.get(
-                        `${imported.importPath}\0${imported.name}`
-                    );
+        const methodSets = this._resolveTypeMethodSetsCached(typeKey, this._mergedTypes);
+        const selectors =
+            methodMode === 'value' ? methodSets.valueSelectors : methodSets.pointerSelectors;
+        const selector = selectors.get(methodKey);
+        let found = [];
+        if (selector && selector.count === 1 && selector.kind === 'method' && selector.origin) {
+            if (selector.origin.kind === 'type') {
+                for (const location of this._typesByLocation.get(selector.origin.key) || []) {
+                    if (!location.methods.has(methodKey)) continue;
+                    const recorded = location.methodLines && location.methodLines.get(methodKey);
+                    found.push({
+                        file: location.file,
+                        line: typeof recorded === 'number' ? recorded : location.line,
+                    });
                 }
-            } else if (!embed.includes('.')) {
-                const localKey = symbolKeyFor(typeInfo.packageKey, embed);
-                if (this._mergedTypes.has(localKey)) embeddedKey = localKey;
-                else if (
-                    canPromoteInterface &&
-                    this._mergedInterfaces &&
-                    this._mergedInterfaces.has(localKey)
-                ) {
-                    embeddedInterfaceKey = localKey;
+            } else if (selector.origin.kind === 'interface') {
+                const declaration = this._interfaceDecls.get(selector.origin.key);
+                if (declaration) {
+                    const recorded = declaration.methodLines && declaration.methodLines.get(methodKey);
+                    found = [{
+                        file: declaration.file,
+                        line: typeof recorded === 'number' ? recorded : declaration.line,
+                    }];
                 }
-            }
-            if (embeddedKey) {
-                const promoted = this._findMethodLocationsRecursive(
-                    embeddedKey,
-                    methodName,
-                    new Set(seen)
-                );
-                // Follow the resolved promotion order so navigation points at the
-                // declaration that contributed the method.
-                if (promoted.length > 0) return promoted;
-            } else if (embeddedInterfaceKey) {
-                const info = this._mergedInterfaces.get(embeddedInterfaceKey);
-                if (!info || info.constraint) continue;
-                const resolved = this._resolveInterfaceMethodsCached(
-                    embeddedInterfaceKey,
-                    this._mergedInterfaces
-                );
-                if (!resolved.methods.has(methodName)) continue;
-                const declaration = this._interfaceDecls.get(embeddedInterfaceKey);
-                if (!declaration) continue;
-                const recorded = declaration.methodLines && declaration.methodLines.get(methodName);
-                return [{
-                    file: declaration.file,
-                    line: typeof recorded === 'number' ? recorded : declaration.line,
-                }];
-            } else if (canPromoteInterface && BUILTIN_INTERFACES.has(embed)) {
-                const builtinMethods = BUILTIN_INTERFACES.get(embed);
-                if (!builtinMethods.has(methodName)) continue;
+            } else if (selector.origin.kind === 'builtin') {
                 const declarations = (this._typesByLocation.get(typeKey) || []).filter(
                     (location) => location.declared !== false
                 );
                 if (declarations.length > 0) {
-                    return [{ file: declarations[0].file, line: declarations[0].line }];
+                    found = [{ file: declarations[0].file, line: declarations[0].line }];
                 }
             }
         }
-        return out;
+        this._methodLocationCache.set(cacheKey, found);
+        return found;
     }
 
     clear() {

@@ -2,6 +2,18 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [1.2.6] - 2026-08-18
+
+### Fixed
+
+- Require a receiver's complete method set to satisfy an interface before
+  showing it in reverse `goto interface` results.
+- Keep unexported method identities package-scoped while preserving valid
+  cross-package implementations contributed through embedding.
+- Resolve promoted methods using Go selector depth and ambiguity rules,
+  including named-field shadowing, and navigate to the actual contributing
+  declaration.
+
 ## [1.2.5] - 2026-08-06
 
 ### Added

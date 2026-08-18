@@ -13,7 +13,7 @@ async function main() {
         const file = path.join(tmp, `type${index}.go`);
         fs.writeFileSync(
             file,
-            `package p\ntype Type${index} struct{}\nfunc (*Type${index}) Run(value string) error { return nil }\n`
+            `package p\ntype Type${index} struct{ RunField int }\nfunc (*Type${index}) Run(value string) error { return nil }\n`
         );
         return file;
     });
@@ -54,6 +54,7 @@ async function main() {
     eq('all candidate files parsed', parsed.size, files.length);
     eq('worker concurrency is bounded', first.stats.maxActive, 2);
     assert('pointer metadata survives worker serialization', parsed.get(files[0]).types.get('Type0').pointerMethods.has('Run'));
+    assert('field selector metadata survives worker serialization', parsed.get(files[0]).types.get('Type0').fieldNames.has('RunField'));
 
     const adaptive = new AstWorkerPool({
         concurrency: 16,
@@ -95,6 +96,7 @@ async function main() {
     second.clearOverlay(files[0]);
     const disk = await second.parseFile(files[0], undefined, 100);
     assert('closing overlay restores disk AST', disk.types.get('Type0').methods.has('Run'));
+    assert('field selector metadata restores from the persistent AST cache', disk.types.get('Type0').fieldNames.has('RunField'));
 
     const corruptEntry = second.persisted.get(files[1]);
     fs.writeFileSync(second._cacheShardFile(corruptEntry.key), '{broken');
