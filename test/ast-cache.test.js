@@ -42,14 +42,54 @@ async function main() {
     ], [2, 3, 1]);
     priorityQueue.dispose();
 
+    const promotedQueue = new AstWorkerPool({ concurrency: 1 });
+    promotedQueue._enqueue({ id: 4, key: 'background', priority: 10, sequence: 4 });
+    promotedQueue._enqueue({ id: 5, key: 'normal', priority: 100, sequence: 5 });
+    assert(
+        'queued AST work can be promoted by its exact in-flight key',
+        promotedQueue._promoteQueuedJob('background', 200)
+    );
+    eq('promoted background work moves ahead of normal work', [
+        promotedQueue._dequeue().id,
+        promotedQueue._dequeue().id,
+    ], [4, 5]);
+    promotedQueue.dispose();
+
+    const inflightPromotion = new AstWorkerPool({ concurrency: 1 });
+    const ensurePromotionWorkers = inflightPromotion._ensureWorkers.bind(inflightPromotion);
+    inflightPromotion._ensureWorkers = () => {};
+    const promotionText = 'package p\ntype Promoted struct{}\nfunc (Promoted) Run() {}\n';
+    const backgroundParse = inflightPromotion.parseFile(files[4], promotionText, 10);
+    const earlyForegroundParse = inflightPromotion.parseFile(files[4], promotionText, 100);
+    assert(
+        'foreground request before enqueue shares the background parse promise',
+        earlyForegroundParse === backgroundParse
+    );
+    while (inflightPromotion.queue.length === 0) {
+        await new Promise((resolve) => setImmediate(resolve));
+    }
+    eq('early foreground priority is applied when the job enters the queue', inflightPromotion.queue[0].priority, 100);
+    const queuedForegroundParse = inflightPromotion.parseFile(files[4], promotionText, 200);
+    assert(
+        'foreground request after enqueue still shares the parse promise',
+        queuedForegroundParse === backgroundParse
+    );
+    eq('queued in-flight parse is promoted to foreground priority', inflightPromotion.queue[0].priority, 200);
+    inflightPromotion._ensureWorkers = ensurePromotionWorkers;
+    inflightPromotion._ensureWorkers(1);
+    inflightPromotion._dispatch();
+    await queuedForegroundParse;
+    eq('priority promotion does not duplicate Tree-sitter parsing', inflightPromotion.stats.parsed, 1);
+    inflightPromotion.dispose();
+
     const first = new AstWorkerPool({ concurrency: 2, cacheDir, log: () => {} });
     eq('worker warmup starts every parser worker', await first.warmup(), 2);
     eq('worker warmup does not parse workspace files', first.stats.parsed, 0);
     await Promise.all([
-        first.parseFile(files[0], undefined, 100),
-        first.parseFile(files[0], undefined, 100),
+        first.parseFile(files[0], undefined, 10),
+        first.parseFile(files[0], undefined, 200),
     ]);
-    eq('concurrent requests for one file are deduplicated', first.stats.parsed, 1);
+    eq('running requests with raised priority remain deduplicated', first.stats.parsed, 1);
     const parsed = await first.parseFiles(files.map((file) => ({ file })), 100);
     eq('all candidate files parsed', parsed.size, files.length);
     eq('worker concurrency is bounded', first.stats.maxActive, 2);

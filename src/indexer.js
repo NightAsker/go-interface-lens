@@ -529,6 +529,11 @@ class WorkspaceIndex {
         this._astQueryCache = new Map();
         this._astInflight = new Map();
         this._astGeneration = 1;
+        this._reversePrewarm = null;
+        this._reversePrewarmPromise = null;
+        this._reversePrewarmRequested = false;
+        this._reversePrewarmTimer = null;
+        this._disposed = false;
         this._importPathByDirectory = new Map();
         this._packageKeyByImportPath = new Map();
         this._externalImportDirectoryCache = new Map();
@@ -1044,9 +1049,13 @@ class WorkspaceIndex {
         this._methodLocationCache = null;
         // "receiver\u0000method -> hasLocalInterface" memo is also view-derived.
         this._hasInterfaceCache = null;
+        this._reversePrewarm = null;
         this._astGeneration += 1;
         this._astQueryCache.clear();
         this._astInflight.clear();
+        if (this._reversePrewarmRequested && this._packageFiles.size > 0) {
+            this._scheduleReversePrewarm();
+        }
     }
 
     /**
@@ -1062,6 +1071,8 @@ class WorkspaceIndex {
      * @returns {boolean}
      */
     hasLocalInterface(receiverType, methodName, receiverFile) {
+        const prewarmed = this._prewarmedReverseLookup(receiverType, methodName, receiverFile);
+        if (prewarmed) return prewarmed.results.length > 0;
         if (!this._hasInterfaceCache) this._hasInterfaceCache = new Map();
         const key = `${receiverFile || ''}\u0000${receiverType}\u0000${methodName}`;
         const hit = this._hasInterfaceCache.get(key);
@@ -2898,25 +2909,258 @@ class WorkspaceIndex {
         });
     }
 
+    _reversePrewarmKey(receiverType, methodName, receiverFile) {
+        return `${path.normalize(receiverFile || '')}\0${receiverType}\0${methodName}`;
+    }
+
+    _prewarmedReverseLookup(receiverType, methodName, receiverFile) {
+        const state = this._reversePrewarm;
+        if (!state || state.generation !== this._astGeneration || !receiverFile) return null;
+        const key = this._reversePrewarmKey(receiverType, methodName, receiverFile);
+        if (!state.resultsByReceiver.has(key)) return null;
+        return {
+            results: state.resultsByReceiver.get(key),
+            astFiles: state.astFiles,
+            workspacePackages: state.workspacePackages,
+        };
+    }
+
+    _scheduleReversePrewarm() {
+        if (
+            this._disposed ||
+            !this.astPool ||
+            this._reversePrewarmTimer ||
+            this._packageFiles.size === 0
+        ) {
+            return;
+        }
+        this._reversePrewarmTimer = setTimeout(() => {
+            this._reversePrewarmTimer = null;
+            this.prewarmReverseInterfaces().catch((error) => {
+                if (!this._disposed) this.log(`Reverse interface prewarm failed: ${error.message}`);
+            });
+        }, WorkspaceIndex.REVERSE_PREWARM_INVALIDATION_DELAY_MS);
+        if (typeof this._reversePrewarmTimer.unref === 'function') {
+            this._reversePrewarmTimer.unref();
+        }
+    }
+
+    /**
+     * Parse the complete workspace in the AST worker pool and precompute every
+     * concrete receiver-method -> workspace-interface relationship. Calls share
+     * one in-flight promise; foreground AST queries retain their higher queue
+     * priority and can overtake this background work.
+     * @returns {Promise<{ready:boolean,stale?:boolean,workspaceFiles:number,workspacePackages:number,receiverMethods:number,relationships:number,durationMs:number}>}
+     */
+    prewarmReverseInterfaces() {
+        this._reversePrewarmRequested = true;
+        if (!this.astPool || this._disposed) {
+            return Promise.resolve({
+                ready: false,
+                workspaceFiles: 0,
+                workspacePackages: 0,
+                receiverMethods: 0,
+                relationships: 0,
+                durationMs: 0,
+            });
+        }
+        if (this._reversePrewarm && this._reversePrewarm.generation === this._astGeneration) {
+            return Promise.resolve(this.getReversePrewarmStats());
+        }
+        if (this._reversePrewarmPromise) return this._reversePrewarmPromise;
+        if (this._reversePrewarmTimer) {
+            clearTimeout(this._reversePrewarmTimer);
+            this._reversePrewarmTimer = null;
+        }
+
+        const generation = this._astGeneration;
+        this.log(
+            `Reverse interface prewarm started for ${this._packageFiles.size} workspace package(s)`
+        );
+        let stale = false;
+        let request;
+        request = this._buildReversePrewarm(generation)
+            .then((state) => {
+                if (this._disposed || generation !== this._astGeneration) {
+                    stale = !this._disposed;
+                    return { ...state.stats, ready: false, stale: true };
+                }
+                this._reversePrewarm = state;
+                this.log(
+                    `Reverse interface prewarm complete: ${state.stats.workspaceFiles} file(s), ` +
+                        `${state.stats.workspacePackages} package(s), ` +
+                        `${state.stats.receiverMethods} receiver method(s), ` +
+                        `${state.stats.relationships} relationship(s), ` +
+                        `${state.stats.durationMs}ms`
+                );
+                return { ...state.stats, ready: true };
+            })
+            .finally(() => {
+                if (this._reversePrewarmPromise === request) {
+                    this._reversePrewarmPromise = null;
+                }
+                if (
+                    stale &&
+                    this._reversePrewarmRequested &&
+                    !this._disposed &&
+                    (!this._reversePrewarm ||
+                        this._reversePrewarm.generation !== this._astGeneration)
+                ) {
+                    this._scheduleReversePrewarm();
+                }
+            });
+        this._reversePrewarmPromise = request;
+        return request;
+    }
+
+    async _buildReversePrewarm(generation) {
+        const started = Date.now();
+        const workspacePackages = new Set(this._packageFiles.keys());
+        const workspaceFileSet = new Set(
+            [...this._packageFiles.values()].flatMap((files) => [...files])
+        );
+        const parsed = await this._parseAstPackages(
+            workspacePackages,
+            WorkspaceIndex.REVERSE_PREWARM_PRIORITY
+        );
+        const closure = await this._expandEmbeddedAstPackages(
+            workspacePackages,
+            parsed,
+            WorkspaceIndex.REVERSE_PREWARM_PRIORITY
+        );
+
+        const initialView = this._createAstView(closure.astFiles);
+        const initialMerged = initialView._merged();
+        const methodNames = new Set();
+        for (const info of initialMerged.interfaces.values()) {
+            for (const methodName of info.methods.keys()) methodNames.add(methodName);
+        }
+        for (const info of initialMerged.types.values()) {
+            for (const methodName of info.methods.keys()) methodNames.add(methodName);
+        }
+        const aliasExpansion = await this._expandSignatureAliasPackages(
+            closure.astFiles,
+            methodNames,
+            WorkspaceIndex.REVERSE_PREWARM_PRIORITY
+        );
+        const view = aliasExpansion.view;
+        const { types } = view._merged();
+        const locationsByType = new Map();
+
+        for (const [file, info] of aliasExpansion.astFiles) {
+            const normalizedFile = path.normalize(file);
+            if (!workspaceFileSet.has(normalizedFile)) continue;
+            for (const [typeName] of info.types) {
+                const typeKey = view._findTypeKey(typeName, normalizedFile);
+                const typeInfo = typeKey && types.get(typeKey);
+                if (!typeKey || !typeInfo || typeInfo.externalSource || typeInfo.interfaceAlias) {
+                    continue;
+                }
+                if (!locationsByType.has(typeKey)) locationsByType.set(typeKey, new Set());
+                locationsByType.get(typeKey).add(normalizedFile);
+            }
+        }
+
+        const resultsByReceiver = new Map();
+        let receiverMethods = 0;
+        let relationships = 0;
+        let sliceStarted = Date.now();
+        for (const [typeKey, locations] of locationsByType) {
+            if (generation !== this._astGeneration || this._disposed) break;
+            const typeInfo = types.get(typeKey);
+            const methods = view._resolveTypeMethodsCached(typeKey, types);
+            const representativeFile = locations.values().next().value;
+            for (const methodKey of methods.keys()) {
+                const methodName = bareMethodName(methodKey);
+                const results = view
+                    ._collectLocalInterfaces(typeInfo.name, methodName, {
+                        receiverFile: representativeFile,
+                    })
+                    .results.filter((result) => !result.external);
+                receiverMethods += 1;
+                relationships += results.length;
+                for (const file of locations) {
+                    resultsByReceiver.set(
+                        this._reversePrewarmKey(typeInfo.name, methodName, file),
+                        results
+                    );
+                }
+            }
+            if (Date.now() - sliceStarted >= WorkspaceIndex.REVERSE_PREWARM_TIME_SLICE_MS) {
+                await this._yieldToEventLoop();
+                sliceStarted = Date.now();
+            }
+        }
+
+        return {
+            generation,
+            astFiles: aliasExpansion.astFiles,
+            view,
+            workspacePackages,
+            resultsByReceiver,
+            stats: {
+                workspaceFiles: workspaceFileSet.size,
+                workspacePackages: workspacePackages.size,
+                receiverMethods,
+                relationships,
+                durationMs: Date.now() - started,
+            },
+        };
+    }
+
+    getReversePrewarmStats() {
+        const state = this._reversePrewarm;
+        if (!state || state.generation !== this._astGeneration) {
+            return {
+                ready: false,
+                warming: !!this._reversePrewarmPromise,
+                generation: this._astGeneration,
+            };
+        }
+        return {
+            ...state.stats,
+            ready: true,
+            warming: false,
+            generation: state.generation,
+        };
+    }
+
     findInterfacesAst(receiverType, methodName, opts) {
         const receiverFile = opts && opts.receiverFile;
         const key = `reverse\0${receiverFile || ''}\0${receiverType}\0${methodName}`;
         return this._cachedAstQuery(key, async () => {
             const receiverPackage = this._packageForFile(receiverFile);
             if (!receiverPackage) return [];
-            const candidates = this._candidatePackagesForMethods([methodName]);
-            candidates.add(receiverPackage);
             const started = Date.now();
-            const astFiles = await this._parseAstPackages(candidates, 200);
-            const closure = await this._expandEmbeddedAstPackages(candidates, astFiles, 200);
-            const aliasExpansion = await this._expandSignatureAliasPackages(
-                closure.astFiles,
-                [methodName],
-                200
+            const prewarmed = this._prewarmedReverseLookup(
+                receiverType,
+                methodName,
+                receiverFile
             );
-            const view = aliasExpansion.view;
-            const local = view._collectLocalInterfaces(receiverType, methodName, { receiverFile });
-            const results = local.results;
+            let candidates;
+            let receiverAstFiles;
+            let results;
+            if (prewarmed) {
+                candidates = prewarmed.workspacePackages;
+                receiverAstFiles = prewarmed.astFiles;
+                results = [...prewarmed.results];
+            } else {
+                candidates = this._candidatePackagesForMethods([methodName]);
+                candidates.add(receiverPackage);
+                const astFiles = await this._parseAstPackages(candidates, 200);
+                const closure = await this._expandEmbeddedAstPackages(candidates, astFiles, 200);
+                const aliasExpansion = await this._expandSignatureAliasPackages(
+                    closure.astFiles,
+                    [methodName],
+                    200
+                );
+                const view = aliasExpansion.view;
+                const local = view._collectLocalInterfaces(receiverType, methodName, {
+                    receiverFile,
+                });
+                results = local.results;
+                receiverAstFiles = aliasExpansion.astFiles;
+            }
             const cfg = this.getConfig();
             if (cfg.searchDependencies !== false) {
                 const cacheRoot = resolveGoModCache(cfg.goModCache);
@@ -2925,14 +3169,15 @@ class WorkspaceIndex {
                         ...(await this._searchDependencyInterfacesAst(cacheRoot, methodName, {
                             receiverType,
                             receiverFile,
-                            astFiles: aliasExpansion.astFiles,
+                            astFiles: receiverAstFiles,
                         }))
                     );
                 }
             }
             this.log(
                 `AST reverse query ${receiverType}.${methodName}: ${candidates.size} package(s), ` +
-                    `${aliasExpansion.astFiles.size} file(s), ${Date.now() - started}ms`
+                    `${receiverAstFiles.size} file(s), ${Date.now() - started}ms` +
+                    (prewarmed ? ' (prewarmed)' : '')
             );
             return dedupeResults(results);
         });
@@ -3581,6 +3826,11 @@ class WorkspaceIndex {
     }
 
     clear() {
+        if (this._reversePrewarmTimer) {
+            clearTimeout(this._reversePrewarmTimer);
+            this._reversePrewarmTimer = null;
+        }
+        this._reversePrewarm = null;
         this.files.clear();
         this.overlays.clear();
         this.overlayTexts.clear();
@@ -3620,6 +3870,12 @@ class WorkspaceIndex {
     }
 
     dispose() {
+        this._disposed = true;
+        if (this._reversePrewarmTimer) {
+            clearTimeout(this._reversePrewarmTimer);
+            this._reversePrewarmTimer = null;
+        }
+        this._reversePrewarm = null;
         if (this._invalidateTimer) {
             clearTimeout(this._invalidateTimer);
             this._invalidateTimer = null;
@@ -3667,6 +3923,15 @@ WorkspaceIndex.INVALIDATE_DEBOUNCE_MS = 150;
 WorkspaceIndex.INDEX_READ_CONCURRENCY = 16;
 // Maximum synchronous parse time before yielding back to the extension host.
 WorkspaceIndex.INDEX_TIME_SLICE_MS = 8;
+// Complete reverse prewarming is deliberately lower priority than explicit
+// navigation requests, which use priorities of 150-200.
+WorkspaceIndex.REVERSE_PREWARM_PRIORITY = 10;
+// Yield while building the relation map so matching does not monopolize the
+// extension-host event loop after worker parsing completes.
+WorkspaceIndex.REVERSE_PREWARM_TIME_SLICE_MS = 8;
+// Rebuild only after edits have been idle long enough to avoid one complete
+// relation pass per keystroke.
+WorkspaceIndex.REVERSE_PREWARM_INVALIDATION_DELAY_MS = 1000;
 
 /**
  * De-duplicate result records by their location identity (name + file + line),

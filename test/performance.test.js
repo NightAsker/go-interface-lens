@@ -35,8 +35,9 @@ async function main() {
     }
     const interfaceFile = path.join(apiDir, 'rare.go');
     fs.writeFileSync(interfaceFile, 'package api\ntype Rare interface { RareMethod(value string) error }\n');
+    const implementationFile = path.join(implDir, 'impl.go');
     fs.writeFileSync(
-        path.join(implDir, 'impl.go'),
+        implementationFile,
         'package impl\ntype Impl struct{}\nfunc (Impl) RareMethod(value string) error { return nil }\n'
     );
 
@@ -67,12 +68,26 @@ async function main() {
     const warmStarted = process.hrtime.bigint();
     const warm = await index.findImplementationsAst('Rare', interfaceFile);
     const warmMs = Number(process.hrtime.bigint() - warmStarted) / 1e6;
+    const parsedAfterColdQuery = index.getAstStats().parsed;
+
+    const prewarmStarted = process.hrtime.bigint();
+    const reversePrewarm = await index.prewarmReverseInterfaces();
+    const prewarmMs = Number(process.hrtime.bigint() - prewarmStarted) / 1e6;
+    const readsBeforeReverse = { ...index.getAstStats() };
+    const reverseStarted = process.hrtime.bigint();
+    const reverse = await index.findInterfacesAst('Impl', 'RareMethod', {
+        receiverFile: implementationFile,
+    });
+    const reverseMs = Number(process.hrtime.bigint() - reverseStarted) / 1e6;
+    const readsAfterReverse = index.getAstStats();
 
     console.log('== lazy AST performance (402 Go files) ==');
     console.log(`  startup regex index : ${buildMs.toFixed(1)}ms`);
     console.log(`  legacy warm query   : ${legacyQueryMs.toFixed(2)}ms`);
     console.log(`  AST cold query      : ${coldMs.toFixed(1)}ms`);
     console.log(`  AST cached query    : ${warmMs.toFixed(2)}ms`);
+    console.log(`  reverse prewarm     : ${prewarmMs.toFixed(1)}ms`);
+    console.log(`  prewarmed reverse   : ${reverseMs.toFixed(2)}ms`);
     console.log(`  AST files parsed    : ${index.getAstStats().parsed}`);
 
     assert('cold AST query finds implementation', cold.length === 1 && cold[0].name === 'Impl');
@@ -81,8 +96,19 @@ async function main() {
     assert('startup candidate indexing does not parse any file with WASM', parsedAfterStartup === 0);
     assert('cold candidate AST query stays within broad budget', coldMs < 2000);
     assert('cached query stays responsive', warmMs < 100);
-    assert('query parses candidates instead of the whole workspace', index.getAstStats().parsed <= 4);
+    assert('cold query parses candidates instead of the whole workspace', parsedAfterColdQuery <= 4);
     assert('unrelated local embeds do not inflate candidates', rareCandidates.size <= 2);
+    assert('reverse prewarm covers the complete workspace', reversePrewarm.workspaceFiles === 402);
+    assert('reverse prewarm uses multiple AST workers', index.getAstStats().maxActive > 1);
+    assert('reverse prewarm stays within a broad background budget', prewarmMs < 5000);
+    assert('prewarmed reverse query finds the interface', reverse.length === 1 && reverse[0].name === 'Rare');
+    assert('prewarmed reverse query stays responsive', reverseMs < 100);
+    assert(
+        'prewarmed reverse query performs no AST reads',
+        readsAfterReverse.parsed === readsBeforeReverse.parsed &&
+            readsAfterReverse.memoryHits === readsBeforeReverse.memoryHits &&
+            readsAfterReverse.diskHits === readsBeforeReverse.diskHits
+    );
 
     index.dispose();
     fs.rmSync(tmp, { recursive: true, force: true });

@@ -2,6 +2,20 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [1.2.8] - 2026-08-18
+
+### Added
+
+- Precompute every workspace `implementation -> interface` relationship in a
+  low-priority, multi-worker Tree-sitter background pass after startup.
+- Reuse the complete reverse relation map without additional AST reads, and
+  invalidate plus rebuild it after workspace edits become idle.
+
+### Changed
+
+- Promote queued background AST work to foreground priority when an explicit
+  navigation query needs the same file, while retaining in-flight deduplication.
+
 ## [1.2.7] - 2026-08-18
 
 ### Added

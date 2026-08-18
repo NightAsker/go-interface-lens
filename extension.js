@@ -103,19 +103,29 @@ function resolvePrewarmRoots(documentUri) {
 
 function prewarmRoots(roots, reason) {
     if (!workspaceIndex || typeof workspaceIndex.ensureBuilt !== 'function' || roots.length === 0) return;
-    const warmWorkers = () => {
-        if (typeof workspaceIndex.warmAstWorkers !== 'function') return Promise.resolve();
-        return workspaceIndex.warmAstWorkers().catch((err) => {
-            log(`${reason} AST worker warmup failed: ${err && err.message}`);
-        });
+    const warmReverseIndex = async () => {
+        if (typeof workspaceIndex.warmAstWorkers === 'function') {
+            try {
+                await workspaceIndex.warmAstWorkers();
+            } catch (err) {
+                log(`${reason} AST worker warmup failed: ${err && err.message}`);
+            }
+        }
+        if (typeof workspaceIndex.prewarmReverseInterfaces === 'function') {
+            try {
+                await workspaceIndex.prewarmReverseInterfaces();
+            } catch (err) {
+                log(`${reason} reverse interface prewarm failed: ${err && err.message}`);
+            }
+        }
     };
     if (typeof workspaceIndex.areRootsBuilt === 'function' && workspaceIndex.areRootsBuilt(roots)) {
-        void warmWorkers();
+        void warmReverseIndex();
         return;
     }
 
     Promise.all(roots.map((root) => workspaceIndex.ensureBuilt(root)))
-        .then(warmWorkers)
+        .then(warmReverseIndex)
         .catch((err) => {
             log(`${reason} prewarm failed: ${err && err.message}`);
         });
@@ -167,8 +177,8 @@ class GoCodeLensProvider {
         const parsed = await parseDocument(document);
 
         if (parsed.interfaces.size > 0) {
-            // Build the broad candidate index in the background. Exact AST
-            // parsing remains lazy until a lens is clicked.
+            // Ensure the workspace scan and complete reverse relation prewarm
+            // are running in the background without delaying CodeLens output.
             prewarmWorkspace(document.uri, 'interface lens');
         }
 

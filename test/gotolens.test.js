@@ -216,6 +216,7 @@ async function main() {
 
     let prewarmCalls = 0;
     let workerWarmupCalls = 0;
+    let reversePrewarmCalls = 0;
     extension._test.setWorkspaceIndex({
         areRootsBuilt: () => false,
         ensureBuilt: async () => {
@@ -224,12 +225,16 @@ async function main() {
         warmAstWorkers: async () => {
             workerWarmupCalls += 1;
         },
+        prewarmReverseInterfaces: async () => {
+            reversePrewarmCalls += 1;
+        },
     });
     await interfaceProvider.provideCodeLenses(fakeDocument(variantsPath));
-    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setTimeout(resolve, 10));
     console.log('\n== interface-only file prewarming ==');
     assert('interface lens starts one background workspace build', prewarmCalls === 1);
     assert('interface lens warms AST workers after the workspace build', workerWarmupCalls === 1);
+    assert('interface lens starts reverse interface prewarming', reversePrewarmCalls === 1);
     extension._test.setWorkspaceIndex(idx);
 
     idx.dispose();

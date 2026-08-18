@@ -342,6 +342,21 @@ class AstWorkerPool {
         }
     }
 
+    _promoteQueuedJob(key, priority) {
+        const requested = Number.isFinite(priority) ? priority : 0;
+        const index = this.queue.findIndex((job) => job.key === key);
+        if (index === -1 || requested <= this.queue[index].priority) return false;
+        this.queue[index].priority = requested;
+        let current = index;
+        while (current > 0) {
+            const parent = Math.floor((current - 1) / 2);
+            if (this._jobPrecedes(this.queue[parent], this.queue[current])) break;
+            [this.queue[parent], this.queue[current]] = [this.queue[current], this.queue[parent]];
+            current = parent;
+        }
+        return true;
+    }
+
     _dequeue() {
         if (this.queue.length === 0) return null;
         const first = this.queue[0];
@@ -403,12 +418,13 @@ class AstWorkerPool {
         this._scheduleShrink();
     }
 
-    _run(file, text, priority) {
+    _run(file, text, priority, key) {
         if (this.disposed) return Promise.reject(new Error('AST worker pool is disposed'));
         this._cancelShrink();
         return new Promise((resolve, reject) => {
             this._enqueue({
                 id: this.nextJobID++,
+                key,
                 sequence: this.nextSequence++,
                 priority: priority || 0,
                 file,
@@ -427,16 +443,24 @@ class AstWorkerPool {
                 ? 'disk'
                 : crypto.createHash('sha1').update(text).digest('hex');
         const key = `${file}\0${overlayHash}`;
-        if (this.inflight.has(key)) return this.inflight.get(key);
-        let request;
-        request = this._parseFile(file, text, priority).finally(() => {
-            if (this.inflight.get(key) === request) this.inflight.delete(key);
+        const requestedPriority = Number.isFinite(priority) ? priority : 0;
+        const existing = this.inflight.get(key);
+        if (existing) {
+            if (requestedPriority > existing.priority) {
+                existing.priority = requestedPriority;
+                this._promoteQueuedJob(key, requestedPriority);
+            }
+            return existing.promise;
+        }
+        const entry = { promise: null, priority: requestedPriority };
+        entry.promise = this._parseFile(file, text, entry, key).finally(() => {
+            if (this.inflight.get(key) === entry) this.inflight.delete(key);
         });
-        this.inflight.set(key, request);
-        return request;
+        this.inflight.set(key, entry);
+        return entry.promise;
     }
 
-    async _parseFile(file, text, priority) {
+    async _parseFile(file, text, request, key) {
         await this._load();
         const generation = this.generation;
         if (text !== undefined) {
@@ -445,7 +469,7 @@ class AstWorkerPool {
                 this.stats.memoryHits += 1;
                 return overlay.parsed;
             }
-            const serialized = await this._run(file, text, priority);
+            const serialized = await this._run(file, text, request.priority, key);
             const parsed = deserializeParsedFile(serialized);
             if (generation === this.generation) this.overlays.set(file, { text, parsed });
             this.stats.parsed += 1;
@@ -473,7 +497,7 @@ class AstWorkerPool {
             }
         }
 
-        const serialized = await this._run(file, undefined, priority);
+        const serialized = await this._run(file, undefined, request.priority, key);
         const parsed = deserializeParsedFile(serialized);
         if (generation === this.generation) {
             this._rememberMemory(file, { mtimeMs: stat.mtimeMs, size: stat.size, parsed });
