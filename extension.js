@@ -310,7 +310,7 @@ async function showImplementations(interfaceName, documentUri) {
         return found
             .filter((r) => !shouldExclude(r.file, r.name))
             .map((r) => ({
-                label: `$(symbol-struct) ${r.name}`,
+                label: `$(symbol-struct) ${r.name}${r.external ? ' $(package)' : ''}`,
                 description: `${path.basename(path.dirname(r.file))}/${path.basename(r.file)}`,
                 filePath: r.file,
                 line: r.line,
@@ -335,7 +335,7 @@ async function showMethodImplementations(interfaceName, methodName, documentUri)
         return found
             .filter((r) => !shouldExclude(r.file, r.name))
             .map((r) => ({
-                label: `$(symbol-method) ${r.name}.${methodName}`,
+                label: `$(symbol-method) ${r.name}.${methodName}${r.external ? ' $(package)' : ''}`,
                 description: `${path.basename(path.dirname(r.file))}/${path.basename(r.file)}:${r.line + 1}`,
                 detail: r.signature,
                 filePath: r.file,

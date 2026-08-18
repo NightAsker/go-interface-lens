@@ -2,7 +2,7 @@
   "name": "go-interface-lens",
   "displayName": "Go Interface Lens",
   "description": "Fast bidirectional CodeLens navigation between Go interfaces and their implementations",
-  "version": "1.2.6",
+  "version": "1.2.7",
   "publisher": "xiaoyao",
   "author": {
     "name": "xiaoyao"
@@ -97,7 +97,7 @@
         "goInterfaceLens.searchDependencies": {
           "type": "boolean",
           "default": true,
-          "description": "When 'goto interface' finds no interface in the workspace, additionally search the Go module cache so interfaces declared in dependency packages (implemented in your project) can still be found. The module cache is never fully indexed; only files declaring the relevant method are scanned on demand."
+          "description": "Search dependency packages for interfaces and concrete implementations during explicit navigation queries. Search is limited to go.mod-locked versions, or to the explicitly configured goModCache root when no lock is available, and results are verified with complete AST method sets."
         },
         "goInterfaceLens.goModCache": {
           "type": "string",

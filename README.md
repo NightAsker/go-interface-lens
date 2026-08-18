@@ -1,6 +1,6 @@
 # Go Interface Lens
 
-[![Version](https://img.shields.io/badge/version-1.2.6-blue.svg)](https://github.com/NightAsker/go-interface-lens)
+[![Version](https://img.shields.io/badge/version-1.2.7-blue.svg)](https://github.com/NightAsker/go-interface-lens)
 [![VSCode](https://img.shields.io/badge/VSCode-1.76+-green.svg)](https://code.visualstudio.com/)
 
 一个面向大型 Go 工程的 VS Code / Cursor 接口导航扩展。它在接口、接口方法和具体实现之间提供双向 CodeLens，同时使用轻量候选索引和按需 AST 校验兼顾响应速度与查找准确性。
@@ -12,7 +12,7 @@
 ### 快速启动，按需精确查找
 
 - 启动阶段只建立轻量的方法名候选索引，不扫描依赖目录，也不构建全工程 AST。
-- 点击 CodeLens 后，仅解析接口所在包和可能包含实现的候选包。
+- 点击 CodeLens 后，仅解析接口所在包、可能包含实现的候选包，以及按需命中的锁定依赖包。
 - 优先使用接口中出现频率最低的方法缩小候选范围。
 - 已完成的查询直接使用内存缓存，未变化的文件可从持久化 AST 缓存恢复。
 
@@ -26,7 +26,7 @@
 - Go 的隐式接口实现和完整方法签名校验。
 - 值接收者、指针接收者及其不同的方法集。
 - 本地或跨包嵌入的 struct、interface 和类型别名。
-- 标准库接口、`go.mod` 锁定依赖、local replace、module replace 和 GOROOT 源码。
+- 标准库接口、`go.mod` 锁定依赖中的接口与具体实现、local replace、module replace 和 GOROOT 源码。
 - import 别名、包内别名、跨包别名链和复合别名。
 - `byte`/`uint8`、`rune`/`int32`、`any`/`interface{}` 等价关系，并尊重包级同名声明遮蔽。
 - 多行声明、分组参数、泛型接口与实现、泛型嵌入、泛型实例、匿名接口和嵌套函数类型。
@@ -115,7 +115,7 @@ WASM、Go grammar WASM 和 MIT 许可证；依赖包里的其他语言 grammar �
 | `goInterfaceLens.excludedFolders` | `mocks, mock, testdata, vendor` | 排除指定目录 |
 | `goInterfaceLens.excludedFilePatterns` | `_mock.go, mock_, .pb.go, _test.go` | 排除文件名中包含指定文本的文件 |
 | `goInterfaceLens.excludedTypePatterns` | `Mock, mock, Stub, Fake` | 排除名称中包含指定文本的类型 |
-| `goInterfaceLens.searchDependencies` | `true` | 反向查找无本地结果时，按需搜索依赖接口 |
+| `goInterfaceLens.searchDependencies` | `true` | 正反向导航时按需搜索 `go.mod` 锁定依赖中的接口与具体实现；无锁信息时仅搜索显式配置的依赖根 |
 | `goInterfaceLens.goModCache` | 空 | 手动指定 Go module cache；为空时自动探测 |
 
 示例：
@@ -216,7 +216,7 @@ VS Code 会并发请求同一 Go 文件上所有匹配的 CodeLens provider，�
 3. 检查排除目录、文件和类型配置。
 4. 执行 `Go: Clear Implementation Lens Cache` 后重试。
 
-### 依赖中的接口找不到
+### 依赖中的接口或实现找不到
 
 1. 确认 `goInterfaceLens.searchDependencies` 为 `true`。
 2. 确认依赖出现在 `go.mod` 中，或配置了有效 replace。

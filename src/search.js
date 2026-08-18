@@ -165,6 +165,89 @@ async function grepInterfaceFilesForMethod(root, methodName, maxFiles, searchDir
 }
 
 /**
+ * Find Go files containing a receiver method declaration named `methodName`.
+ * The caller expands each hit to its complete package and performs semantic AST
+ * verification, so this grep is deliberately recall-oriented.
+ *
+ * @param {string} root dependency root (e.g. module cache)
+ * @param {string} methodName interface method used as the candidate anchor
+ * @param {number} [maxFiles] cap on candidate files
+ * @param {string[]} [searchDirs] restrict search to locked module directories
+ * @returns {Promise<string[]>}
+ */
+async function grepImplementationFilesForMethod(root, methodName, maxFiles, searchDirs) {
+    if (!/^[A-Za-z_]\w*$/.test(methodName)) return [];
+    const rg = findRipgrep();
+    const cap = maxFiles || 400;
+    const args = [
+        '-l',
+        '-U',
+        '--glob',
+        '*.go',
+        '--max-count',
+        '1',
+        '-e',
+        `\\bfunc\\s*\\([^)]*\\)\\s*${methodName}\\s*\\(`,
+        '--',
+    ];
+    const targets = Array.isArray(searchDirs) && searchDirs.length > 0 ? searchDirs : ['.'];
+    for (const target of targets) args.push(target);
+
+    try {
+        const out = await runExec(rg || 'rg', args, root, 20000);
+        return out
+            .split('\n')
+            .map((line) => line.trim())
+            .filter(Boolean)
+            .map((line) => (path.isAbsolute(line) ? line : path.join(root, line)))
+            .slice(0, cap);
+    } catch (_) {
+        return [];
+    }
+}
+
+/**
+ * Find files that may embed or alias one of the supplied named types. AST
+ * method-set resolution later rejects ordinary references and ambiguous embeds.
+ *
+ * @param {string} root dependency root
+ * @param {Iterable<string>} typeNames candidate embedded type names
+ * @param {number} [maxFiles] cap on candidate files
+ * @param {string[]} [searchDirs] restrict search to locked module directories
+ * @returns {Promise<string[]>}
+ */
+async function grepGoFilesForTypeNames(root, typeNames, maxFiles, searchDirs) {
+    const names = [...new Set(typeNames)].filter((name) => /^[A-Za-z_]\w*$/.test(name)).sort();
+    if (names.length === 0) return [];
+    const rg = findRipgrep();
+    const cap = maxFiles || 400;
+    const args = [
+        '-l',
+        '--glob',
+        '*.go',
+        '--max-count',
+        '1',
+        '-e',
+        `\\b(?:${names.join('|')})\\b`,
+        '--',
+    ];
+    const targets = Array.isArray(searchDirs) && searchDirs.length > 0 ? searchDirs : ['.'];
+    for (const target of targets) args.push(target);
+
+    try {
+        const out = await runExec(rg || 'rg', args, root, 20000);
+        return out
+            .split('\n')
+            .map((line) => line.trim())
+            .filter(Boolean)
+            .map((line) => (path.isAbsolute(line) ? line : path.join(root, line)))
+            .slice(0, cap);
+    } catch (_) {
+        return [];
+    }
+}
+
+/**
  * @param {string} cmd
  * @param {string[]} args
  * @param {string} cwd
@@ -259,4 +342,6 @@ module.exports = {
     findRipgrep,
     resolveGoModCache,
     grepInterfaceFilesForMethod,
+    grepImplementationFilesForMethod,
+    grepGoFilesForTypeNames,
 };

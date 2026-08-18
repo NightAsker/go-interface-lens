@@ -16,7 +16,13 @@ const {
     splitTopLevel,
     BUILTIN_INTERFACES,
 } = require('./signatures');
-const { listGoFiles, resolveGoModCache, grepInterfaceFilesForMethod } = require('./search');
+const {
+    listGoFiles,
+    resolveGoModCache,
+    grepInterfaceFilesForMethod,
+    grepImplementationFilesForMethod,
+    grepGoFilesForTypeNames,
+} = require('./search');
 const { findGoMod, resolveLockedModuleDirs, resolveModuleImportDirectory } = require('./gomod');
 const { currentBuildContext, shouldIncludeGoFile } = require('./build');
 const { AstWorkerPool, DEFAULT_AST_CONCURRENCY } = require('./ast-cache');
@@ -528,6 +534,8 @@ class WorkspaceIndex {
         this._externalImportDirectoryCache = new Map();
         this._externalPackageCache = new Map();
         this._dependencyCandidateCache = new Map();
+        this._dependencyImplementationCandidateCache = new Map();
+        this._dependencyTypeReferenceCandidateCache = new Map();
         this._goRootPromise = null;
         this._candidateCacheDir = this.options.cacheDir || '';
         this._candidateCacheStates = new Map();
@@ -2468,14 +2476,20 @@ class WorkspaceIndex {
         if (!this.astPool) return null;
         const directory = await this._resolveExternalImportDirectory(importPath);
         if (!directory) return null;
-        const cacheKey = `${directory}\0${importPath}`;
+        return this._loadExternalDirectory(directory, importPath);
+    }
+
+    async _loadExternalDirectory(directory, importPath) {
+        if (!this.astPool) return null;
+        const normalizedDirectory = path.normalize(directory);
+        const cacheKey = `${normalizedDirectory}\0${importPath || ''}`;
         if (this._externalPackageCache.has(cacheKey)) {
             return this._externalPackageCache.get(cacheKey);
         }
         const request = (async () => {
             let entries;
             try {
-                entries = await fs.promises.readdir(directory, { withFileTypes: true });
+                entries = await fs.promises.readdir(normalizedDirectory, { withFileTypes: true });
             } catch (_) {
                 return null;
             }
@@ -2486,7 +2500,7 @@ class WorkspaceIndex {
                         entry.name.endsWith('.go') &&
                         !entry.name.endsWith('_test.go')
                 )
-                .map((entry) => path.join(directory, entry.name))
+                .map((entry) => path.join(normalizedDirectory, entry.name))
                 .filter((file) => shouldIncludeGoFile(file, '', this._buildContext));
             const sources = await Promise.all(
                 files.map(async (file) => {
@@ -2501,16 +2515,18 @@ class WorkspaceIndex {
             );
             const parsed = await this.astPool.parseFiles(sources.filter(Boolean), 150);
             return {
-                directory,
+                directory: normalizedDirectory,
                 files: new Map(
                     [...parsed].map(([file, info]) => [
                         file,
-                        { ...info, importPath, externalSource: true },
+                        { ...info, importPath: importPath || null, externalSource: true },
                     ])
                 ),
             };
         })().catch((error) => {
-            this.log(`External package parse failed for ${importPath}: ${error.message}`);
+            this.log(
+                `External package parse failed for ${importPath || normalizedDirectory}: ${error.message}`
+            );
             return null;
         });
         this._externalPackageCache.set(cacheKey, request);
@@ -2712,16 +2728,144 @@ class WorkspaceIndex {
             astFiles: aliasExpansion.astFiles,
             view: aliasExpansion.view,
             candidatePackages: candidates,
+            descriptor,
         };
+    }
+
+    _dependencyImplementationAstContext(interfaceName, interfaceFile) {
+        const key = `dependency-context\0${interfaceFile}\0${interfaceName}`;
+        return this._cachedAstQuery(key, async () => {
+            const context = await this._implementationAstContext(interfaceName, interfaceFile);
+            if (!context || !context.descriptor) return context;
+            const cfg = this.getConfig();
+            if (cfg.searchDependencies === false) return context;
+            const cacheRoot = resolveGoModCache(cfg.goModCache);
+            if (!cacheRoot) return context;
+
+            const methodKeys = [...context.descriptor.resolved.methods.keys()];
+            if (methodKeys.length === 0) return context;
+            methodKeys.sort((left, right) => {
+                const leftCount = (this._candidateFilesByMethod.get(bareMethodName(left)) || new Set()).size;
+                const rightCount = (this._candidateFilesByMethod.get(bareMethodName(right)) || new Set()).size;
+                return leftCount - rightCount;
+            });
+            const anchorMethod = bareMethodName(methodKeys[0]);
+            const dependencyDirs = this._dependencySearchDirs(cacheRoot);
+            if (dependencyDirs === null) return context;
+            const [implementationCandidates, interfaceCandidates] = await Promise.all([
+                this._dependencyImplementationCandidates(cacheRoot, anchorMethod, dependencyDirs),
+                this._dependencyInterfaceCandidates(cacheRoot, anchorMethod, dependencyDirs),
+            ]);
+            const candidateFiles = new Set([
+                ...implementationCandidates,
+                ...interfaceCandidates,
+            ]);
+            const loadedDirectories = new Set();
+            const discoveredImports = new Set();
+            let astFiles = new Map(context.astFiles);
+            const rememberLoadedDirectories = () => {
+                for (const file of astFiles.keys()) loadedDirectories.add(path.dirname(file));
+            };
+            const loadCandidatePackages = async (files) => {
+                rememberLoadedDirectories();
+                const additions = new Map();
+                for (const file of files) {
+                    const directory = path.dirname(file);
+                    if (loadedDirectories.has(directory)) continue;
+                    const importPath = this._importPathForFile(file);
+                    additions.set(directory, importPath);
+                }
+                const externalPackages = await Promise.all(
+                    [...additions].map(([directory, importPath]) =>
+                        this._loadExternalDirectory(directory, importPath)
+                    )
+                );
+                for (const externalPackage of externalPackages) {
+                    if (!externalPackage) continue;
+                    for (const [file, info] of externalPackage.files) astFiles.set(file, info);
+                }
+                for (const [directory, importPath] of additions) {
+                    loadedDirectories.add(directory);
+                    discoveredImports.add(importPath || directory);
+                }
+            };
+            await loadCandidatePackages(candidateFiles);
+            if (astFiles.size === context.astFiles.size) return context;
+
+            let aliasExpansion = null;
+            const searchedTypeNames = new Set();
+            for (let round = 0; round < 10; round++) {
+                const closure = await this._expandEmbeddedAstPackages(
+                    context.candidatePackages,
+                    astFiles,
+                    200
+                );
+                aliasExpansion = await this._expandSignatureAliasPackages(
+                    closure.astFiles,
+                    context.descriptor.resolved.methods.keys(),
+                    200
+                );
+                astFiles = aliasExpansion.astFiles;
+
+                const view = aliasExpansion.view;
+                const names = new Set(
+                    view
+                        .findImplementations(interfaceName, interfaceFile, {
+                            includeExternal: true,
+                        })
+                        .filter((result) => result.external)
+                        .map((result) => result.name.replace(/^\*/, ''))
+                );
+                const { interfaces } = view._merged();
+                const target = view._interfaceDescriptor(view, interfaceName, interfaceFile);
+                if (target) {
+                    for (const [interfaceKey, info] of interfaces) {
+                        if (!info.externalSource || info.constraint) continue;
+                        const resolved = view._resolveInterfaceMethodsCached(interfaceKey, interfaces);
+                        if (satisfies(target.resolved.methods, resolved.methods)) names.add(info.name);
+                    }
+                }
+                for (const name of searchedTypeNames) names.delete(name);
+                if (names.size === 0) break;
+                for (const name of names) searchedTypeNames.add(name);
+
+                const references = await this._dependencyTypeReferenceCandidates(
+                    cacheRoot,
+                    names,
+                    dependencyDirs
+                );
+                for (const file of references) candidateFiles.add(file);
+                const before = astFiles.size;
+                await loadCandidatePackages(references);
+                if (astFiles.size === before) break;
+            }
+            if (!aliasExpansion) return context;
+            this.log(
+                `AST dependency implementation context ${interfaceName}: ${candidateFiles.size} ` +
+                    `candidate file(s), ${discoveredImports.size} package(s), anchor ${anchorMethod}`
+            );
+            return {
+                ...context,
+                astFiles: aliasExpansion.astFiles,
+                view: aliasExpansion.view,
+                dependencyCandidateFiles: [...candidateFiles],
+            };
+        });
     }
 
     findImplementationsAst(interfaceName, interfaceFile) {
         const key = `implementations\0${interfaceFile}\0${interfaceName}`;
         return this._cachedAstQuery(key, async () => {
             const started = Date.now();
-            const context = await this._implementationAstContext(interfaceName, interfaceFile);
+            const cfg = this.getConfig();
+            const context =
+                cfg.searchDependencies === false
+                    ? await this._implementationAstContext(interfaceName, interfaceFile)
+                    : await this._dependencyImplementationAstContext(interfaceName, interfaceFile);
             if (!context) return [];
-            const results = context.view.findImplementations(interfaceName, interfaceFile);
+            const results = context.view.findImplementations(interfaceName, interfaceFile, {
+                includeExternal: cfg.searchDependencies !== false,
+            });
             this.log(
                 `AST implementation query ${interfaceName}: ${context.candidatePackages.size} package(s), ` +
                     `${context.astFiles.size} file(s), ${Date.now() - started}ms`
@@ -2734,9 +2878,18 @@ class WorkspaceIndex {
         const key = `method\0${interfaceFile}\0${interfaceName}\0${methodName}`;
         return this._cachedAstQuery(key, async () => {
             const started = Date.now();
-            const context = await this._implementationAstContext(interfaceName, interfaceFile);
+            const cfg = this.getConfig();
+            const context =
+                cfg.searchDependencies === false
+                    ? await this._implementationAstContext(interfaceName, interfaceFile)
+                    : await this._dependencyImplementationAstContext(interfaceName, interfaceFile);
             if (!context) return [];
-            const results = context.view.findMethodImplementations(interfaceName, methodName, interfaceFile);
+            const results = context.view.findMethodImplementations(
+                interfaceName,
+                methodName,
+                interfaceFile,
+                { includeExternal: cfg.searchDependencies !== false }
+            );
             this.log(
                 `AST method query ${interfaceName}.${methodName}: ${context.candidatePackages.size} package(s), ` +
                     `${context.astFiles.size} file(s), ${Date.now() - started}ms`
@@ -2765,30 +2918,39 @@ class WorkspaceIndex {
             const local = view._collectLocalInterfaces(receiverType, methodName, { receiverFile });
             const results = local.results;
             const cfg = this.getConfig();
-            if (results.length === 0 && cfg.searchDependencies !== false) {
+            if (cfg.searchDependencies !== false) {
                 const cacheRoot = resolveGoModCache(cfg.goModCache);
-                if (cacheRoot) await this._searchDependencyInterfacesAst(cacheRoot, methodName, local);
+                if (cacheRoot) {
+                    results.push(
+                        ...(await this._searchDependencyInterfacesAst(cacheRoot, methodName, {
+                            receiverType,
+                            receiverFile,
+                            astFiles: aliasExpansion.astFiles,
+                        }))
+                    );
+                }
             }
             this.log(
                 `AST reverse query ${receiverType}.${methodName}: ${candidates.size} package(s), ` +
                     `${aliasExpansion.astFiles.size} file(s), ${Date.now() - started}ms`
             );
-            return results;
+            return dedupeResults(results);
         });
     }
 
-    async _searchDependencyInterfacesAst(cacheRoot, methodName, local) {
-        const lockedDirs = this._resolveLockedDirs(cacheRoot);
+    async _searchDependencyInterfacesAst(cacheRoot, methodName, receiver) {
+        const dependencyDirs = this._dependencySearchDirs(cacheRoot);
+        if (dependencyDirs === null) return [];
         let candidates;
         try {
             candidates = await this._dependencyInterfaceCandidates(
                 cacheRoot,
                 methodName,
-                lockedDirs
+                dependencyDirs
             );
         } catch (err) {
             this.log(`AST dependency candidate search failed: ${err.message}`);
-            return;
+            return [];
         }
         const sources = await Promise.all(
             candidates.map(async (file) => {
@@ -2803,41 +2965,41 @@ class WorkspaceIndex {
             })
         );
         const requests = sources.filter(Boolean);
-        if (requests.length === 0) return;
+        if (requests.length === 0) return [];
         let parsed;
         try {
-            parsed = await this.astPool.parseFiles(requests, 200);
+            const candidateFiles = await this.astPool.parseFiles(requests, 200);
+            parsed = new Map(
+                [...candidateFiles].map(([file, info]) => [
+                    file,
+                    {
+                        ...info,
+                        importPath: this._importPathForFile(file),
+                        externalSource: true,
+                    },
+                ])
+            );
         } catch (err) {
             this.log(`AST dependency parsing failed: ${err.message}`);
-            return;
+            return [];
         }
-        const closure = await this._expandEmbeddedAstPackages(new Set(), parsed, 200);
+        const combined = new Map(receiver.astFiles);
+        for (const [file, info] of parsed) combined.set(file, info);
+        const closure = await this._expandEmbeddedAstPackages(new Set(), combined, 200);
         const aliasExpansion = await this._expandSignatureAliasPackages(
             closure.astFiles,
             [methodName],
             200
         );
         const view = aliasExpansion.view;
-        const { interfaces } = view._merged();
-        for (const interfaceKey of interfaces.keys()) {
-            const declaration = view._interfaceDecls.get(interfaceKey);
-            const info = interfaces.get(interfaceKey);
-            if (!declaration || !info || info.constraint) continue;
-            const resolved = view._resolveInterfaceMethodsCached(interfaceKey, interfaces);
-            if (![...resolved.methods.keys()].some((key) => bareMethodName(key) === methodName)) {
-                continue;
-            }
-            local.consider(
-                interfaceKey,
-                resolved,
-                declaration,
-                true
-            );
-        }
+        const results = view._collectLocalInterfaces(receiver.receiverType, methodName, {
+            receiverFile: receiver.receiverFile,
+        }).results;
         this.log(
             `AST dependency query ${methodName}: ${candidates.length} candidate file(s), ` +
                 `${parsed.size} parsed file(s)`
         );
+        return results;
     }
 
     _dependencyInterfaceCandidates(cacheRoot, methodName, lockedDirs) {
@@ -2850,7 +3012,7 @@ class WorkspaceIndex {
         request = grepInterfaceFilesForMethod(
             cacheRoot,
             methodName,
-            undefined,
+            normalizedDirs.length > 0 ? Number.MAX_SAFE_INTEGER : undefined,
             normalizedDirs
         ).catch((error) => {
             if (this._dependencyCandidateCache.get(key) === request) {
@@ -2859,6 +3021,51 @@ class WorkspaceIndex {
             throw error;
         });
         this._dependencyCandidateCache.set(key, request);
+        return request;
+    }
+
+    _dependencyImplementationCandidates(cacheRoot, methodName, lockedDirs) {
+        const normalizedDirs = [...(lockedDirs || [])].map(path.normalize).sort();
+        const key = `${path.normalize(cacheRoot)}\0${methodName}\0${normalizedDirs.join('\0')}`;
+        if (this._dependencyImplementationCandidateCache.has(key)) {
+            return this._dependencyImplementationCandidateCache.get(key);
+        }
+        let request;
+        request = grepImplementationFilesForMethod(
+            cacheRoot,
+            methodName,
+            normalizedDirs.length > 0 ? Number.MAX_SAFE_INTEGER : undefined,
+            normalizedDirs
+        ).catch((error) => {
+            if (this._dependencyImplementationCandidateCache.get(key) === request) {
+                this._dependencyImplementationCandidateCache.delete(key);
+            }
+            throw error;
+        });
+        this._dependencyImplementationCandidateCache.set(key, request);
+        return request;
+    }
+
+    _dependencyTypeReferenceCandidates(cacheRoot, typeNames, lockedDirs) {
+        const normalizedDirs = [...(lockedDirs || [])].map(path.normalize).sort();
+        const names = [...new Set(typeNames)].sort();
+        const key = `${path.normalize(cacheRoot)}\0${names.join(',')}\0${normalizedDirs.join('\0')}`;
+        if (this._dependencyTypeReferenceCandidateCache.has(key)) {
+            return this._dependencyTypeReferenceCandidateCache.get(key);
+        }
+        let request;
+        request = grepGoFilesForTypeNames(
+            cacheRoot,
+            names,
+            normalizedDirs.length > 0 ? Number.MAX_SAFE_INTEGER : undefined,
+            normalizedDirs
+        ).catch((error) => {
+            if (this._dependencyTypeReferenceCandidateCache.get(key) === request) {
+                this._dependencyTypeReferenceCandidateCache.delete(key);
+            }
+            throw error;
+        });
+        this._dependencyTypeReferenceCandidateCache.set(key, request);
         return request;
     }
 
@@ -2874,9 +3081,10 @@ class WorkspaceIndex {
      * Find all concrete types that implement the given interface (by signature).
      * @param {string} interfaceName
      * @param {string} [interfaceFile] source file that identifies the package
+     * @param {{includeExternal?:boolean}} [opts]
      * @returns {{name:string, file:string, line:number}[]}
      */
-    findImplementations(interfaceName, interfaceFile) {
+    findImplementations(interfaceName, interfaceFile, opts) {
         const { interfaces, types } = this._merged();
         const interfaceKey = this._findInterfaceKey(interfaceName, interfaceFile);
         if (!interfaceKey) return [];
@@ -2894,15 +3102,28 @@ class WorkspaceIndex {
         // loose matching is package-aware (see looseSignatureEqual): it no longer
         // equates two different packages' same-named types, so it does not
         // reintroduce cross-package false positives.
-        const strict = this._collectImplementations(resolved, types, interfaces, false);
-        const loose = this._collectImplementations(resolved, types, interfaces, true);
+        const includeExternal = !!(opts && opts.includeExternal);
+        const strict = this._collectImplementations(
+            resolved,
+            types,
+            interfaces,
+            false,
+            includeExternal
+        );
+        const loose = this._collectImplementations(
+            resolved,
+            types,
+            interfaces,
+            true,
+            includeExternal
+        );
         return dedupeResults([...strict, ...loose]);
     }
 
-    _collectImplementations(resolved, types, interfaces, loose) {
+    _collectImplementations(resolved, types, interfaces, loose, includeExternal) {
         const results = [];
         for (const [typeKey, typeInfo] of types) {
-            if (typeInfo.interfaceAlias || typeInfo.externalSource) continue;
+            if (typeInfo.interfaceAlias || (typeInfo.externalSource && !includeExternal)) continue;
             const methodSets = this._resolveTypeMethodSetsCached(typeKey, types);
             const valueImplements = this._interfaceSatisfiedBy(
                 resolved,
@@ -2941,6 +3162,7 @@ class WorkspaceIndex {
                         name: valueImplements ? typeInfo.name : `*${typeInfo.name}`,
                         file: decl.file,
                         line: decl.line,
+                        external: !!typeInfo.externalSource,
                     });
                 }
             }
@@ -2954,9 +3176,10 @@ class WorkspaceIndex {
      * @param {string} interfaceName
      * @param {string} methodName
      * @param {string} [interfaceFile] source file that identifies the package
+     * @param {{includeExternal?:boolean}} [opts]
      * @returns {{name:string, file:string, line:number, signature:string}[]}
      */
-    findMethodImplementations(interfaceName, methodName, interfaceFile) {
+    findMethodImplementations(interfaceName, methodName, interfaceFile, opts) {
         const { interfaces, types } = this._merged();
         const interfaceKey = this._findInterfaceKey(interfaceName, interfaceFile);
         if (!interfaceKey) return [];
@@ -2971,13 +3194,15 @@ class WorkspaceIndex {
         // pass; skipping loose whenever strict found anything dropped those
         // implementations. Package-aware loose matching (looseSignatureEqual)
         // keeps this from reintroducing cross-package false positives.
+        const includeExternal = !!(opts && opts.includeExternal);
         const strict = this._collectMethodImplementations(
             resolved,
             wantSig,
             methodKey,
             types,
             interfaces,
-            false
+            false,
+            includeExternal
         );
         const loose = this._collectMethodImplementations(
             resolved,
@@ -2985,12 +3210,21 @@ class WorkspaceIndex {
             methodKey,
             types,
             interfaces,
-            true
+            true,
+            includeExternal
         );
         return dedupeResults([...strict, ...loose]);
     }
 
-    _collectMethodImplementations(resolved, wantSig, methodKey, types, interfaces, loose) {
+    _collectMethodImplementations(
+        resolved,
+        wantSig,
+        methodKey,
+        types,
+        interfaces,
+        loose,
+        includeExternal
+    ) {
         const results = [];
         const sigMatches = (a, b) => {
             if (a === b) return true;
@@ -2999,7 +3233,7 @@ class WorkspaceIndex {
             return loose && looseSignatureEqual(a, b);
         };
         for (const [typeKey, typeInfo] of types) {
-            if (typeInfo.interfaceAlias || typeInfo.externalSource) continue;
+            if (typeInfo.interfaceAlias || (typeInfo.externalSource && !includeExternal)) continue;
             const methodSets = this._resolveTypeMethodSetsCached(typeKey, types);
             const implementsWith = (methods) => {
                 const sig = methods.get(methodKey);
@@ -3037,6 +3271,7 @@ class WorkspaceIndex {
                     name: valueImplements ? typeInfo.name : `*${typeInfo.name}`,
                     ...loc,
                     signature: sig,
+                    external: !!typeInfo.externalSource,
                 });
             }
         }
@@ -3204,18 +3439,21 @@ class WorkspaceIndex {
      *
      * Search is restricted to the module versions locked by the project's
      * go.mod (resolved to their exact cache directories), so other cached
-     * versions of the same module are never returned. If no go.mod / locked
-     * directories can be resolved, it falls back to searching the whole cache.
+     * versions of the same module are never returned. If the user explicitly
+     * configured a dependency root, that root remains searchable for projects
+     * without a go.mod; an auto-detected global cache is never scanned without
+     * a resolvable lock set.
      */
     async _searchDependencyInterfaces(cacheRoot, receiverType, methodName, mySig, typeMethods, consider) {
-        const lockedDirs = this._resolveLockedDirs(cacheRoot);
+        const dependencyDirs = this._dependencySearchDirs(cacheRoot);
+        if (dependencyDirs === null) return;
 
         let candidates;
         try {
             candidates = await this._dependencyInterfaceCandidates(
                 cacheRoot,
                 methodName,
-                lockedDirs
+                dependencyDirs
             );
         } catch (err) {
             this.log(`Dependency search failed: ${err.message}`);
@@ -3223,9 +3461,9 @@ class WorkspaceIndex {
         }
         this.log(
             `Dependency search: ${candidates.length} candidate file(s)` +
-                (lockedDirs.length > 0
-                    ? ` in ${lockedDirs.length} locked module dir(s)`
-                    : ` across ${cacheRoot} (no go.mod lock resolved)`)
+                (dependencyDirs.length > 0
+                    ? ` in ${dependencyDirs.length} locked module dir(s)`
+                    : ` below explicitly configured root ${cacheRoot}`)
         );
 
         for (const file of candidates) {
@@ -3250,7 +3488,7 @@ class WorkspaceIndex {
     /**
      * Resolve the exact module-cache directories locked by the go.mod(s) of the
      * indexed project roots. De-duplicated. Returns [] if none can be resolved
-     * (caller then falls back to searching the whole cache).
+     * (callers then skip dependency search).
      * @param {string} cacheRoot
      * @returns {string[]}
      */
@@ -3266,6 +3504,25 @@ class WorkspaceIndex {
             for (const d of resolved.dirs) dirs.add(d);
         }
         return [...dirs];
+    }
+
+    /**
+     * Return exact locked module directories, or [] to search a dependency root
+     * the user explicitly configured. null means there is no safe search bound.
+     * @param {string} cacheRoot
+     * @returns {string[]|null}
+     */
+    _dependencySearchDirs(cacheRoot) {
+        const lockedDirs = this._resolveLockedDirs(cacheRoot);
+        if (lockedDirs.length > 0) return lockedDirs;
+
+        const configured = this.getConfig().goModCache;
+        if (!configured || !configured.trim()) return null;
+        try {
+            return path.resolve(configured.trim()) === path.resolve(cacheRoot) ? [] : null;
+        } catch (_) {
+            return null;
+        }
     }
 
     _findMethodLocation(typeKey, methodKey, mode) {
@@ -3339,6 +3596,8 @@ class WorkspaceIndex {
         this._externalImportDirectoryCache.clear();
         this._externalPackageCache.clear();
         this._dependencyCandidateCache.clear();
+        this._dependencyImplementationCandidateCache.clear();
+        this._dependencyTypeReferenceCandidateCache.clear();
         for (const state of this._candidateCacheStates.values()) {
             if (state.writeTimer) clearTimeout(state.writeTimer);
             state.writeTimer = null;
@@ -3393,6 +3652,8 @@ class WorkspaceIndex {
         this._externalImportDirectoryCache.clear();
         this._externalPackageCache.clear();
         this._dependencyCandidateCache.clear();
+        this._dependencyImplementationCandidateCache.clear();
+        this._dependencyTypeReferenceCandidateCache.clear();
         this._builds.clear();
         this._builtRoots.clear();
     }

@@ -56,6 +56,18 @@ async function main() {
         byInline.some((r) => r.name === 'ExtendedInlineExecutor')
     );
 
+    console.log('\n== explicit dependency root works without a project go.mod ==');
+    const dependencyImplementations = await idx.findImplementationsAst(
+        'ExplicitDependencyService',
+        path.join(projRoot, 'service.go')
+    );
+    const dependencyImplementation = dependencyImplementations.find(
+        (result) => result.name === '*ExplicitDependencyWorker'
+    );
+    assert('finds an implementation below the explicitly configured dependency root', !!dependencyImplementation);
+    assert('dependency implementation is marked external', dependencyImplementation && dependencyImplementation.external);
+    assert('dependency implementation points into the configured root', dependencyImplementation && dependencyImplementation.file.startsWith(modCache));
+
     console.log('\n== dependency search disabled -> no external results ==');
     const idx2 = new WorkspaceIndex(
         () => ({ ...cfg(), searchDependencies: false }),

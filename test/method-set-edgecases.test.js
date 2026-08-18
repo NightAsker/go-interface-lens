@@ -20,15 +20,44 @@ async function main() {
     const root = path.join(tmp, 'project');
     const apiDir = path.join(root, 'api');
     const implDir = path.join(root, 'impl');
+    const pbDir = path.join(root, 'pb');
     const promotionDir = path.join(root, 'promotion');
+    const protoDir = path.join(root, 'proto');
+    const typesDir = path.join(root, 'types');
     fs.mkdirSync(apiDir, { recursive: true });
     fs.mkdirSync(implDir, { recursive: true });
+    fs.mkdirSync(pbDir, { recursive: true });
     fs.mkdirSync(promotionDir, { recursive: true });
+    fs.mkdirSync(protoDir, { recursive: true });
+    fs.mkdirSync(typesDir, { recursive: true });
     fs.writeFileSync(path.join(root, 'go.mod'), 'module example.com/methodsets\n\ngo 1.23\n');
+
+    fs.writeFileSync(path.join(protoDir, 'message.go'), 'package proto\ntype MessageExt struct{}\n');
+    fs.writeFileSync(
+        path.join(typesDir, 'message.go'),
+        [
+            'package types',
+            'import "example.com/methodsets/proto"',
+            'type MessageExt struct {',
+            '    proto.MessageExt',
+            '    Consumer int',
+            '}',
+        ].join('\n')
+    );
+    fs.writeFileSync(
+        path.join(pbDir, 'alias.go'),
+        [
+            'package pb',
+            'import "example.com/methodsets/types"',
+            'type ConsumeMessage = types.MessageExt',
+        ].join('\n')
+    );
 
     const interfaceFile = path.join(apiDir, 'contracts.go');
     const interfaceSource = [
         'package api',
+        'import "context"',
+        'import "example.com/methodsets/types"',
         'type Sealed interface {',
         '    hidden()',
         '    Visible()',
@@ -39,6 +68,9 @@ async function main() {
         'type Workflow interface { Step(); Finish() }',
         'type Stepper interface { Step() }',
         'type Runner interface { Run() }',
+        'type IHandler interface {',
+        '    HandleMessage(context.Context, *types.MessageExt) error',
+        '}',
     ];
     fs.writeFileSync(interfaceFile, interfaceSource.join('\n'));
 
@@ -47,13 +79,19 @@ async function main() {
         implementationFile,
         [
             'package impl',
+            'import "context"',
             'import "example.com/methodsets/api"',
+            'import "example.com/methodsets/pb"',
             'type Direct struct{}',
             'func (Direct) hidden() {}',
             'func (Direct) Visible() {}',
             'type Embedded struct { api.Carrier }',
             'type Partial struct{}',
             'func (Partial) Step() {}',
+            'type MessageSyncHandler struct{}',
+            'func (*MessageSyncHandler) HandleMessage(ctx context.Context, msg *pb.ConsumeMessage) error {',
+            '    return nil',
+            '}',
         ].join('\n')
     );
 
@@ -136,6 +174,22 @@ async function main() {
     eq('a matching anchor method is insufficient when another method is missing', partialInterfaces, [
         'Stepper',
     ]);
+
+    console.log('\n== reverse lookup expands aliases from the receiver signature ==');
+    const handlers = await index.findImplementationsAst('IHandler', interfaceFile);
+    assert(
+        'forward lookup resolves a cross-package alias in the implementation signature',
+        handlers.some((result) => result.name === '*MessageSyncHandler')
+    );
+    const handlerInterfaces = await index.findInterfacesAst(
+        'MessageSyncHandler',
+        'HandleMessage',
+        { receiverFile: implementationFile }
+    );
+    assert(
+        'reverse lookup resolves the same cross-package alias from the receiver signature',
+        handlerInterfaces.some((result) => result.name === 'IHandler')
+    );
 
     console.log('\n== promoted selectors honor fields, depth, and ambiguity ==');
     const runners = (await index.findImplementationsAst('Runner', interfaceFile))

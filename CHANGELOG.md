@@ -2,6 +2,26 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [1.2.7] - 2026-08-18
+
+### Added
+
+- Search `go.mod`-locked dependency packages for concrete interface
+  implementations, including method-level navigation and promoted methods from
+  embedded dependency types.
+- Preserve dependency search for projects without a `go.mod` when a dependency
+  root is explicitly configured, without scanning an auto-detected global cache.
+
+### Changed
+
+- Always merge matching dependency interfaces into explicit `goto interface`
+  results, even when matching workspace interfaces also exist.
+
+### Fixed
+
+- Resolve cross-package alias chains symmetrically when reverse navigation
+  compares a workspace receiver with an interface declared in a dependency.
+
 ## [1.2.6] - 2026-08-18
 
 ### Fixed
