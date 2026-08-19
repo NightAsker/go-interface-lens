@@ -4,6 +4,30 @@ All notable changes to Go Interface Lens are documented here.
 
 ## Unreleased
 
+## [2.0.2] - 2026-08-19
+
+### Changed
+
+- Prewarm workspace and locked-dependency relationships in bounded batches,
+  preserving complete alias, embedding, generic, and method-set resolution
+  while avoiding a workspace-wide retained AST view.
+- Release batch AST entries, cached dependency source text, cache-pack memory,
+  and excess parser workers as soon as their relationship results are merged.
+- Rebuild invalidated relationship maps through the same bounded pipeline and
+  retain only the completed forward/reverse indexes after prewarming.
+- Bound parser concurrency by cgroup memory headroom in addition to available
+  CPUs, and expose dependency ripgrep concurrency as a setting that defaults to
+  eight threads.
+- Log prewarm stage memory watermarks, peak/final RSS and heap usage, worker
+  counts, batch sizes, and memory collection/recycle activity.
+
+### Fixed
+
+- Apply configured generated/test-file exclusions consistently while indexing
+  workspace and dependency packages.
+- Keep dependency candidates that rely on aliases declared in another file
+  when prefiltering packages for exact AST verification.
+
 ## [2.0.1] - 2026-08-18
 
 ### Changed

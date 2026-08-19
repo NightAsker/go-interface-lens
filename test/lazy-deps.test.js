@@ -37,6 +37,7 @@ async function main() {
     const anchorNoiseDir = path.join(modCache, 'example.com', 'anchornoise@v1.0.0');
     const ordinaryRefDir = path.join(modCache, 'example.com', 'ordinaryref@v1.0.0');
     const callNoiseDir = path.join(modCache, 'example.com', 'callnoise@v1.0.0');
+    const aliasImplDir = path.join(modCache, 'example.com', 'aliasimpl@v1.0.0');
     const goRoot = path.join(tmp, 'goroot');
     const standardDir = path.join(goRoot, 'src', 'standard', 'sort');
     fs.mkdirSync(root, { recursive: true });
@@ -50,10 +51,11 @@ async function main() {
     fs.mkdirSync(anchorNoiseDir, { recursive: true });
     fs.mkdirSync(ordinaryRefDir, { recursive: true });
     fs.mkdirSync(callNoiseDir, { recursive: true });
+    fs.mkdirSync(aliasImplDir, { recursive: true });
     fs.mkdirSync(standardDir, { recursive: true });
     fs.writeFileSync(
         path.join(root, 'go.mod'),
-        'module example.com/project\n\ngo 1.22\n\nrequire (\n\texample.com/dep v1.0.0\n\texample.com/aliasdep v1.0.0\n\texample.com/depimpl v1.0.0\n\texample.com/iface v1.0.0\n\texample.com/wrapper v1.0.0\n\texample.com/noisealias v1.0.0\n\texample.com/anchornoise v1.0.0\n\texample.com/ordinaryref v1.0.0\n\texample.com/callnoise v1.0.0\n)\n'
+        'module example.com/project\n\ngo 1.22\n\nrequire (\n\texample.com/dep v1.0.0\n\texample.com/aliasdep v1.0.0\n\texample.com/depimpl v1.0.0\n\texample.com/iface v1.0.0\n\texample.com/wrapper v1.0.0\n\texample.com/noisealias v1.0.0\n\texample.com/anchornoise v1.0.0\n\texample.com/ordinaryref v1.0.0\n\texample.com/callnoise v1.0.0\n\texample.com/aliasimpl v1.0.0\n)\n'
     );
     const implementationFile = path.join(root, 'impl.go');
     fs.writeFileSync(
@@ -88,6 +90,7 @@ async function main() {
     fs.writeFileSync(path.join(anchorNoiseDir, 'go.mod'), 'module example.com/anchornoise\n\ngo 1.22\n');
     fs.writeFileSync(path.join(ordinaryRefDir, 'go.mod'), 'module example.com/ordinaryref\n\ngo 1.22\n');
     fs.writeFileSync(path.join(callNoiseDir, 'go.mod'), 'module example.com/callnoise\n\ngo 1.22\n');
+    fs.writeFileSync(path.join(aliasImplDir, 'go.mod'), 'module example.com/aliasimpl\n\ngo 1.22\n');
     fs.writeFileSync(path.join(noiseAliasDir, 'noise.go'), 'package noisealias\ntype Payload struct{}\n');
     for (let i = 0; i < 8; i++) {
         fs.writeFileSync(
@@ -111,6 +114,18 @@ async function main() {
             '    RareDep()',
             '}',
         ].join('\n') + '\n'
+    );
+    fs.writeFileSync(
+        path.join(aliasImplDir, 'handler.go'),
+        [
+            'package aliasimpl',
+            'type CrossFileAliasHandler struct{}',
+            'func (CrossFileAliasHandler) AliasOnly(value LocalAlias) {}',
+        ].join('\n') + '\n'
+    );
+    fs.writeFileSync(
+        path.join(aliasImplDir, 'alias.go'),
+        'package aliasimpl\ntype LocalAlias = string\n'
     );
     fs.writeFileSync(
         path.join(aliasDepDir, 'alias.go'),
@@ -214,7 +229,10 @@ async function main() {
     });
     const previousGoRoot = process.env.GOROOT;
     process.env.GOROOT = goRoot;
-    const index = new WorkspaceIndex(config, () => {}, { cacheDir: path.join(tmp, 'cache') });
+    const index = new WorkspaceIndex(config, () => {}, {
+        cacheDir: path.join(tmp, 'cache'),
+        prewarmDependencyBatchPackages: 1,
+    });
     await index.ensureBuilt(root);
 
     console.log('== lazy AST dependency filtering ==');
@@ -260,6 +278,7 @@ async function main() {
         '    DependencyOnly() error',
         '}',
         'type AnchorContract interface { Common(); RareDep() }',
+        'type CrossFileAliasContract interface { AliasOnly(value string) }',
         'type EmbeddedExternal struct { dep.External }',
         'type EmbeddedExternalAlias struct { dep.ExternalAlias }',
         'type EmbeddedSort struct { sort.Interface }',
@@ -276,7 +295,14 @@ async function main() {
 
     const dependencyPrewarmPriorities = [];
     const dependencyPrewarmDirectories = [];
+    let aliasDiscoverySemanticViews = 0;
+    let workspaceAstInFlight = false;
+    let dependencyScanOverlappedWorkspaceAst = false;
     const loadExternalDirectoryForPrewarm = index._loadExternalDirectory.bind(index);
+    const createAstViewForPrewarm = index._createAstView.bind(index);
+    const parseAstPackagesForPrewarm = index._parseAstPackages.bind(index);
+    const potentialSignatureAliasImports = index._potentialSignatureAliasImports.bind(index);
+    let discoveringAliasImports = false;
     const batchDependencyCandidates = index._dependencyImplementationBatchCandidates;
     const perInterfaceDependencyContext = index._buildDependencyImplementationAstContext;
     const individualImplementationCandidates = index._dependencyImplementationCandidates;
@@ -292,7 +318,28 @@ async function main() {
         dependencyPrewarmPriorities.push(priority);
         return loadExternalDirectoryForPrewarm(directory, importPath, priority);
     };
+    index._createAstView = (...args) => {
+        if (discoveringAliasImports) aliasDiscoverySemanticViews += 1;
+        return createAstViewForPrewarm(...args);
+    };
+    index._potentialSignatureAliasImports = (...args) => {
+        discoveringAliasImports = true;
+        try {
+            return potentialSignatureAliasImports(...args);
+        } finally {
+            discoveringAliasImports = false;
+        }
+    };
+    index._parseAstPackages = async (...args) => {
+        workspaceAstInFlight = true;
+        try {
+            return await parseAstPackagesForPrewarm(...args);
+        } finally {
+            workspaceAstInFlight = false;
+        }
+    };
     index._dependencyImplementationBatchCandidates = async (...args) => {
+        if (workspaceAstInFlight) dependencyScanOverlappedWorkspaceAst = true;
         batchCandidateScans += 1;
         for (const methodName of args[1]) batchScannedMethods.add(methodName);
         return batchDependencyCandidates.apply(index, args);
@@ -310,20 +357,34 @@ async function main() {
         await index.prewarmReverseInterfaces();
     } finally {
         index._loadExternalDirectory = loadExternalDirectoryForPrewarm;
+        index._createAstView = createAstViewForPrewarm;
+        index._parseAstPackages = parseAstPackagesForPrewarm;
+        index._potentialSignatureAliasImports = potentialSignatureAliasImports;
         index._dependencyImplementationBatchCandidates = batchDependencyCandidates;
         index._buildDependencyImplementationAstContext = perInterfaceDependencyContext;
         index._dependencyImplementationCandidates = individualImplementationCandidates;
         index._dependencyInterfaceCandidates = individualInterfaceCandidates;
     }
     const prewarmStats = index.getReversePrewarmStats();
+    assert(
+        'parsed external packages release retained Go source text',
+        [...index._externalPackageCache.values()].every((entry) => entry.sources === null)
+    );
     eq('all workspace interfaces share one dependency candidate scan', batchCandidateScans, 1);
     eq('prewarm reports one batched dependency scan', prewarmStats.dependencyCandidateScans, 1);
+    assert('dependency relationship prewarm uses multiple bounded batches', prewarmStats.dependencyBatchCount > 1);
+    eq('dependency batches respect their package limit', prewarmStats.maxDependencyBatchPackages, 1);
     assert(
-        'dependency prewarm scans at most one anchor per workspace interface',
-        batchScannedMethods.size <= prewarmStats.workspaceInterfaces
+        'dependency candidate discovery overlaps workspace AST prewarming',
+        dependencyScanOverlappedWorkspaceAst
+    );
+    eq(
+        'alias import discovery does not construct a complete semantic AST view',
+        aliasDiscoverySemanticViews,
+        0
     );
     assert(
-        'single-anchor selection searches the rare method instead of Common',
+        'speculative dependency scan selects one rare anchor per workspace interface',
         batchScannedMethods.has('RareDep') && !batchScannedMethods.has('Common')
     );
     assert(
@@ -337,6 +398,10 @@ async function main() {
     assert(
         'same-named function calls do not load a false dependency package candidate',
         !dependencyPrewarmDirectories.includes(path.normalize(callNoiseDir))
+    );
+    assert(
+        'cross-file aliases remain conservative dependency candidates',
+        dependencyPrewarmDirectories.includes(path.normalize(aliasImplDir))
     );
     assert(
         'type-reference expansion ignores ordinary parameter and expression references',
@@ -409,6 +474,16 @@ async function main() {
     assert(
         'dependency-aware rare anchor still retains the complete implementation',
         anchorImplementations.some((result) => result.name === 'AnchorImpl')
+    );
+    const crossFileAliasImplementations = await index.findImplementationsAst(
+        'CrossFileAliasContract',
+        localInterfaceFile
+    );
+    assert(
+        'dependency prewarm preserves implementations using aliases from another file',
+        crossFileAliasImplementations.some(
+            (result) => result.name === 'CrossFileAliasHandler'
+        )
     );
     eq(
         'prewarmed dependency implementation queries perform no AST reads',

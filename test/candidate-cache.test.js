@@ -82,6 +82,10 @@ async function main() {
     const apiMetadata = second.index._candidateMetadataByFile.get(apiFile);
     assert('cached imports survive serialization', apiMetadata.imports.get('io') === 'io');
     assert('cached embedded references survive serialization', apiMetadata.embeddedReferences.has('io.Reader'));
+    assert(
+        'cached interface method groups preserve dependency prefetch anchors',
+        apiMetadata.interfaceMethodGroups.some((methods) => methods.has('Run'))
+    );
     const implementations = await second.index.findImplementationsAst('Service', apiFile);
     eq('restored candidates still drive precise AST lookup', implementations.map((item) => item.name), ['Impl']);
     second.index.dispose();

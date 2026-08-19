@@ -5,6 +5,10 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
+const DEPENDENCY_METHOD_SCAN_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_DEPENDENCY_SCAN_CONCURRENCY = 8;
+const MAX_DEPENDENCY_SCAN_CONCURRENCY = 32;
+
 /**
  * File discovery for Go sources.
  *
@@ -216,7 +220,7 @@ async function grepImplementationFilesForMethod(root, methodName, maxFiles, sear
  * @param {Iterable<string>} methodNames interface method anchors
  * @param {number} [maxFiles] cap on candidate files
  * @param {string[]} [searchDirs] restrict search to locked module directories
- * @param {{execute?:(cmd:string,args:string[],cwd:string,timeout:number)=>Promise<object>}} [options]
+ * @param {{concurrency?:number,execute?:(cmd:string,args:string[],cwd:string,timeout:number)=>Promise<object>}} [options]
  * @returns {Promise<{files:string[],filesByMethod:Map<string,Set<string>>,complete:boolean,timedOut:boolean,multilineFiles:number}>}
  */
 async function scanDependencyFilesForMethods(root, methodNames, maxFiles, searchDirs, options) {
@@ -234,7 +238,14 @@ async function scanDependencyFilesForMethods(root, methodNames, maxFiles, search
     }
     const rg = findRipgrep();
     const cap = maxFiles || 1000;
-    const args = ['--json', '--glob', '*.go'];
+    const requestedConcurrency = Number.isFinite(options && options.concurrency)
+        ? Math.trunc(options.concurrency)
+        : DEFAULT_DEPENDENCY_SCAN_CONCURRENCY;
+    const concurrency = Math.max(
+        1,
+        Math.min(MAX_DEPENDENCY_SCAN_CONCURRENCY, requestedConcurrency)
+    );
+    const args = ['--json', '--threads', String(concurrency), '--glob', '*.go'];
     const chunkSize = 128;
     for (let start = 0; start < names.length; start += chunkSize) {
         const alternatives = names.slice(start, start + chunkSize).join('|');
@@ -255,7 +266,12 @@ async function scanDependencyFilesForMethods(root, methodNames, maxFiles, search
     const execute = options && options.execute ? options.execute : runExecResult;
     let execution;
     try {
-        execution = await execute(rg || 'rg', args, root, 60000);
+        execution = await execute(
+            rg || 'rg',
+            args,
+            root,
+            DEPENDENCY_METHOD_SCAN_TIMEOUT_MS
+        );
     } catch (error) {
         execution = {
             stdout: error && error.stdout ? String(error.stdout) : '',
@@ -532,6 +548,7 @@ function resolveSearchRoots(documentUri) {
 }
 
 module.exports = {
+    DEFAULT_DEPENDENCY_SCAN_CONCURRENCY,
     listGoFiles,
     resolveSearchRoots,
     findRipgrep,

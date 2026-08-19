@@ -2,7 +2,7 @@
   "name": "go-interface-lens",
   "displayName": "Go Interface Lens",
   "description": "Fast bidirectional CodeLens navigation between Go interfaces and their implementations",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "publisher": "xiaoyao",
   "author": {
     "name": "xiaoyao"
@@ -103,6 +103,13 @@
           "type": "string",
           "default": "",
           "description": "Optional absolute path to the Go module cache. Leave empty to auto-detect via $GOMODCACHE, $GOPATH/pkg/mod, then ~/go/pkg/mod."
+        },
+        "goInterfaceLens.dependencyScanConcurrency": {
+          "type": "integer",
+          "default": 8,
+          "minimum": 1,
+          "maximum": 32,
+          "description": "Number of ripgrep threads used to scan locked dependency source for implementation candidates."
         },
         "goInterfaceLens.astConcurrency": {
           "type": "integer",

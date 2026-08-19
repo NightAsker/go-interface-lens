@@ -1,6 +1,6 @@
 # Go Interface Lens
 
-[![Version](https://img.shields.io/badge/version-2.0.1-blue.svg)](https://github.com/NightAsker/go-interface-lens)
+[![Version](https://img.shields.io/badge/version-2.0.2-blue.svg)](https://github.com/NightAsker/go-interface-lens)
 [![VSCode](https://img.shields.io/badge/VSCode-1.76+-green.svg)](https://code.visualstudio.com/)
 
 一个面向大型 Go 工程的 VS Code / Cursor 接口导航扩展。它在接口、接口方法和具体实现之间提供双向 CodeLens，同时使用轻量候选索引和按需 AST 校验兼顾响应速度与查找准确性。
@@ -105,6 +105,10 @@ WASM、Go grammar WASM 和 MIT 许可证；依赖包里的其他语言 grammar �
 
 查找结果会自动排除配置中的 mock、测试、生成文件和其他不需要的类型。
 
+后台关系预热会按有界批次解析工作区和依赖包。每批关系合并后会释放完整
+AST、依赖源码文本和多余 Worker；完成日志会输出各阶段耗时、RSS/Heap 峰值和
+Worker 水位，便于排查大型工程中的扩展宿主内存压力。
+
 ## 环境要求
 
 - VS Code 1.76+，或兼容 VS Code 扩展的 Cursor 版本。
@@ -118,6 +122,7 @@ WASM、Go grammar WASM 和 MIT 许可证；依赖包里的其他语言 grammar �
 | 配置项 | 默认值 | 作用 |
 | --- | --- | --- |
 | `goInterfaceLens.astConcurrency` | `32` | 候选包 AST Worker 上限，可设置为 `1-32`；实际预热和后台并发按可用 CPU 自适应 |
+| `goInterfaceLens.dependencyScanConcurrency` | `8` | 扫描锁定依赖候选源码时使用的 ripgrep 线程数，可设置为 `1-32` |
 | `goInterfaceLens.excludedFolders` | `mocks, mock, testdata, vendor` | 排除指定目录 |
 | `goInterfaceLens.excludedFilePatterns` | `_mock.go, mock_, .pb.go, _test.go` | 排除文件名中包含指定文本的文件 |
 | `goInterfaceLens.excludedTypePatterns` | `Mock, mock, Stub, Fake` | 排除名称中包含指定文本的类型 |
@@ -129,6 +134,7 @@ WASM、Go grammar WASM 和 MIT 许可证；依赖包里的其他语言 grammar �
 ```json
 {
   "goInterfaceLens.astConcurrency": 32,
+  "goInterfaceLens.dependencyScanConcurrency": 8,
   "goInterfaceLens.searchDependencies": true,
   "goInterfaceLens.goModCache": "",
   "goInterfaceLens.excludedFolders": [

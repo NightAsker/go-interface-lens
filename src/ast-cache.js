@@ -21,6 +21,30 @@ const CACHE_WRITE_CONCURRENCY = 8;
 const CACHE_PACK_ENTRIES = 64;
 const MAX_MEMORY_PACKS = 8;
 const BACKGROUND_PRIORITY_MAX = 10;
+const DEFAULT_WORKER_MEMORY_BYTES = 128 * 1024 * 1024;
+const DEFAULT_MEMORY_RESERVE_BYTES = 512 * 1024 * 1024;
+
+function readMemoryNumber(file) {
+    try {
+        const value = fs.readFileSync(file, 'utf8').trim();
+        if (!value || value === 'max') return null;
+        const parsed = Number(value);
+        return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function readCgroupMemoryState() {
+    const v2Limit = readMemoryNumber('/sys/fs/cgroup/memory.max');
+    const v2Current = readMemoryNumber('/sys/fs/cgroup/memory.current');
+    if (v2Limit !== null) return { limitBytes: v2Limit, currentBytes: v2Current || 0 };
+
+    const v1Limit = readMemoryNumber('/sys/fs/cgroup/memory/memory.limit_in_bytes');
+    const v1Current = readMemoryNumber('/sys/fs/cgroup/memory/memory.usage_in_bytes');
+    if (v1Limit === null || v1Limit >= Number.MAX_SAFE_INTEGER / 2) return null;
+    return { limitBytes: v1Limit, currentBytes: v1Current || 0 };
+}
 
 function availableParallelism() {
     if (typeof os.availableParallelism === 'function') return os.availableParallelism();
@@ -37,12 +61,49 @@ class AstWorkerPool {
         const parallelism = Number.isFinite(opts.parallelism)
             ? Math.max(1, Math.trunc(opts.parallelism))
             : availableParallelism();
+        const detectedMemory = readCgroupMemoryState();
+        const memoryLimitBytes = Number.isFinite(opts.memoryLimitBytes)
+            ? Math.max(1, opts.memoryLimitBytes)
+            : detectedMemory && detectedMemory.limitBytes;
+        const memoryCurrentBytes = Number.isFinite(opts.memoryCurrentBytes)
+            ? Math.max(0, opts.memoryCurrentBytes)
+            : detectedMemory && detectedMemory.currentBytes;
+        const workerMemoryBytes = Number.isFinite(opts.workerMemoryBytes)
+            ? Math.max(1, opts.workerMemoryBytes)
+            : DEFAULT_WORKER_MEMORY_BYTES;
+        const memoryReserveBytes = Number.isFinite(opts.memoryReserveBytes)
+            ? Math.max(0, opts.memoryReserveBytes)
+            : DEFAULT_MEMORY_RESERVE_BYTES;
+        const memoryConcurrency = memoryLimitBytes
+            ? Math.max(
+                  1,
+                  Math.floor(
+                      Math.max(
+                          workerMemoryBytes,
+                          memoryLimitBytes - (memoryCurrentBytes || 0) - memoryReserveBytes
+                      ) / workerMemoryBytes
+                  )
+              )
+            : MAX_AST_CONCURRENCY;
         // availableParallelism accounts for container CPU quotas. Keep a third
         // of the available CPUs free for the extension host, editor, and OS.
         this.effectiveConcurrency = Math.max(
             1,
-            Math.min(this.concurrency, Math.floor(parallelism * CPU_CONCURRENCY_RATIO))
+            Math.min(
+                this.concurrency,
+                Math.floor(parallelism * CPU_CONCURRENCY_RATIO),
+                memoryConcurrency
+            )
         );
+        this.memoryState = memoryLimitBytes
+            ? {
+                  limitBytes: memoryLimitBytes,
+                  currentBytes: memoryCurrentBytes || 0,
+                  reserveBytes: memoryReserveBytes,
+                  workerBytes: workerMemoryBytes,
+                  concurrency: memoryConcurrency,
+              }
+            : null;
         const requestedWarmConcurrency = Number.isFinite(opts.warmConcurrency)
             ? Math.trunc(opts.warmConcurrency)
             : this.effectiveConcurrency;
@@ -50,22 +111,7 @@ class AstWorkerPool {
             1,
             Math.min(this.effectiveConcurrency, requestedWarmConcurrency)
         );
-        // Background prewarming stays inside the already-warmed baseline and
-        // has its own cap so the remaining workers are available to foreground
-        // queries without waiting for background parser jobs.
-        this.backgroundConcurrency = Math.max(
-            1,
-            Math.min(
-                DEFAULT_BACKGROUND_CONCURRENCY,
-                this.warmConcurrency,
-                Math.floor(this.warmConcurrency * BACKGROUND_CONCURRENCY_RATIO)
-            )
-        );
-        this.foregroundReserve = this.effectiveConcurrency - this.backgroundConcurrency;
-        this.backgroundIOConcurrency = Math.max(
-            this.backgroundConcurrency,
-            Math.min(16, this.effectiveConcurrency * 2)
-        );
+        this._updateBackgroundLimits();
         this.idleTimeoutMs = Number.isFinite(opts.idleTimeoutMs)
             ? Math.max(0, Math.trunc(opts.idleTimeoutMs))
             : DEFAULT_IDLE_TIMEOUT_MS;
@@ -113,6 +159,24 @@ class AstWorkerPool {
             maxActive: 0,
             maxWorkers: 0,
         };
+    }
+
+    _updateBackgroundLimits() {
+        // Background prewarming stays inside the warmed baseline and leaves
+        // capacity for foreground navigation requests.
+        this.backgroundConcurrency = Math.max(
+            1,
+            Math.min(
+                DEFAULT_BACKGROUND_CONCURRENCY,
+                this.warmConcurrency,
+                Math.floor(this.warmConcurrency * BACKGROUND_CONCURRENCY_RATIO)
+            )
+        );
+        this.foregroundReserve = this.effectiveConcurrency - this.backgroundConcurrency;
+        this.backgroundIOConcurrency = Math.max(
+            this.backgroundConcurrency,
+            Math.min(16, this.effectiveConcurrency * 2)
+        );
     }
 
     async _load() {
@@ -336,6 +400,48 @@ class AstWorkerPool {
             if (!state.ready) state.resolveReady(false);
             state.worker.terminate();
         }
+    }
+
+    async shrinkTo(target) {
+        const requested = Number.isFinite(target) ? Math.trunc(target) : 1;
+        this.warmConcurrency = Math.max(1, Math.min(this.effectiveConcurrency, requested));
+        this._updateBackgroundLimits();
+        if (this.disposed || this.stats.active !== 0 || this.queue.length !== 0) {
+            this._scheduleShrink();
+            return this.workers.length;
+        }
+        const retiring = this.workers.slice(this.warmConcurrency);
+        this.workers = this.workers.slice(0, this.warmConcurrency);
+        await Promise.all(
+            retiring.map((state) => {
+                state.retiring = true;
+                if (!state.ready) state.resolveReady(false);
+                return state.worker.terminate();
+            })
+        );
+        return this.workers.length;
+    }
+
+    async recycleIdleWorkers() {
+        if (this.disposed || this.stats.active !== 0 || this.queue.length !== 0) return false;
+        const retiring = this.workers;
+        this.workers = [];
+        await Promise.all(
+            retiring.map((state) => {
+                state.retiring = true;
+                if (!state.ready) state.resolveReady(false);
+                return state.worker.terminate();
+            })
+        );
+        return retiring.length > 0;
+    }
+
+    releaseFiles(files) {
+        for (const file of files || []) this.memory.delete(path.normalize(file));
+    }
+
+    releasePackMemory() {
+        this.packMemory.clear();
     }
 
     _spawnWorker() {
@@ -868,4 +974,7 @@ module.exports = {
     DEFAULT_MEMORY_CACHE_ENTRIES,
     DEFAULT_DISK_CACHE_ENTRIES,
     DEFAULT_DISK_CACHE_BYTES,
+    DEFAULT_WORKER_MEMORY_BYTES,
+    DEFAULT_MEMORY_RESERVE_BYTES,
+    readCgroupMemoryState,
 };

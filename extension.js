@@ -4,7 +4,10 @@ const vscode = require('vscode');
 const path = require('path');
 
 const { WorkspaceIndex } = require('./src/indexer');
-const { resolveSearchRoots } = require('./src/search');
+const {
+    resolveSearchRoots,
+    DEFAULT_DEPENDENCY_SCAN_CONCURRENCY,
+} = require('./src/search');
 const { parseGoFile } = require('./src/ast');
 const { DEFAULT_AST_CONCURRENCY } = require('./src/ast-cache');
 const { initializeGoParser } = require('./src/tree-sitter-runtime');
@@ -29,6 +32,10 @@ function getConfiguration() {
         searchDependencies: config.get('searchDependencies', true),
         goModCache: config.get('goModCache', ''),
         astConcurrency: config.get('astConcurrency', DEFAULT_AST_CONCURRENCY),
+        dependencyScanConcurrency: config.get(
+            'dependencyScanConcurrency',
+            DEFAULT_DEPENDENCY_SCAN_CONCURRENCY
+        ),
     };
 }
 

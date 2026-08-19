@@ -57,6 +57,17 @@ async function main() {
     eq('configured concurrency remains an adaptive worker ceiling', configuredCeiling.warmConcurrency, 6);
     eq('configured ceiling keeps a proportional background lane', configuredCeiling.backgroundConcurrency, 4);
     configuredCeiling.dispose();
+    const memoryBound = new AstWorkerPool({
+        concurrency: 32,
+        parallelism: 64,
+        memoryLimitBytes: 2 * 1024 * 1024 * 1024,
+        memoryCurrentBytes: 1024 * 1024 * 1024,
+        workerMemoryBytes: 128 * 1024 * 1024,
+        memoryReserveBytes: 512 * 1024 * 1024,
+    });
+    eq('cgroup memory headroom bounds the effective worker count', memoryBound.effectiveConcurrency, 4);
+    eq('memory-bounded warmup uses the same safe ceiling', memoryBound.warmConcurrency, 4);
+    memoryBound.dispose();
     const maximum = new AstWorkerPool({ concurrency: 100, parallelism: 64 });
     eq('worker concurrency is capped at 32', maximum.concurrency, 32);
     eq('CPU-derived warm concurrency is capped at 32', maximum.warmConcurrency, 32);
@@ -275,6 +286,17 @@ async function main() {
     await new Promise((resolve) => setTimeout(resolve, 50));
     eq('idle adaptive workers shrink back to the warm baseline', adaptive.workers.length, 2);
     adaptive.dispose();
+
+    const shrinkable = new AstWorkerPool({
+        concurrency: 4,
+        warmConcurrency: 4,
+        parallelism: 8,
+    });
+    eq('explicit warmup starts the full prewarm worker set', await shrinkable.warmup(), 4);
+    await shrinkable.shrinkTo(1);
+    eq('post-prewarm shrink terminates idle workers immediately', shrinkable.workers.length, 1);
+    eq('future background work keeps the smaller idle baseline', shrinkable.warmConcurrency, 1);
+    shrinkable.dispose();
 
     await first.parseFile(files[0], undefined, 100);
     assert('second query hits memory cache', first.stats.memoryHits >= 1);

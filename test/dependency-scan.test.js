@@ -15,6 +15,7 @@ Module._resolveFilename = function (request, ...rest) {
 const { WorkspaceIndex } = require('../src/indexer');
 const { scanDependencyFilesForMethods } = require('../src/search');
 const { assert, eq, done } = require('./harness');
+const manifest = require('../package.json');
 
 async function main() {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'go-interface-dependency-scan-'));
@@ -94,19 +95,40 @@ async function main() {
             lines: { text: 'func (Direct) DirectMethod() {}\n' },
         },
     });
+    let dependencyScanTimeout = 0;
+    let dependencyScanArgs = [];
     const incomplete = await scanDependencyFilesForMethods(
         modCache,
         ['DirectMethod'],
         100,
         [depDir],
         {
-            execute: async () => ({
-                stdout: partialMessage,
-                complete: false,
-                timedOut: true,
-                error: new Error('timed out'),
-            }),
+            concurrency: 3,
+            execute: async (_command, args, _cwd, timeout) => {
+                dependencyScanTimeout = timeout;
+                dependencyScanArgs = args;
+                return {
+                    stdout: partialMessage,
+                    complete: false,
+                    timedOut: true,
+                    error: new Error('timed out'),
+                };
+            },
         }
+    );
+    eq('dependency candidate scan allows up to ten minutes', dependencyScanTimeout, 600000);
+    const threadsArg = dependencyScanArgs.indexOf('--threads');
+    eq(
+        'configured dependency scan concurrency reaches ripgrep',
+        dependencyScanArgs[threadsArg + 1],
+        '3'
+    );
+    eq(
+        'dependency scan concurrency defaults to eight in the extension manifest',
+        manifest.contributes.configuration.properties[
+            'goInterfaceLens.dependencyScanConcurrency'
+        ].default,
+        8
     );
     assert('partial stdout is marked incomplete', incomplete.complete === false);
     assert('timeout metadata survives candidate parsing', incomplete.timedOut === true);

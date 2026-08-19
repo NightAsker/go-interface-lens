@@ -101,7 +101,12 @@ async function main() {
             astConcurrency: 4,
         }),
         (message) => logs.push(message),
-        { cacheDir: path.join(tmp, 'cache') }
+        {
+            cacheDir: path.join(tmp, 'cache'),
+            prewarmBatchFiles: 4,
+            postPrewarmWorkers: 1,
+            memorySampleIntervalMs: 5,
+        }
     );
     await index.ensureBuilt(root);
 
@@ -118,6 +123,17 @@ async function main() {
         warmed.implementationRelationships >= 2
     );
     eq('prewarm builds forward and reverse maps in one relationship pass', warmed.relationshipPasses, 1);
+    assert('workspace prewarm uses multiple bounded batches', warmed.workspaceBatchCount > 1);
+    assert(
+        'every workspace batch respects the configured input-file limit',
+        warmed.maxWorkspaceBatchInputFiles <= 4
+    );
+    eq('completed prewarm does not retain parsed AST files', warmed.retainedAstFiles, 0);
+    eq('completed prewarm does not retain a semantic AST view', index._reversePrewarm.view, null);
+    assert(
+        'completed prewarm shrinks parser workers to its idle baseline',
+        index.astPool.workers.length <= 1
+    );
     assert(
         'relationship prewarm verifies narrowed interface/type candidates',
         warmed.relationshipCandidateChecks < warmed.receiverMethods * warmed.workspaceInterfaces
@@ -132,6 +148,21 @@ async function main() {
     assert(
         'prewarm completion is logged',
         logs.some((line) => line.includes('Workspace interface relation prewarm complete'))
+    );
+    assert(
+        'prewarm logs peak RSS and its delta from the activation baseline',
+        logs.some(
+            (line) =>
+                line.includes('Workspace interface relation prewarm memory:') &&
+                line.includes('peakRss=') &&
+                line.includes('rssDelta=')
+        )
+    );
+    assert(
+        'prewarm exposes sampled memory high-water statistics',
+        warmed.memoryPeak &&
+            Number.isFinite(warmed.memoryPeak.rssBytes) &&
+            warmed.memoryPeak.rssBytes >= warmed.memoryBaseline.rssBytes
     );
 
     console.log('\n== prewarmed results are directly reusable ==');
@@ -246,7 +277,7 @@ async function main() {
     );
     restoredIndex.dispose();
 
-    console.log('\n== edits invalidate and rebuild the complete relation map ==');
+    console.log('\n== edits invalidate and rebuild the complete batched relation map ==');
     const changedContract = [...contractSource];
     changedContract.splice(changedContract.indexOf('}'), 0, '    Reset() error');
     const changedContractText = `${changedContract.join('\n')}\n`;
@@ -255,11 +286,16 @@ async function main() {
     assert('workspace edit invalidates ready prewarm results', index.getReversePrewarmStats().ready === false);
     const readsBeforeIncrementalWarm = astReads(index.getAstStats());
     const incrementallyWarmed = await index.prewarmReverseInterfaces();
-    assert('single-package edit uses incremental relation prewarm', incrementallyWarmed.incremental);
-    eq('incremental relation prewarm reparses only the changed package file', incrementallyWarmed.incrementalFiles, 1);
+    assert('edit rebuild remains batched after the old AST view is released', !incrementallyWarmed.incremental);
+    assert('edit rebuild still uses multiple bounded batches', incrementallyWarmed.workspaceBatchCount > 1);
     assert(
-        'incremental prewarm avoids touching unchanged workspace AST entries',
-        index.getAstStats().memoryHits - readsBeforeIncrementalWarm.memoryHits <= 1
+        'edit rebuild retains no complete AST state',
+        incrementallyWarmed.retainedAstFiles === 0 && index._reversePrewarm.view === null
+    );
+    assert(
+        'batched rebuild uses the persistent AST cache for unchanged files',
+        index.getAstStats().memoryHits + index.getAstStats().diskHits >
+            readsBeforeIncrementalWarm.memoryHits + readsBeforeIncrementalWarm.diskHits
     );
     const beforeChangedQuery = astReads(index.getAstStats());
     const changedInterfaces = await index.findInterfacesAst('MessageSyncHandler', 'HandleMessage', {
