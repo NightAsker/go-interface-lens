@@ -5,10 +5,6 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const DEPENDENCY_METHOD_SCAN_TIMEOUT_MS = 10 * 60 * 1000;
-const DEFAULT_DEPENDENCY_SCAN_CONCURRENCY = 8;
-const MAX_DEPENDENCY_SCAN_CONCURRENCY = 32;
-
 /**
  * File discovery for Go sources.
  *
@@ -210,185 +206,6 @@ async function grepImplementationFilesForMethod(root, methodName, maxFiles, sear
     }
 }
 
-/**
- * Find dependency files relevant to any of the supplied interface method
- * anchors in one ripgrep pass. Receiver declarations locate direct concrete
- * implementations; interface declarations retain types that may later be
- * promoted through embedding. Tree-sitter performs the exact verification.
- *
- * @param {string} root dependency root
- * @param {Iterable<string>} methodNames interface method anchors
- * @param {number} [maxFiles] cap on candidate files
- * @param {string[]} [searchDirs] restrict search to locked module directories
- * @param {{concurrency?:number,execute?:(cmd:string,args:string[],cwd:string,timeout:number)=>Promise<object>}} [options]
- * @returns {Promise<{files:string[],filesByMethod:Map<string,Set<string>>,complete:boolean,timedOut:boolean,multilineFiles:number}>}
- */
-async function scanDependencyFilesForMethods(root, methodNames, maxFiles, searchDirs, options) {
-    const names = [...new Set(methodNames)]
-        .filter((name) => /^[A-Za-z_]\w*$/.test(name))
-        .sort();
-    if (names.length === 0) {
-        return {
-            files: [],
-            filesByMethod: new Map(),
-            complete: true,
-            timedOut: false,
-            multilineFiles: 0,
-        };
-    }
-    const rg = findRipgrep();
-    const cap = maxFiles || 1000;
-    const requestedConcurrency = Number.isFinite(options && options.concurrency)
-        ? Math.trunc(options.concurrency)
-        : DEFAULT_DEPENDENCY_SCAN_CONCURRENCY;
-    const concurrency = Math.max(
-        1,
-        Math.min(MAX_DEPENDENCY_SCAN_CONCURRENCY, requestedConcurrency)
-    );
-    const args = ['--json', '--threads', String(concurrency), '--glob', '*.go'];
-    const chunkSize = 128;
-    for (let start = 0; start < names.length; start += chunkSize) {
-        const alternatives = names.slice(start, start + chunkSize).join('|');
-        args.push(
-            '-e',
-            `(?:\\bfunc\\s*\\([^)]*\\)\\s*|^\\s*|[;{]\\s*)` +
-                `(?:${alternatives})\\s*\\(`
-        );
-    }
-    // A receiver list may span lines. Discover those rare files in the same
-    // line-oriented pass, then inspect only those sources with a multiline
-    // receiver declaration matcher below.
-    args.push('-e', '\\bfunc\\s*\\([^)]*$');
-    args.push('--');
-    const targets = Array.isArray(searchDirs) && searchDirs.length > 0 ? searchDirs : ['.'];
-    for (const target of targets) args.push(target);
-
-    const execute = options && options.execute ? options.execute : runExecResult;
-    let execution;
-    try {
-        execution = await execute(
-            rg || 'rg',
-            args,
-            root,
-            DEPENDENCY_METHOD_SCAN_TIMEOUT_MS
-        );
-    } catch (error) {
-        execution = {
-            stdout: error && error.stdout ? String(error.stdout) : '',
-            complete: false,
-            timedOut: !!(error && error.timedOut),
-            error,
-        };
-    }
-    if (typeof execution === 'string') {
-        execution = { stdout: execution, complete: true, timedOut: false };
-    }
-
-    const out = execution && execution.stdout ? String(execution.stdout) : '';
-    const files = new Set();
-    const filesByMethod = new Map(names.map((name) => [name, new Set()]));
-    const methodMatcher = new RegExp(`\\b(${names.join('|')})\\s*\\(`, 'g');
-    const multilineCandidates = new Set();
-    const directFilesByMethod = new Map(names.map((name) => [name, new Set()]));
-    const ambiguousFilesByMethod = new Map(names.map((name) => [name, new Set()]));
-    for (const line of out.split('\n')) {
-        if (!line) continue;
-        let message;
-        try {
-            message = JSON.parse(line);
-        } catch (_) {
-            continue;
-        }
-        if (!message || message.type !== 'match' || !message.data) continue;
-        const rawPath = message.data.path && message.data.path.text;
-        if (!rawPath) continue;
-        const file = path.normalize(path.isAbsolute(rawPath) ? rawPath : path.join(root, rawPath));
-        const matchedSource = (message.data.lines && message.data.lines.text) || '';
-        if (/\bfunc\s*\([^)]*$/.test(matchedSource.trimEnd())) {
-            multilineCandidates.add(file);
-        }
-        methodMatcher.lastIndex = 0;
-        let match;
-        while ((match = methodMatcher.exec(matchedSource))) {
-            const prefix = matchedSource.slice(0, match.index);
-            const directDeclaration =
-                /\bfunc\s*\([^)]*\)\s*$/.test(prefix) || /[;{]\s*$/.test(prefix);
-            const target = directDeclaration ? directFilesByMethod : ambiguousFilesByMethod;
-            target.get(match[1]).add(file);
-        }
-    }
-
-    const filesToRead = new Set(multilineCandidates);
-    for (const methodFiles of ambiguousFilesByMethod.values()) {
-        for (const file of methodFiles) filesToRead.add(file);
-    }
-    const sourcesByFile = new Map();
-    let sourceReadComplete = true;
-    let nextFile = 0;
-    const sourceFiles = [...filesToRead];
-    const readNext = async () => {
-        while (nextFile < sourceFiles.length) {
-            const file = sourceFiles[nextFile++];
-            try {
-                sourcesByFile.set(file, await fs.promises.readFile(file, 'utf8'));
-            } catch (_) {
-                sourceReadComplete = false;
-            }
-        }
-    };
-    const readConcurrency = Math.min(sourceFiles.length, 16);
-    await Promise.all(Array.from({ length: readConcurrency }, () => readNext()));
-
-    for (const name of names) {
-        const methodFiles = filesByMethod.get(name);
-        for (const file of directFilesByMethod.get(name)) {
-            methodFiles.add(file);
-            files.add(file);
-        }
-        for (const file of ambiguousFilesByMethod.get(name)) {
-            const source = sourcesByFile.get(file);
-            if (source !== undefined && !/\binterface\b/.test(source)) continue;
-            methodFiles.add(file);
-            files.add(file);
-        }
-    }
-
-    const receiverMatcher = new RegExp(
-        `\\bfunc\\s*\\([^)]*\\)\\s*(${names.join('|')})\\s*\\(`,
-        'g'
-    );
-    for (const file of multilineCandidates) {
-        const source = sourcesByFile.get(file);
-        if (source === undefined) continue;
-        receiverMatcher.lastIndex = 0;
-        let match;
-        while ((match = receiverMatcher.exec(source))) {
-            files.add(file);
-            const methodFiles = filesByMethod.get(match[1]);
-            if (methodFiles) methodFiles.add(file);
-        }
-    }
-
-    const limitedFiles = [...files].slice(0, cap);
-    const retained = new Set(limitedFiles);
-    for (const [name, methodFiles] of filesByMethod) {
-        filesByMethod.set(
-            name,
-            new Set([...methodFiles].filter((file) => retained.has(file)))
-        );
-    }
-    return {
-        files: limitedFiles,
-        filesByMethod,
-        complete: execution.complete !== false && sourceReadComplete,
-        timedOut: !!execution.timedOut,
-        multilineFiles: multilineCandidates.size,
-    };
-}
-
-async function grepDependencyFilesForMethods(root, methodNames, maxFiles, searchDirs) {
-    return (await scanDependencyFilesForMethods(root, methodNames, maxFiles, searchDirs)).files;
-}
 
 /**
  * Find files that may embed or alias one of the supplied named types. AST
@@ -548,14 +365,11 @@ function resolveSearchRoots(documentUri) {
 }
 
 module.exports = {
-    DEFAULT_DEPENDENCY_SCAN_CONCURRENCY,
     listGoFiles,
     resolveSearchRoots,
     findRipgrep,
     resolveGoModCache,
     grepInterfaceFilesForMethod,
     grepImplementationFilesForMethod,
-    grepDependencyFilesForMethods,
-    scanDependencyFilesForMethods,
     grepGoFilesForTypeNames,
 };

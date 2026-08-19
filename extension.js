@@ -4,13 +4,9 @@ const vscode = require('vscode');
 const path = require('path');
 
 const { WorkspaceIndex } = require('./src/indexer');
-const {
-    resolveSearchRoots,
-    DEFAULT_DEPENDENCY_SCAN_CONCURRENCY,
-} = require('./src/search');
-const { parseGoFile } = require('./src/ast');
+const { resolveSearchRoots } = require('./src/search');
+const { parseGoDeclarations } = require('./src/ast');
 const { DEFAULT_AST_CONCURRENCY } = require('./src/ast-cache');
-const { initializeGoParser } = require('./src/tree-sitter-runtime');
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -29,13 +25,10 @@ function getConfiguration() {
         excludedFolders: config.get('excludedFolders', ['mocks', 'mock', 'testdata', 'vendor']),
         excludedFilePatterns: config.get('excludedFilePatterns', ['_mock.go', 'mock_', '.pb.go', '_test.go']),
         excludedTypePatterns: config.get('excludedTypePatterns', ['Mock', 'mock', 'Stub', 'Fake']),
+        excludedPackagePatterns: config.get('excludedPackagePatterns', []),
         searchDependencies: config.get('searchDependencies', true),
         goModCache: config.get('goModCache', ''),
         astConcurrency: config.get('astConcurrency', DEFAULT_AST_CONCURRENCY),
-        dependencyScanConcurrency: config.get(
-            'dependencyScanConcurrency',
-            DEFAULT_DEPENDENCY_SCAN_CONCURRENCY
-        ),
     };
 }
 
@@ -68,7 +61,6 @@ let workspaceIndex = null;
 const overlayTimers = new Map();
 const documentAstCache = new WeakMap();
 const OVERLAY_DELAY_MS = 150;
-const WORKSPACE_PREWARM_DELAY_MS = 300;
 
 function parseDocument(document) {
     const cached = documentAstCache.get(document);
@@ -81,65 +73,13 @@ function parseDocument(document) {
         return cached.parsed;
     }
 
-    const parsed = parseGoFile(text);
+    const parsed = parseGoDeclarations(text).then((result) => result.parsed);
     documentAstCache.set(document, {
         version: document.version,
         text: document.version === undefined ? text : undefined,
         parsed,
     });
     return parsed;
-}
-
-function resolvePrewarmRoots(documentUri) {
-    const roots = new Set();
-    for (const folder of vscode.workspace.workspaceFolders || []) {
-        roots.add(folder.uri.fsPath);
-    }
-
-    const owning = documentUri && vscode.workspace.getWorkspaceFolder(documentUri);
-    if (owning) roots.add(owning.uri.fsPath);
-
-    // A standalone Go file still benefits from indexing its containing folder.
-    // When a workspace IS open, deliberately do not add an external dependency
-    // directory here; dependency lookup remains on-demand.
-    if (roots.size === 0 && documentUri && documentUri.fsPath) {
-        roots.add(path.dirname(documentUri.fsPath));
-    }
-    return [...roots];
-}
-
-function prewarmRoots(roots, reason) {
-    if (!workspaceIndex || typeof workspaceIndex.ensureBuilt !== 'function' || roots.length === 0) return;
-    const warmReverseIndex = async () => {
-        if (typeof workspaceIndex.warmAstWorkers === 'function') {
-            try {
-                await workspaceIndex.warmAstWorkers();
-            } catch (err) {
-                log(`${reason} AST worker warmup failed: ${err && err.message}`);
-            }
-        }
-        if (typeof workspaceIndex.prewarmReverseInterfaces === 'function') {
-            try {
-                await workspaceIndex.prewarmReverseInterfaces();
-            } catch (err) {
-                log(`${reason} workspace interface relation prewarm failed: ${err && err.message}`);
-            }
-        }
-    };
-    if (typeof workspaceIndex.areRootsBuilt === 'function' && workspaceIndex.areRootsBuilt(roots)) {
-        void warmReverseIndex();
-        return;
-    }
-
-    Promise.all(roots.map((root) => workspaceIndex.ensureBuilt(root)))
-        .then(warmReverseIndex)
-        .catch((err) => {
-            log(`${reason} prewarm failed: ${err && err.message}`);
-        });
-}
-
-function prewarmWorkspace(documentUri, reason) {
-    prewarmRoots(resolvePrewarmRoots(documentUri), reason);
 }
 
 function cancelOverlayTimer(filePath) {
@@ -182,12 +122,6 @@ class GoCodeLensProvider {
     async provideCodeLenses(document) {
         const codeLenses = [];
         const parsed = await parseDocument(document);
-
-        if (parsed.interfaces.size > 0) {
-            // Ensure the workspace scan and complete reverse relation prewarm
-            // are running in the background without delaying CodeLens output.
-            prewarmWorkspace(document.uri, 'interface lens');
-        }
 
         const lineRange = (index) =>
             new vscode.Range(index, 0, index, document.lineAt(index).text.length);
@@ -395,9 +329,6 @@ function activate(context) {
     output = vscode.window.createOutputChannel('Go Interface Lens');
     context.subscriptions.push(output);
     log('Go Interface Lens activated');
-    void initializeGoParser().catch((err) => {
-        log(`Document parser warmup failed: ${err && err.message}`);
-    });
 
     workspaceIndex = new WorkspaceIndex(getConfiguration, log, {
         cacheDir: context.globalStorageUri && context.globalStorageUri.fsPath,
@@ -412,15 +343,16 @@ function activate(context) {
     // Language-only matching covers local `file` and every remote scheme.
     const selector = { language: 'go' };
 
-    // Shift the first workspace scan into idle background time. The timer keeps
-    // activation and CodeLens rendering synchronous, while ensureBuilt's own
-    // promise guard prevents this and provider-triggered prewarming from doing
-    // duplicate work.
-    const prewarmTimer = setTimeout(
-        () => prewarmWorkspace(undefined, 'activation'),
-        WORKSPACE_PREWARM_DELAY_MS
-    );
-    if (typeof prewarmTimer.unref === 'function') prewarmTimer.unref();
+    if (typeof vscode.workspace.onDidChangeConfiguration === 'function') {
+        context.subscriptions.push(
+            vscode.workspace.onDidChangeConfiguration((event) => {
+                if (!event.affectsConfiguration('goInterfaceLens.excludedPackagePatterns')) return;
+                log('Package exclusion patterns changed; rebuilding workspace index');
+                workspaceIndex.clear();
+                provider._onDidChangeCodeLenses.fire();
+            })
+        );
+    }
 
     context.subscriptions.push(
         vscode.languages.registerCodeLensProvider(selector, provider),
@@ -455,7 +387,6 @@ function activate(context) {
         }),
         {
             dispose: () => {
-                clearTimeout(prewarmTimer);
                 for (const timer of overlayTimers.values()) clearTimeout(timer);
                 overlayTimers.clear();
             },
@@ -486,6 +417,4 @@ module.exports._test = {
     GoGotoInterfaceLensProvider: GoCodeLensProvider,
     GoInterfaceLensProvider: GoCodeLensProvider,
     parseDocument,
-    resolvePrewarmRoots,
-    prewarmRoots,
 };

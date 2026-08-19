@@ -15,14 +15,6 @@ Module._resolveFilename = function (request, ...rest) {
 const { WorkspaceIndex } = require('../src/indexer');
 const { assert, eq, done } = require('./harness');
 
-function astReads(stats) {
-    return {
-        parsed: stats.parsed,
-        memoryHits: stats.memoryHits,
-        diskHits: stats.diskHits,
-    };
-}
-
 async function main() {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'go-interface-lazy-deps-'));
     const root = path.join(tmp, 'project');
@@ -231,7 +223,6 @@ async function main() {
     process.env.GOROOT = goRoot;
     const index = new WorkspaceIndex(config, () => {}, {
         cacheDir: path.join(tmp, 'cache'),
-        prewarmDependencyBatchPackages: 1,
     });
     await index.ensureBuilt(root);
 
@@ -293,170 +284,17 @@ async function main() {
     assert('reverse lookup retains a matching workspace interface', mergedHandlerNames.includes('LocalHandler'));
     assert('reverse lookup also searches an unrelated dependency interface when a local match exists', mergedHandlerNames.includes('RemoteHandler'));
 
-    const dependencyPrewarmPriorities = [];
-    const dependencyPrewarmDirectories = [];
-    let aliasDiscoverySemanticViews = 0;
-    let workspaceAstInFlight = false;
-    let dependencyScanOverlappedWorkspaceAst = false;
-    const loadExternalDirectoryForPrewarm = index._loadExternalDirectory.bind(index);
-    const createAstViewForPrewarm = index._createAstView.bind(index);
-    const parseAstPackagesForPrewarm = index._parseAstPackages.bind(index);
-    const potentialSignatureAliasImports = index._potentialSignatureAliasImports.bind(index);
-    let discoveringAliasImports = false;
-    const batchDependencyCandidates = index._dependencyImplementationBatchCandidates;
-    const perInterfaceDependencyContext = index._buildDependencyImplementationAstContext;
-    const individualImplementationCandidates = index._dependencyImplementationCandidates;
-    const individualInterfaceCandidates = index._dependencyInterfaceCandidates;
-    let batchCandidateScans = 0;
-    const batchScannedMethods = new Set();
-    assert(
-        'dependency prewarm exposes one batched multi-method candidate scan',
-        typeof batchDependencyCandidates === 'function'
+    console.log('\n== on-demand dependency implementations ==');
+    const dependencyImplementations = await index.findImplementationsAst(
+        'DependencyHandlerContract',
+        localInterfaceFile
     );
-    index._loadExternalDirectory = (directory, importPath, priority) => {
-        dependencyPrewarmDirectories.push(path.normalize(directory));
-        dependencyPrewarmPriorities.push(priority);
-        return loadExternalDirectoryForPrewarm(directory, importPath, priority);
-    };
-    index._createAstView = (...args) => {
-        if (discoveringAliasImports) aliasDiscoverySemanticViews += 1;
-        return createAstViewForPrewarm(...args);
-    };
-    index._potentialSignatureAliasImports = (...args) => {
-        discoveringAliasImports = true;
-        try {
-            return potentialSignatureAliasImports(...args);
-        } finally {
-            discoveringAliasImports = false;
-        }
-    };
-    index._parseAstPackages = async (...args) => {
-        workspaceAstInFlight = true;
-        try {
-            return await parseAstPackagesForPrewarm(...args);
-        } finally {
-            workspaceAstInFlight = false;
-        }
-    };
-    index._dependencyImplementationBatchCandidates = async (...args) => {
-        if (workspaceAstInFlight) dependencyScanOverlappedWorkspaceAst = true;
-        batchCandidateScans += 1;
-        for (const methodName of args[1]) batchScannedMethods.add(methodName);
-        return batchDependencyCandidates.apply(index, args);
-    };
-    index._buildDependencyImplementationAstContext = async () => {
-        throw new Error('dependency prewarm rebuilt a separate AST context per interface');
-    };
-    index._dependencyImplementationCandidates = async () => {
-        throw new Error('dependency prewarm ran an individual implementation candidate scan');
-    };
-    index._dependencyInterfaceCandidates = async () => {
-        throw new Error('dependency prewarm ran an individual interface candidate scan');
-    };
-    try {
-        await index.prewarmReverseInterfaces();
-    } finally {
-        index._loadExternalDirectory = loadExternalDirectoryForPrewarm;
-        index._createAstView = createAstViewForPrewarm;
-        index._parseAstPackages = parseAstPackagesForPrewarm;
-        index._potentialSignatureAliasImports = potentialSignatureAliasImports;
-        index._dependencyImplementationBatchCandidates = batchDependencyCandidates;
-        index._buildDependencyImplementationAstContext = perInterfaceDependencyContext;
-        index._dependencyImplementationCandidates = individualImplementationCandidates;
-        index._dependencyInterfaceCandidates = individualInterfaceCandidates;
-    }
-    const prewarmStats = index.getReversePrewarmStats();
-    assert(
-        'parsed external packages release retained Go source text',
-        [...index._externalPackageCache.values()].every((entry) => entry.sources === null)
+    const dependencyMethodImplementations = await index.findMethodImplementationsAst(
+        'DependencyHandlerContract',
+        'HandleMessage',
+        localInterfaceFile
     );
-    eq('all workspace interfaces share one dependency candidate scan', batchCandidateScans, 1);
-    eq('prewarm reports one batched dependency scan', prewarmStats.dependencyCandidateScans, 1);
-    assert('dependency relationship prewarm uses multiple bounded batches', prewarmStats.dependencyBatchCount > 1);
-    eq('dependency batches respect their package limit', prewarmStats.maxDependencyBatchPackages, 1);
-    assert(
-        'dependency candidate discovery overlaps workspace AST prewarming',
-        dependencyScanOverlappedWorkspaceAst
-    );
-    eq(
-        'alias import discovery does not construct a complete semantic AST view',
-        aliasDiscoverySemanticViews,
-        0
-    );
-    assert(
-        'speculative dependency scan selects one rare anchor per workspace interface',
-        batchScannedMethods.has('RareDep') && !batchScannedMethods.has('Common')
-    );
-    assert(
-        'unrelated receiver signatures do not load dependency packages during relation prewarm',
-        !dependencyPrewarmDirectories.includes(path.normalize(noiseAliasDir))
-    );
-    assert(
-        'dependency anchor selection uses dependency-side rarity instead of workspace counts',
-        !dependencyPrewarmDirectories.includes(path.normalize(anchorNoiseDir))
-    );
-    assert(
-        'same-named function calls do not load a false dependency package candidate',
-        !dependencyPrewarmDirectories.includes(path.normalize(callNoiseDir))
-    );
-    assert(
-        'cross-file aliases remain conservative dependency candidates',
-        dependencyPrewarmDirectories.includes(path.normalize(aliasImplDir))
-    );
-    assert(
-        'type-reference expansion ignores ordinary parameter and expression references',
-        !dependencyPrewarmDirectories.includes(path.normalize(ordinaryRefDir))
-    );
-    assert(
-        'locked dependency implementation prewarm stays at background priority',
-        dependencyPrewarmPriorities.length > 0 &&
-            dependencyPrewarmPriorities.every(
-                (priority) => Number.isFinite(priority) && priority <= 10
-            )
-    );
-    assert(
-        'complete relation prewarm includes locked dependency implementation files',
-        prewarmStats.dependencyFiles > 0
-    );
-    const astReadsAfterPrewarm = astReads(index.getAstStats());
-    const buildWorkspaceImplementationContext = index._buildImplementationAstContext;
-    const dependencyImplementationCandidates = index._dependencyImplementationCandidates;
-    const dependencyInterfaceCandidates = index._dependencyInterfaceCandidates;
-    const dependencyTypeReferenceCandidates = index._dependencyTypeReferenceCandidates;
-    index._buildImplementationAstContext = async () => {
-        throw new Error('workspace implementation context was rebuilt after prewarm');
-    };
-    index._dependencyImplementationCandidates = async () => {
-        throw new Error('dependency implementations were scanned after complete prewarm');
-    };
-    index._dependencyInterfaceCandidates = async () => {
-        throw new Error('dependency interfaces were scanned after complete prewarm');
-    };
-    index._dependencyTypeReferenceCandidates = async () => {
-        throw new Error('dependency type references were scanned after complete prewarm');
-    };
-    let dependencyImplementations;
-    let dependencyMethodImplementations;
-    try {
-        dependencyImplementations = await index.findImplementationsAst(
-            'DependencyHandlerContract',
-            localInterfaceFile
-        );
-        dependencyMethodImplementations = await index.findMethodImplementationsAst(
-            'DependencyHandlerContract',
-            'HandleMessage',
-            localInterfaceFile
-        );
-    } finally {
-        index._buildImplementationAstContext = buildWorkspaceImplementationContext;
-        index._dependencyImplementationCandidates = dependencyImplementationCandidates;
-        index._dependencyInterfaceCandidates = dependencyInterfaceCandidates;
-        index._dependencyTypeReferenceCandidates = dependencyTypeReferenceCandidates;
-    }
-    assert(
-        'dependency implementation lookup reuses the prewarmed workspace context',
-        Array.isArray(dependencyImplementations)
-    );
+    assert('dependency implementation lookup returns a result array', Array.isArray(dependencyImplementations));
     const dependencyImplementation = dependencyImplementations.find(
         (result) => result.name === '*DependencyHandler'
     );
@@ -480,15 +318,10 @@ async function main() {
         localInterfaceFile
     );
     assert(
-        'dependency prewarm preserves implementations using aliases from another file',
+        'on-demand dependency lookup preserves implementations using aliases from another file',
         crossFileAliasImplementations.some(
             (result) => result.name === 'CrossFileAliasHandler'
         )
-    );
-    eq(
-        'prewarmed dependency implementation queries perform no AST reads',
-        astReads(index.getAstStats()),
-        astReadsAfterPrewarm
     );
     const dependencyMethod = dependencyMethodImplementations.find(
         (result) => result.name === '*DependencyHandler'
@@ -599,87 +432,10 @@ async function main() {
         0
     );
 
-    const dependencySnapshotIndex = new WorkspaceIndex(config, () => {}, {
-        cacheDir: path.join(tmp, 'cache'),
-    });
-    await dependencySnapshotIndex.ensureBuilt(root);
-    dependencySnapshotIndex._buildReversePrewarm = async () => {
-        throw new Error('dependency relationship snapshot was not restored');
-    };
-    const dependencySnapshot = await dependencySnapshotIndex.prewarmReverseInterfaces();
-    assert(
-        'dependency-enabled restart restores the complete relationship snapshot',
-        dependencySnapshot.snapshotRestored
-    );
-    eq(
-        'restored relationship snapshot reports no dependency candidate scan',
-        dependencySnapshot.dependencyCandidateScans,
-        0
-    );
-    const beforeSnapshotImplementation = astReads(dependencySnapshotIndex.getAstStats());
-    const snapshotImplementations = await dependencySnapshotIndex.findImplementationsAst(
-        'DependencyHandlerContract',
-        localInterfaceFile
-    );
-    assert(
-        'restored dependency snapshot includes external concrete implementations',
-        snapshotImplementations.some((result) => result.name === '*DependencyHandler')
-    );
-    eq(
-        'restored dependency implementation performs no AST reads',
-        astReads(dependencySnapshotIndex.getAstStats()),
-        beforeSnapshotImplementation
-    );
-    const snapshotInterfaces = await dependencySnapshotIndex.findInterfacesAst(
-        'ExternalImpl',
-        'HandleMessage',
-        { receiverFile: implementationFile }
-    );
-    assert(
-        'restored snapshot retains dependency-interface reverse lookup correctness',
-        snapshotInterfaces.some((result) => result.name === 'LocalHandler') &&
-            snapshotInterfaces.some((result) => result.name === 'RemoteHandler')
-    );
-
-    console.log('\n== incomplete dependency prewarm ==');
-    const incompleteLogs = [];
-    const incompleteCacheDir = path.join(tmp, 'incomplete-cache');
-    const incompleteIndex = new WorkspaceIndex(config, (message) => incompleteLogs.push(message), {
-        cacheDir: incompleteCacheDir,
-    });
-    await incompleteIndex.ensureBuilt(root);
-    incompleteIndex._dependencyImplementationBatchCandidates = async (
-        _cacheRoot,
-        methodNames
-    ) => ({
-        files: [],
-        filesByMethod: new Map([...methodNames].map((name) => [name, new Set()])),
-        complete: false,
-        timedOut: true,
-    });
-    const incompletePrewarm = await incompleteIndex.prewarmReverseInterfaces();
-    assert('workspace relationships remain ready after dependency timeout', incompletePrewarm.ready);
-    assert(
-        'dependency timeout is not reported as a complete dependency prewarm',
-        incompleteIndex._reversePrewarm && !incompleteIndex._reversePrewarm.dependenciesPrewarmed
-    );
-    assert(
-        'dependency timeout is logged as incomplete',
-        incompleteLogs.some((line) => line.includes('dependency candidate scan incomplete'))
-    );
-    const incompleteCacheFiles = fs.existsSync(incompleteCacheDir)
-        ? fs.readdirSync(incompleteCacheDir)
-        : [];
-    assert(
-        'incomplete dependency relationships are not persisted as a complete snapshot',
-        !incompleteCacheFiles.some((file) => file.startsWith('interface-relations-'))
-    );
 
     index.dispose();
     localOnlyIndex.dispose();
     dependencyCacheIndex.dispose();
-    dependencySnapshotIndex.dispose();
-    incompleteIndex.dispose();
     if (previousGoRoot === undefined) delete process.env.GOROOT;
     else process.env.GOROOT = previousGoRoot;
     fs.rmSync(tmp, { recursive: true, force: true });

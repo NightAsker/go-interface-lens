@@ -216,6 +216,15 @@ async function main() {
     const implementations = await index.findImplementationsAst('Service', interfaceFile);
     eq('AST finds only the structurally valid implementation', implementations.map((r) => r.name), ['*Worker']);
     assert('AST query parsed candidate files in workers', index.getAstStats().parsed > 0);
+    assert(
+        'workspace candidate parsing removes function bodies',
+        index.getAstStats().functionBodiesSkipped > 0
+    );
+    eq(
+        'every workspace candidate parse uses declaration-only mode',
+        index.getAstStats().declarationOnlyParsed,
+        index.getAstStats().parsed
+    );
     eq('implementation query reuses its alias-analysis AST view', astViewCreations, 2);
 
     const parsedBeforeCacheHit = index.getAstStats().parsed;
@@ -331,6 +340,10 @@ async function main() {
     assert(
         'unsaved implementation participates in AST filtering',
         withOverlay.some((result) => result.name === 'OverlayWorker')
+    );
+    assert(
+        'unsaved overlay parsing also removes function bodies',
+        index.getAstStats().declarationOnlyParsed > parsedBeforeCacheHit
     );
     index.clearOverlay(implementationFile);
     const afterClose = await index.findImplementationsAst('Service', interfaceFile);

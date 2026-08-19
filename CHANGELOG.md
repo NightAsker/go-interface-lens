@@ -4,6 +4,21 @@ All notable changes to Go Interface Lens are documented here.
 
 ## Unreleased
 
+## [2.0.3] - 2026-08-19
+
+### Changed
+
+- Remove automatic workspace indexing, relation-map construction, dependency
+  batch scans, relation snapshots, and parser-worker startup. Navigation now
+  builds its lightweight candidate index and parses exact AST candidates only
+  after the user invokes a CodeLens action.
+- Remove the dependency batch-scan concurrency setting; AST query concurrency
+  remains CPU- and memory-aware and workers are created only by real queries.
+- Add `goInterfaceLens.excludedPackagePatterns` to exclude wildcard-matched Go
+  import paths from workspace indexing, dependency scans, and navigation.
+- Strip function body contents before Tree-sitter declaration parsing while
+  preserving signatures, source offsets, and line numbers.
+
 ## [2.0.2] - 2026-08-19
 
 ### Changed

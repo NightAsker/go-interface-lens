@@ -10,9 +10,7 @@ const { deserializeParsedFile } = require('./ast');
 const CACHE_SCHEMA = 10;
 const DEFAULT_AST_CONCURRENCY = 32;
 const MAX_AST_CONCURRENCY = 32;
-const DEFAULT_BACKGROUND_CONCURRENCY = 16;
 const CPU_CONCURRENCY_RATIO = 2 / 3;
-const BACKGROUND_CONCURRENCY_RATIO = 2 / 3;
 const DEFAULT_IDLE_TIMEOUT_MS = 30_000;
 const DEFAULT_MEMORY_CACHE_ENTRIES = 512;
 const DEFAULT_DISK_CACHE_ENTRIES = 4096;
@@ -20,7 +18,6 @@ const DEFAULT_DISK_CACHE_BYTES = 256 * 1024 * 1024;
 const CACHE_WRITE_CONCURRENCY = 8;
 const CACHE_PACK_ENTRIES = 64;
 const MAX_MEMORY_PACKS = 8;
-const BACKGROUND_PRIORITY_MAX = 10;
 const DEFAULT_WORKER_MEMORY_BYTES = 128 * 1024 * 1024;
 const DEFAULT_MEMORY_RESERVE_BYTES = 512 * 1024 * 1024;
 
@@ -104,14 +101,6 @@ class AstWorkerPool {
                   concurrency: memoryConcurrency,
               }
             : null;
-        const requestedWarmConcurrency = Number.isFinite(opts.warmConcurrency)
-            ? Math.trunc(opts.warmConcurrency)
-            : this.effectiveConcurrency;
-        this.warmConcurrency = Math.max(
-            1,
-            Math.min(this.effectiveConcurrency, requestedWarmConcurrency)
-        );
-        this._updateBackgroundLimits();
         this.idleTimeoutMs = Number.isFinite(opts.idleTimeoutMs)
             ? Math.max(0, Math.trunc(opts.idleTimeoutMs))
             : DEFAULT_IDLE_TIMEOUT_MS;
@@ -158,25 +147,11 @@ class AstWorkerPool {
             active: 0,
             maxActive: 0,
             maxWorkers: 0,
+            declarationOnlyParsed: 0,
+            declarationOnlyFallbacks: 0,
+            functionBodiesSkipped: 0,
+            functionBodyCharactersSkipped: 0,
         };
-    }
-
-    _updateBackgroundLimits() {
-        // Background prewarming stays inside the warmed baseline and leaves
-        // capacity for foreground navigation requests.
-        this.backgroundConcurrency = Math.max(
-            1,
-            Math.min(
-                DEFAULT_BACKGROUND_CONCURRENCY,
-                this.warmConcurrency,
-                Math.floor(this.warmConcurrency * BACKGROUND_CONCURRENCY_RATIO)
-            )
-        );
-        this.foregroundReserve = this.effectiveConcurrency - this.backgroundConcurrency;
-        this.backgroundIOConcurrency = Math.max(
-            this.backgroundConcurrency,
-            Math.min(16, this.effectiveConcurrency * 2)
-        );
     }
 
     async _load() {
@@ -354,17 +329,14 @@ class AstWorkerPool {
 
     _ensureWorkers(target) {
         if (this.disposed) return;
-        const desired = Math.max(
-            0,
-            Math.min(this.concurrency, target === undefined ? this.warmConcurrency : target)
-        );
+        const desired = Math.max(0, Math.min(this.concurrency, target === undefined ? 1 : target));
         while (this.workers.length < desired) this._spawnWorker();
     }
 
     _desiredWorkerCount() {
         return Math.min(
             this.effectiveConcurrency,
-            Math.max(this.warmConcurrency, this.stats.active + this.queue.length)
+            Math.max(1, this.stats.active + this.queue.length)
         );
     }
 
@@ -380,7 +352,7 @@ class AstWorkerPool {
             this.shrinkTimer ||
             this.stats.active !== 0 ||
             this.queue.length !== 0 ||
-            this.workers.length <= this.warmConcurrency
+            this.workers.length <= 1
         ) {
             return;
         }
@@ -393,47 +365,13 @@ class AstWorkerPool {
 
     _shrinkIdleWorkers() {
         if (this.disposed || this.stats.active !== 0 || this.queue.length !== 0) return;
-        const retiring = this.workers.slice(this.warmConcurrency);
-        this.workers = this.workers.slice(0, this.warmConcurrency);
+        const retiring = this.workers.slice(1);
+        this.workers = this.workers.slice(0, 1);
         for (const state of retiring) {
             state.retiring = true;
             if (!state.ready) state.resolveReady(false);
             state.worker.terminate();
         }
-    }
-
-    async shrinkTo(target) {
-        const requested = Number.isFinite(target) ? Math.trunc(target) : 1;
-        this.warmConcurrency = Math.max(1, Math.min(this.effectiveConcurrency, requested));
-        this._updateBackgroundLimits();
-        if (this.disposed || this.stats.active !== 0 || this.queue.length !== 0) {
-            this._scheduleShrink();
-            return this.workers.length;
-        }
-        const retiring = this.workers.slice(this.warmConcurrency);
-        this.workers = this.workers.slice(0, this.warmConcurrency);
-        await Promise.all(
-            retiring.map((state) => {
-                state.retiring = true;
-                if (!state.ready) state.resolveReady(false);
-                return state.worker.terminate();
-            })
-        );
-        return this.workers.length;
-    }
-
-    async recycleIdleWorkers() {
-        if (this.disposed || this.stats.active !== 0 || this.queue.length !== 0) return false;
-        const retiring = this.workers;
-        this.workers = [];
-        await Promise.all(
-            retiring.map((state) => {
-                state.retiring = true;
-                if (!state.ready) state.resolveReady(false);
-                return state.worker.terminate();
-            })
-        );
-        return retiring.length > 0;
     }
 
     releaseFiles(files) {
@@ -497,20 +435,6 @@ class AstWorkerPool {
         this._dispatch();
     }
 
-    /** Start parser workers and wait until their modules are loaded. */
-    async warmup() {
-        if (this.disposed) return 0;
-        for (let attempt = 0; attempt < 3; attempt++) {
-            const target = Math.max(this.warmConcurrency, this.workers.length);
-            this._ensureWorkers(target);
-            const snapshot = [...this.workers];
-            await Promise.all(snapshot.map((state) => state.readyPromise));
-            const ready = this.workers.filter((state) => state.ready && !state.failed).length;
-            if (ready >= Math.min(this.concurrency, target) || this.disposed) return ready;
-        }
-        return this.workers.filter((state) => state.ready && !state.failed).length;
-    }
-
     _jobPrecedes(left, right) {
         return (
             left.priority > right.priority ||
@@ -541,22 +465,8 @@ class AstWorkerPool {
             [this.queue[parent], this.queue[current]] = [this.queue[current], this.queue[parent]];
             current = parent;
         }
-        // Background dispatch deliberately leaves ready workers idle. Wake one
-        // immediately when that exact job becomes foreground work.
         this._dispatch();
         return true;
-    }
-
-    _isBackgroundJob(job) {
-        return !!job && job.priority <= BACKGROUND_PRIORITY_MAX;
-    }
-
-    _activeBackgroundJobs() {
-        let active = 0;
-        for (const state of this.workers) {
-            if (state.busy && this._isBackgroundJob(state.job)) active += 1;
-        }
-        return active;
     }
 
     _dequeue() {
@@ -596,6 +506,13 @@ class AstWorkerPool {
         state.job = null;
         state.busy = false;
         this.stats.active = Math.max(0, this.stats.active - 1);
+        if (message.optimization && message.optimization.declarationOnly) {
+            this.stats.declarationOnlyParsed += 1;
+            this.stats.functionBodiesSkipped += message.optimization.bodyCount || 0;
+            this.stats.functionBodyCharactersSkipped +=
+                message.optimization.maskedCharacters || 0;
+            if (message.optimization.fallback) this.stats.declarationOnlyFallbacks += 1;
+        }
         if (message.error) {
             const err = new Error(message.error.message);
             err.code = message.error.code;
@@ -608,28 +525,24 @@ class AstWorkerPool {
 
     _dispatch() {
         if (this.disposed) return;
-        let backgroundActive = this._activeBackgroundJobs();
         for (const state of this.workers) {
             if (state.busy || this.queue.length === 0) continue;
-            const next = this.queue[0];
-            if (
-                this._isBackgroundJob(next) &&
-                backgroundActive >= this.backgroundConcurrency
-            ) {
-                continue;
-            }
             const job = this._dequeue();
             state.busy = true;
             state.job = job;
-            if (this._isBackgroundJob(job)) backgroundActive += 1;
             this.stats.active += 1;
             this.stats.maxActive = Math.max(this.stats.maxActive, this.stats.active);
-            state.worker.postMessage({ id: job.id, file: job.file, text: job.text });
+            state.worker.postMessage({
+                id: job.id,
+                file: job.file,
+                text: job.text,
+                declarationOnly: job.declarationOnly,
+            });
         }
         this._scheduleShrink();
     }
 
-    _run(file, text, priority, key) {
+    _run(file, text, priority, key, declarationOnly) {
         if (this.disposed) return Promise.reject(new Error('AST worker pool is disposed'));
         this._cancelShrink();
         return new Promise((resolve, reject) => {
@@ -640,6 +553,7 @@ class AstWorkerPool {
                 priority: priority || 0,
                 file,
                 text,
+                declarationOnly: !!declarationOnly,
                 resolve,
                 reject,
             });
@@ -648,8 +562,10 @@ class AstWorkerPool {
         });
     }
 
-    parseFile(file, text, priority) {
-        if (text === undefined) return this.parseDiskFile(file, undefined, priority);
+    parseFile(file, text, priority, declarationOnly) {
+        if (text === undefined) {
+            return this.parseDiskFile(file, undefined, priority, declarationOnly);
+        }
         const overlayHash =
             crypto.createHash('sha1').update(text).digest('hex');
         const key = `${file}\0${overlayHash}`;
@@ -663,7 +579,7 @@ class AstWorkerPool {
             return existing.promise;
         }
         const entry = { promise: null, priority: requestedPriority };
-        entry.promise = this._parseFile(file, text, entry, key).finally(() => {
+        entry.promise = this._parseFile(file, text, entry, key, declarationOnly).finally(() => {
             if (this.inflight.get(key) === entry) this.inflight.delete(key);
         });
         this.inflight.set(key, entry);
@@ -675,7 +591,7 @@ class AstWorkerPool {
      * caller for build-constraint filtering. Unlike an editor overlay, this path
      * validates file metadata and participates in the persistent AST cache.
      */
-    parseDiskFile(file, prefetchedText, priority) {
+    parseDiskFile(file, prefetchedText, priority, declarationOnly) {
         const key = `${file}\0disk`;
         const requestedPriority = Number.isFinite(priority) ? priority : 0;
         const existing = this.inflight.get(key);
@@ -687,14 +603,20 @@ class AstWorkerPool {
             return existing.promise;
         }
         const entry = { promise: null, priority: requestedPriority };
-        entry.promise = this._parseDiskFile(file, prefetchedText, entry, key).finally(() => {
+        entry.promise = this._parseDiskFile(
+            file,
+            prefetchedText,
+            entry,
+            key,
+            declarationOnly
+        ).finally(() => {
             if (this.inflight.get(key) === entry) this.inflight.delete(key);
         });
         this.inflight.set(key, entry);
         return entry.promise;
     }
 
-    async _parseFile(file, text, request, key) {
+    async _parseFile(file, text, request, key, declarationOnly) {
         await this._load();
         const generation = this.generation;
         const overlay = this.overlays.get(file);
@@ -702,14 +624,20 @@ class AstWorkerPool {
             this.stats.memoryHits += 1;
             return overlay.parsed;
         }
-        const serialized = await this._run(file, text, request.priority, key);
+        const serialized = await this._run(
+            file,
+            text,
+            request.priority,
+            key,
+            declarationOnly
+        );
         const parsed = deserializeParsedFile(serialized);
         if (generation === this.generation) this.overlays.set(file, { text, parsed });
         this.stats.parsed += 1;
         return parsed;
     }
 
-    async _parseDiskFile(file, prefetchedText, request, key) {
+    async _parseDiskFile(file, prefetchedText, request, key, declarationOnly) {
         await this._load();
         const generation = this.generation;
         const stat = await fs.promises.stat(file);
@@ -733,7 +661,13 @@ class AstWorkerPool {
             }
         }
 
-        const serialized = await this._run(file, prefetchedText, request.priority, key);
+        const serialized = await this._run(
+            file,
+            prefetchedText,
+            request.priority,
+            key,
+            declarationOnly
+        );
         const parsed = deserializeParsedFile(serialized);
         if (generation === this.generation) {
             this._rememberMemory(file, { mtimeMs: stat.mtimeMs, size: stat.size, parsed });
@@ -746,43 +680,22 @@ class AstWorkerPool {
 
     async parseFiles(requests, priority) {
         const requestedPriority = Number.isFinite(priority) ? priority : 100;
-        if (requestedPriority <= BACKGROUND_PRIORITY_MAX) {
-            const results = new Array(requests.length);
-            const diskIndexes = [];
-            const overlayIndexes = [];
-            for (let index = 0; index < requests.length; index++) {
-                if (requests[index].text === undefined) diskIndexes.push(index);
-                else overlayIndexes.push(index);
-            }
-            const run = async (indexes, disk) => {
-                while (indexes.length > 0) {
-                    const index = indexes.pop();
-                    const request = requests[index];
-                    results[index] = [
-                        request.file,
-                        disk
-                            ? await this.parseDiskFile(request.file, request.diskText, requestedPriority)
-                            : await this.parseFile(request.file, request.text, requestedPriority),
-                    ];
-                }
-            };
-            const diskRunners = Math.min(diskIndexes.length, this.backgroundIOConcurrency);
-            const overlayRunners = Math.min(
-                overlayIndexes.length,
-                this.backgroundConcurrency
-            );
-            await Promise.all([
-                ...Array.from({ length: diskRunners }, () => run(diskIndexes, true)),
-                ...Array.from({ length: overlayRunners }, () => run(overlayIndexes, false)),
-            ]);
-            return new Map(results);
-        }
         const results = await Promise.all(
             requests.map(async (request) => [
                 request.file,
                 request.text === undefined
-                    ? await this.parseDiskFile(request.file, request.diskText, requestedPriority)
-                    : await this.parseFile(request.file, request.text, requestedPriority),
+                    ? await this.parseDiskFile(
+                          request.file,
+                          request.diskText,
+                          requestedPriority,
+                          request.declarationOnly
+                      )
+                    : await this.parseFile(
+                          request.file,
+                          request.text,
+                          requestedPriority,
+                          request.declarationOnly
+                      ),
             ])
         );
         return new Map(results);
@@ -968,7 +881,6 @@ module.exports = {
     AstWorkerPool,
     CACHE_SCHEMA,
     DEFAULT_AST_CONCURRENCY,
-    DEFAULT_BACKGROUND_CONCURRENCY,
     MAX_AST_CONCURRENCY,
     DEFAULT_IDLE_TIMEOUT_MS,
     DEFAULT_MEMORY_CACHE_ENTRIES,

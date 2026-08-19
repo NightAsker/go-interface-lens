@@ -128,10 +128,6 @@ async function main() {
     });
     const idx = new WorkspaceIndex(cfg, () => {});
     await idx.ensureBuilt(root);
-    // Inject our prebuilt index and make resolveSearchRoots resolve to exactly
-    // `root` (so areRootsBuilt matches the root we built). getWorkspaceFolder
-    // must return the owning folder, otherwise resolveSearchRoots also appends
-    // the file's own directory as a separate (unbuilt) root.
     extension._test.setWorkspaceIndex(idx);
     const folder = { uri: { fsPath: root } };
     vscodeStub.workspace.workspaceFolders = [folder];
@@ -214,27 +210,30 @@ async function main() {
     const changedParse = await extension._test.parseDocument(variantsDocument);
     assert('new document version invalidates its AST', changedParse !== cachedParse);
 
-    let prewarmCalls = 0;
-    let workerWarmupCalls = 0;
-    let reversePrewarmCalls = 0;
+    const invalidBodyDocument = {
+        version: 1,
+        getText: () => 'package p\ntype Visible struct{}\nfunc (Visible) Run() { value := }\n',
+    };
+    const declarationParse = await extension._test.parseDocument(invalidBodyDocument);
+    assert(
+        'editor parsing retains method signatures',
+        declarationParse.types.get('Visible').methods.has('Run')
+    );
+    assert(
+        'editor parsing ignores syntax errors inside removed function bodies',
+        !declarationParse.hasSyntaxError
+    );
+
+    let backgroundBuilds = 0;
     extension._test.setWorkspaceIndex({
-        areRootsBuilt: () => false,
         ensureBuilt: async () => {
-            prewarmCalls += 1;
-        },
-        warmAstWorkers: async () => {
-            workerWarmupCalls += 1;
-        },
-        prewarmReverseInterfaces: async () => {
-            reversePrewarmCalls += 1;
+            backgroundBuilds += 1;
         },
     });
     await interfaceProvider.provideCodeLenses(fakeDocument(variantsPath));
     await new Promise((resolve) => setTimeout(resolve, 10));
-    console.log('\n== interface-only file prewarming ==');
-    assert('interface lens starts one background workspace build', prewarmCalls === 1);
-    assert('interface lens warms AST workers after the workspace build', workerWarmupCalls === 1);
-    assert('interface lens starts reverse interface prewarming', reversePrewarmCalls === 1);
+    console.log('\n== interface-only file remains lazy ==');
+    assert('rendering interface lenses performs no background workspace build', backgroundBuilds === 0);
     extension._test.setWorkspaceIndex(idx);
 
     idx.dispose();

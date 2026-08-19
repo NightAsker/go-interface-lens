@@ -69,7 +69,17 @@ async function main() {
     );
 
     console.log('== persistent lightweight candidate index ==');
+    fs.mkdirSync(cacheDir, { recursive: true });
+    const obsoleteRelation = path.join(cacheDir, 'interface-relations-v1-old.json');
+    const obsoleteDependencyBatch = path.join(cacheDir, 'dependency-candidates-v1-old.json');
+    const unrelatedCache = path.join(cacheDir, 'unrelated.json');
+    fs.writeFileSync(obsoleteRelation, '{}');
+    fs.writeFileSync(obsoleteDependencyBatch, '{}');
+    fs.writeFileSync(unrelatedCache, '{}');
     const first = await buildObservedIndex(root, cacheDir);
+    assert('removed relation cache artifacts are cleaned during upgrade', !fs.existsSync(obsoleteRelation));
+    assert('removed dependency batch artifacts are cleaned during upgrade', !fs.existsSync(obsoleteDependencyBatch));
+    assert('upgrade cleanup preserves unrelated cache files', fs.existsSync(unrelatedCache));
     eq('first build reads every Go source', first.indexed, 2);
     eq('first build has no persisted candidates to restore', first.restored, 0);
     const cacheFile = first.index._candidateCacheFile(root);
@@ -82,10 +92,6 @@ async function main() {
     const apiMetadata = second.index._candidateMetadataByFile.get(apiFile);
     assert('cached imports survive serialization', apiMetadata.imports.get('io') === 'io');
     assert('cached embedded references survive serialization', apiMetadata.embeddedReferences.has('io.Reader'));
-    assert(
-        'cached interface method groups preserve dependency prefetch anchors',
-        apiMetadata.interfaceMethodGroups.some((methods) => methods.has('Run'))
-    );
     const implementations = await second.index.findImplementationsAst('Service', apiFile);
     eq('restored candidates still drive precise AST lookup', implementations.map((item) => item.name), ['Impl']);
     second.index.dispose();

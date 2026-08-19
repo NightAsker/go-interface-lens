@@ -1,6 +1,7 @@
 'use strict';
 
 const { parseGoSyntaxTree } = require('./tree-sitter-runtime');
+const { maskGoFunctionBodies } = require('./go-source');
 
 const PREDECLARED_CONCRETE_TYPES = new Set([
     'bool', 'byte', 'complex64', 'complex128', 'float32', 'float64',
@@ -573,6 +574,30 @@ async function parseGoFile(text) {
     }
 }
 
+/**
+ * Parse declaration metadata without sending function body contents through
+ * Tree-sitter. Invalid/incomplete declarations fall back to the original text
+ * so editor-time syntax recovery remains unchanged.
+ */
+async function parseGoDeclarations(text) {
+    const masked = maskGoFunctionBodies(text);
+    let parsed = await parseGoFile(masked.text);
+    let fallback = false;
+    if (masked.bodyCount > 0 && parsed.hasSyntaxError) {
+        parsed = await parseGoFile(text);
+        fallback = true;
+    }
+    return {
+        parsed,
+        optimization: {
+            declarationOnly: true,
+            bodyCount: masked.bodyCount,
+            maskedCharacters: masked.maskedCharacters,
+            fallback,
+        },
+    };
+}
+
 function mapToEntries(map, valueMapper) {
     return [...(map || new Map())].map(([key, value]) => [key, valueMapper ? valueMapper(value) : value]);
 }
@@ -637,6 +662,7 @@ function deserializeParsedFile(serialized) {
 
 module.exports = {
     parseGoFile,
+    parseGoDeclarations,
     buildDeclarationIR,
     serializeParsedFile,
     deserializeParsedFile,

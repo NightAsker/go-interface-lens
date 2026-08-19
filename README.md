@@ -1,20 +1,18 @@
 # Go Interface Lens
 
-[![Version](https://img.shields.io/badge/version-2.0.2-blue.svg)](https://github.com/NightAsker/go-interface-lens)
+[![Version](https://img.shields.io/badge/version-2.0.3-blue.svg)](https://github.com/NightAsker/go-interface-lens)
 [![VSCode](https://img.shields.io/badge/VSCode-1.76+-green.svg)](https://code.visualstudio.com/)
 
 一个面向大型 Go 工程的 VS Code / Cursor 接口导航扩展。它在接口、接口方法和具体实现之间提供双向 CodeLens，同时使用轻量候选索引和按需 AST 校验兼顾响应速度与查找准确性。
 
-不依赖 gopls；激活主路径保持轻量，完整 workspace 反向关系在后台并发预热。
+不依赖 gopls；激活和 CodeLens 渲染期间不扫描 workspace，导航数据全部按需构建。
 
 ## 工程特色
 
 ### 快速启动，按需精确查找
 
-- 激活主路径只建立轻量的方法名候选索引，不阻塞编辑器和 CodeLens 展示。
-- 轻量索引完成后，后台 AST worker pool 低优先级并发预热完整 workspace，同时预计算 `implementation -> interface` 和 `interface -> implementation` 双向关系；预热会保留已初始化 worker 和 I/O 容量给前台首次查询。
-- 点击查询命中排队中的预热文件时会提升该任务优先级，并继续复用同一次解析。
-- 点击 CodeLens 后，仅解析接口所在包、可能包含实现的候选包，以及按需命中的锁定依赖包。
+- 激活和 CodeLens 展示只解析当前编辑器文档，不建立 workspace 索引，也不启动 AST Worker。
+- 点击 CodeLens 后才建立轻量的方法名候选索引，并仅解析接口所在包、可能包含实现的候选包，以及当前查询命中的锁定依赖包。
 - 每个接口只选择一个低频方法作为依赖候选锚点，避免为完整方法集重复扫描模块缓存。
 - 已完成的查询直接使用内存缓存，未变化的文件可从持久化 AST 缓存恢复。
 
@@ -29,10 +27,9 @@
 - 值接收者、指针接收者及其不同的方法集。
 - 本地或跨包嵌入的 struct、interface 和类型别名。
 - 标准库接口、`go.mod` 锁定依赖中的接口与具体实现、local replace、module replace 和 GOROOT 源码。
-- workspace 内的双向接口关系和 workspace 接口对应的锁定依赖实现会在后台完整预热；预热完成后 `implementations` 直接查询包含依赖结果及方法位置的内存关系，依赖接口的 `goto interface` 结果仍按需补充。
-- 依赖实现预热会合并每个 workspace 接口的单个方法锚点，以逐行模式只扫描一次锁定依赖；跨行 receiver 只对命中的少量文件做补偿，并复用同一份 AST view 解析 alias、embed 和方法位置。
-- 完整的锁定依赖候选会按不可变 `module@version` 查询持久化；workspace 关系失效后可直接复用，超时或部分扫描结果不会写入完整关系快照。
-- 完整关系会持久化为 workspace 快照；未变化的 workspace 再次启动时可直接回答 implementations。AST 缓存按 pack 合并读取，依赖源码和单包编辑也会增量复用。
+- workspace 与锁定依赖中的正反向关系均在点击后按当前目标计算，不建立整库关系表。
+- 锁定依赖候选按接口中的低频方法逐次收窄，仅加载命中的包；跨包 alias、embed 和方法位置在同一次查询上下文中解析。
+- AST 缓存按 pack 合并读取；未变化的 workspace 和依赖声明可跨重启复用，但查询结果不会持久化为整库关系快照。
 - import 别名、包内别名、跨包别名链和复合别名。
 - `byte`/`uint8`、`rune`/`int32`、`any`/`interface{}` 等价关系，并尊重包级同名声明遮蔽。
 - 多行声明、分组参数、泛型接口与实现、泛型嵌入、泛型实例、匿名接口和嵌套函数类型。
@@ -70,7 +67,8 @@ func (r *PostgresUserRepository) FindByID(
 
 ### 为大型工程控制开销
 
-- 候选包 AST 使用 1-32 个 Worker Thread 并发解析，默认并发数为 16。
+- 候选包 AST 使用 1-32 个 Worker Thread 并发解析，默认上限为 32，并按可用 CPU 和内存自适应收缩。
+- Tree-sitter 解析前会清空函数体内容，仅保留函数签名、原始行号和源码偏移。
 - 相同文件的并发解析请求会自动合并。
 - 依赖接口只在工作区查找不到结果时按需搜索，不全量索引 module cache。
 - 外部依赖中的 concrete type 不会混入工作区实现结果。
@@ -105,9 +103,7 @@ WASM、Go grammar WASM 和 MIT 许可证；依赖包里的其他语言 grammar �
 
 查找结果会自动排除配置中的 mock、测试、生成文件和其他不需要的类型。
 
-后台关系预热会按有界批次解析工作区和依赖包。每批关系合并后会释放完整
-AST、依赖源码文本和多余 Worker；完成日志会输出各阶段耗时、RSS/Heap 峰值和
-Worker 水位，便于排查大型工程中的扩展宿主内存压力。
+查询完成后会释放依赖源码文本；多余 AST Worker 在空闲超时后收缩到一个，供后续查询复用。
 
 ## 环境要求
 
@@ -121,22 +117,26 @@ Worker 水位，便于排查大型工程中的扩展宿主内存压力。
 
 | 配置项 | 默认值 | 作用 |
 | --- | --- | --- |
-| `goInterfaceLens.astConcurrency` | `32` | 候选包 AST Worker 上限，可设置为 `1-32`；实际预热和后台并发按可用 CPU 自适应 |
-| `goInterfaceLens.dependencyScanConcurrency` | `8` | 扫描锁定依赖候选源码时使用的 ripgrep 线程数，可设置为 `1-32` |
+| `goInterfaceLens.astConcurrency` | `32` | 候选包 AST Worker 上限，可设置为 `1-32`；实际并发按可用 CPU 和内存自适应 |
 | `goInterfaceLens.excludedFolders` | `mocks, mock, testdata, vendor` | 排除指定目录 |
 | `goInterfaceLens.excludedFilePatterns` | `_mock.go, mock_, .pb.go, _test.go` | 排除文件名中包含指定文本的文件 |
 | `goInterfaceLens.excludedTypePatterns` | `Mock, mock, Stub, Fake` | 排除名称中包含指定文本的类型 |
+| `goInterfaceLens.excludedPackagePatterns` | 空 | 按 Go import path 排除工作区索引和依赖解析；`*` 匹配任意字符（包括 `/`），`?` 匹配单个字符 |
 | `goInterfaceLens.searchDependencies` | `true` | 正反向导航时按需搜索 `go.mod` 锁定依赖中的接口与具体实现；无锁信息时仅搜索显式配置的依赖根 |
 | `goInterfaceLens.goModCache` | 空 | 手动指定 Go module cache；为空时自动探测 |
+
+修改包路径排除规则后，插件会自动清理旧索引；下一次导航查询会按新规则重建，无需重启扩展。
 
 示例：
 
 ```json
 {
   "goInterfaceLens.astConcurrency": 32,
-  "goInterfaceLens.dependencyScanConcurrency": 8,
   "goInterfaceLens.searchDependencies": true,
   "goInterfaceLens.goModCache": "",
+  "goInterfaceLens.excludedPackagePatterns": [
+    "code.byted.org/overpass*"
+  ],
   "goInterfaceLens.excludedFolders": [
     "mocks",
     "mock",
@@ -160,7 +160,7 @@ Worker 水位，便于排查大型工程中的扩展宿主内存压力。
 }
 ```
 
-AST Worker 使用 `os.availableParallelism()` 感知宿主机或容器可用 CPU。预热默认使用可用 CPU 的约三分之二，后台解析再使用其中约三分之二，并为编辑器和前台导航保留容量。
+AST Worker 使用 `os.availableParallelism()` 感知宿主机或容器可用 CPU，并结合 cgroup 内存余量限制并发。扩展启动时 Worker 数为 `0`，首次导航查询才创建，空闲后收缩到 `1`。
 
 类型名以 `_` 开头时始终从实现结果中排除。
 

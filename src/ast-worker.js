@@ -2,7 +2,7 @@
 
 const fs = require('fs');
 const { parentPort } = require('worker_threads');
-const { parseGoFile, serializeParsedFile } = require('./ast');
+const { parseGoFile, parseGoDeclarations, serializeParsedFile } = require('./ast');
 const { initializeGoParser } = require('./tree-sitter-runtime');
 
 const ready = initializeGoParser();
@@ -16,8 +16,20 @@ parentPort.on('message', async (job) => {
     try {
         await ready;
         const text = job.text === undefined ? fs.readFileSync(job.file, 'utf8') : job.text;
-        const parsed = await parseGoFile(text);
-        parentPort.postMessage({ id: job.id, parsed: serializeParsedFile(parsed) });
+        let parsed;
+        let optimization = null;
+        if (job.declarationOnly) {
+            const result = await parseGoDeclarations(text);
+            parsed = result.parsed;
+            optimization = result.optimization;
+        } else {
+            parsed = await parseGoFile(text);
+        }
+        parentPort.postMessage({
+            id: job.id,
+            parsed: serializeParsedFile(parsed),
+            optimization,
+        });
     } catch (err) {
         parentPort.postMessage({
             id: job.id,
