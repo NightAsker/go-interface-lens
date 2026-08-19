@@ -4,6 +4,9 @@ const vscode = require('vscode');
 const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { hasCompatibleMethodArity } = require('./go-arity');
+
+const ARITY_PREFILTER_READ_CONCURRENCY = 32;
 
 /**
  * On-demand Go declaration candidate searches. Prefer VS Code's bundled
@@ -93,9 +96,10 @@ function resolveGoModCache(override) {
  * @param {string} methodName known method name to look for
  * @param {number} [maxFiles] cap on candidate files
  * @param {string[]} [searchDirs] restrict search to these absolute directories
+ * @param {{params:number,results:number}} [arity] optional declaration shape prefilter
  * @returns {Promise<string[]>}
  */
-async function grepInterfaceFilesForMethod(root, methodName, maxFiles, searchDirs) {
+async function grepInterfaceFilesForMethod(root, methodName, maxFiles, searchDirs, arity) {
     if (!/^[A-Za-z_]\w*$/.test(methodName)) return []; // guard the regex input
     const rg = findRipgrep();
     const cap = maxFiles || 200;
@@ -121,12 +125,12 @@ async function grepInterfaceFilesForMethod(root, methodName, maxFiles, searchDir
 
     try {
         const out = await runExec(rg || 'rg', args, root, 20000);
-        return out
+        const files = out
             .split('\n')
             .map((l) => l.trim())
             .filter(Boolean)
-            .map((l) => (path.isAbsolute(l) ? l : path.join(root, l)))
-            .slice(0, cap);
+            .map((l) => (path.isAbsolute(l) ? l : path.join(root, l)));
+        return filterFilesByMethodArity(files, methodName, 'interface', arity, cap);
     } catch (_) {
         return [];
     }
@@ -141,9 +145,10 @@ async function grepInterfaceFilesForMethod(root, methodName, maxFiles, searchDir
  * @param {string} methodName interface method used as the candidate anchor
  * @param {number} [maxFiles] cap on candidate files
  * @param {string[]} [searchDirs] restrict search to locked module directories
+ * @param {{params:number,results:number}} [arity] optional declaration shape prefilter
  * @returns {Promise<string[]>}
  */
-async function grepImplementationFilesForMethod(root, methodName, maxFiles, searchDirs) {
+async function grepImplementationFilesForMethod(root, methodName, maxFiles, searchDirs, arity) {
     if (!/^[A-Za-z_]\w*$/.test(methodName)) return [];
     const rg = findRipgrep();
     const cap = maxFiles || 400;
@@ -163,15 +168,49 @@ async function grepImplementationFilesForMethod(root, methodName, maxFiles, sear
 
     try {
         const out = await runExec(rg || 'rg', args, root, 20000);
-        return out
+        const files = out
             .split('\n')
             .map((line) => line.trim())
             .filter(Boolean)
-            .map((line) => (path.isAbsolute(line) ? line : path.join(root, line)))
-            .slice(0, cap);
+            .map((line) => (path.isAbsolute(line) ? line : path.join(root, line)));
+        return filterFilesByMethodArity(files, methodName, 'implementation', arity, cap);
     } catch (_) {
         return [];
     }
+}
+
+async function filterFilesByMethodArity(files, methodName, kind, arity, maxFiles) {
+    const cap = maxFiles || Number.MAX_SAFE_INTEGER;
+    if (
+        !arity ||
+        !Number.isInteger(arity.params) ||
+        !Number.isInteger(arity.results)
+    ) {
+        return files.slice(0, cap);
+    }
+    const keep = new Array(files.length);
+    let next = 0;
+    const workers = Array.from(
+        { length: Math.min(files.length, ARITY_PREFILTER_READ_CONCURRENCY) },
+        async () => {
+            while (next < files.length) {
+                const index = next++;
+                try {
+                    const source = await fs.promises.readFile(files[index], 'utf8');
+                    keep[index] = hasCompatibleMethodArity(
+                        source,
+                        methodName,
+                        kind,
+                        arity
+                    );
+                } catch (_) {
+                    keep[index] = true;
+                }
+            }
+        }
+    );
+    await Promise.all(workers);
+    return files.filter((_, index) => keep[index]).slice(0, cap);
 }
 
 

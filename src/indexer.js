@@ -165,6 +165,24 @@ function bareMethodName(methodKey) {
     return separator === -1 ? methodKey : methodKey.slice(separator + 1);
 }
 
+function signatureArity(signature) {
+    const slots = splitNormalizedSignature(signature);
+    return slots ? { params: slots.params.length, results: slots.results.length } : null;
+}
+
+function methodArity(methods, methodName) {
+    for (const [name, signature] of methods || []) {
+        if (bareMethodName(name) === methodName) return signatureArity(signature);
+    }
+    return null;
+}
+
+function arityCacheKey(arity) {
+    return arity && Number.isInteger(arity.params) && Number.isInteger(arity.results)
+        ? `${arity.params}:${arity.results}`
+        : '*';
+}
+
 function importedReferenceIdentity(reference) {
     const match = reference && reference.match(/^@\{([^}]+)\}\.([A-Z_a-z]\w*)$/);
     return match ? { importPath: match[1], name: match[2] } : null;
@@ -1563,11 +1581,12 @@ class WorkspaceIndex {
             .sort((left, right) => right.length - left.length || left.localeCompare(right))[0];
     }
 
-    _workspaceCandidateFiles(kind, methodName) {
+    _workspaceCandidateFiles(kind, methodName, arity) {
         const roots = this._workspaceRoots();
         const key = [
             kind,
             methodName,
+            arityCacheKey(arity),
             this._packagePatternKey(),
             JSON.stringify(normalizeWildcardPatterns(this.getConfig().excludedFolders)),
             ...roots,
@@ -1580,7 +1599,9 @@ class WorkspaceIndex {
                 ? grepImplementationFilesForMethod
                 : grepInterfaceFilesForMethod;
         const request = Promise.all(
-            roots.map((root) => search(root, methodName, Number.MAX_SAFE_INTEGER))
+            roots.map((root) =>
+                search(root, methodName, Number.MAX_SAFE_INTEGER, undefined, arity)
+            )
         ).then((groups) => {
             const files = new Set(groups.flat().map(path.normalize));
             for (const file of this._candidateFilesByMethod.get(methodName) || []) {
@@ -2595,9 +2616,10 @@ class WorkspaceIndex {
 
         const anchorMethod = this._selectAnchorMethod(descriptor.resolved.methods.keys());
         if (!anchorMethod) return null;
+        const anchorArity = methodArity(descriptor.resolved.methods, anchorMethod);
         const [implementationCandidates, interfaceCandidates] = await Promise.all([
-            this._workspaceCandidateFiles('implementation', anchorMethod),
-            this._workspaceCandidateFiles('interface', anchorMethod),
+            this._workspaceCandidateFiles('implementation', anchorMethod, anchorArity),
+            this._workspaceCandidateFiles('interface', anchorMethod, anchorArity),
         ]);
         const candidateFiles = new Set([
             ...implementationCandidates,
@@ -2705,11 +2727,25 @@ class WorkspaceIndex {
                 context.descriptor.resolved.methods.keys()
             );
             if (!anchorMethod) return context;
+            const anchorArity = methodArity(
+                context.descriptor.resolved.methods,
+                anchorMethod
+            );
             const dependencyDirs = this._dependencySearchDirs(cacheRoot);
             if (dependencyDirs === null) return context;
             const [implementationCandidates, interfaceCandidates] = await Promise.all([
-                this._dependencyImplementationCandidates(cacheRoot, anchorMethod, dependencyDirs),
-                this._dependencyInterfaceCandidates(cacheRoot, anchorMethod, dependencyDirs),
+                this._dependencyImplementationCandidates(
+                    cacheRoot,
+                    anchorMethod,
+                    dependencyDirs,
+                    anchorArity
+                ),
+                this._dependencyInterfaceCandidates(
+                    cacheRoot,
+                    anchorMethod,
+                    dependencyDirs,
+                    anchorArity
+                ),
             ]);
             const candidateFiles = new Set([
                 ...implementationCandidates,
@@ -2902,9 +2938,18 @@ class WorkspaceIndex {
                 200
             );
             if (!receiverPackageInfo) return [];
+            const receiverView = this._createAstView(receiverPackageInfo.files);
+            const receiverTypeKey = receiverView._findTypeKey(receiverType, receiverFile);
+            const receiverTypes = receiverView._merged().types;
+            const receiverInfo = receiverTypeKey && receiverTypes.get(receiverTypeKey);
+            const receiverArity = methodArity(
+                receiverInfo && receiverInfo.methods,
+                methodName
+            );
             const interfaceCandidates = await this._workspaceCandidateFiles(
                 'interface',
-                methodName
+                methodName,
+                receiverArity
             );
             const astFiles = new Map(receiverPackageInfo.files);
             const loadedDirectories = await this._loadWorkspaceCandidatePackages(
@@ -2976,6 +3021,7 @@ class WorkspaceIndex {
                             receiverType,
                             receiverFile,
                             astFiles: receiverAstFiles,
+                            methodArity: receiverArity,
                         }))
                     );
                 }
@@ -2996,7 +3042,8 @@ class WorkspaceIndex {
             candidates = await this._dependencyInterfaceCandidates(
                 cacheRoot,
                 methodName,
-                dependencyDirs
+                dependencyDirs,
+                receiver.methodArity
             );
         } catch (err) {
             this.log(`AST dependency candidate search failed: ${err.message}`);
@@ -3053,9 +3100,9 @@ class WorkspaceIndex {
         return results;
     }
 
-    _dependencyInterfaceCandidates(cacheRoot, methodName, lockedDirs) {
+    _dependencyInterfaceCandidates(cacheRoot, methodName, lockedDirs, arity) {
         const normalizedDirs = [...(lockedDirs || [])].map(path.normalize).sort();
-        const key = `${this._packagePatternKey()}\0${path.normalize(cacheRoot)}\0${methodName}\0${normalizedDirs.join('\0')}`;
+        const key = `${this._packagePatternKey()}\0${path.normalize(cacheRoot)}\0${methodName}\0${arityCacheKey(arity)}\0${normalizedDirs.join('\0')}`;
         if (this._dependencyCandidateCache.has(key)) {
             return this._dependencyCandidateCache.get(key);
         }
@@ -3064,7 +3111,8 @@ class WorkspaceIndex {
             cacheRoot,
             methodName,
             normalizedDirs.length > 0 ? Number.MAX_SAFE_INTEGER : undefined,
-            normalizedDirs
+            normalizedDirs,
+            arity
         ).then((files) => this._filterDependencyFiles(files)).catch((error) => {
             if (this._dependencyCandidateCache.get(key) === request) {
                 this._dependencyCandidateCache.delete(key);
@@ -3075,9 +3123,9 @@ class WorkspaceIndex {
         return request;
     }
 
-    _dependencyImplementationCandidates(cacheRoot, methodName, lockedDirs) {
+    _dependencyImplementationCandidates(cacheRoot, methodName, lockedDirs, arity) {
         const normalizedDirs = [...(lockedDirs || [])].map(path.normalize).sort();
-        const key = `${this._packagePatternKey()}\0${path.normalize(cacheRoot)}\0${methodName}\0${normalizedDirs.join('\0')}`;
+        const key = `${this._packagePatternKey()}\0${path.normalize(cacheRoot)}\0${methodName}\0${arityCacheKey(arity)}\0${normalizedDirs.join('\0')}`;
         if (this._dependencyImplementationCandidateCache.has(key)) {
             return this._dependencyImplementationCandidateCache.get(key);
         }
@@ -3086,7 +3134,8 @@ class WorkspaceIndex {
             cacheRoot,
             methodName,
             normalizedDirs.length > 0 ? Number.MAX_SAFE_INTEGER : undefined,
-            normalizedDirs
+            normalizedDirs,
+            arity
         ).then((files) => this._filterDependencyFiles(files)).catch((error) => {
             if (this._dependencyImplementationCandidateCache.get(key) === request) {
                 this._dependencyImplementationCandidateCache.delete(key);
@@ -3501,7 +3550,8 @@ class WorkspaceIndex {
             candidates = await this._dependencyInterfaceCandidates(
                 cacheRoot,
                 methodName,
-                dependencyDirs
+                dependencyDirs,
+                signatureArity(mySig)
             );
         } catch (err) {
             this.log(`Dependency search failed: ${err.message}`);

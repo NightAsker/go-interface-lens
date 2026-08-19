@@ -26,6 +26,7 @@ async function main() {
     const alphaDir = path.join(root, 'alpha');
     const betaDir = path.join(root, 'beta');
     const assembledDir = path.join(root, 'assembled');
+    const arityNoiseDir = path.join(root, 'aritynoise');
     fs.mkdirSync(apiDir, { recursive: true });
     fs.mkdirSync(implDir, { recursive: true });
     fs.mkdirSync(wrongDir, { recursive: true });
@@ -34,6 +35,7 @@ async function main() {
     fs.mkdirSync(alphaDir, { recursive: true });
     fs.mkdirSync(betaDir, { recursive: true });
     fs.mkdirSync(assembledDir, { recursive: true });
+    fs.mkdirSync(arityNoiseDir, { recursive: true });
     fs.writeFileSync(path.join(root, 'go.mod'), 'module example.com/project\n\ngo 1.22\n');
 
     const interfaceFile = path.join(apiDir, 'service.go');
@@ -145,8 +147,9 @@ async function main() {
         ].join('\n')
     );
 
+    const wrongFile = path.join(wrongDir, 'wrong.go');
     fs.writeFileSync(
-        path.join(wrongDir, 'wrong.go'),
+        wrongFile,
         [
             'package wrong',
             'import "context"',
@@ -159,6 +162,15 @@ async function main() {
             'type WrongEnterLeaveMsgResponse struct{}',
             'type WrongEnterLeaveService struct{}',
             'func (WrongEnterLeaveService) PutConversationIntoLeaveMsg(ctx context.Context, req *pigeon_conversation_paas.EnterLeaveMsgRequest) (*WrongEnterLeaveMsgResponse, error) { return nil, nil }',
+        ].join('\n')
+    );
+    const arityNoiseFile = path.join(arityNoiseDir, 'noise.go');
+    fs.writeFileSync(
+        arityNoiseFile,
+        [
+            'package aritynoise',
+            'type Noise struct{}',
+            'func (Noise) Run(first, second, third string) (string, error) { return "", nil }',
         ].join('\n')
     );
     const bodyNoiseFile = path.join(wrongDir, 'body-noise.go');
@@ -282,6 +294,31 @@ async function main() {
     assert(
         'workspace rg rejects calls from package-level function literals',
         !literalCandidates.includes(bodyNoiseFile)
+    );
+    const broadRunCandidates = await index._workspaceCandidateFiles(
+        'implementation',
+        'Run'
+    );
+    assert(
+        'method-name-only rg includes a wrong-arity declaration',
+        broadRunCandidates.includes(arityNoiseFile)
+    );
+    const shapedRunCandidates = await index._workspaceCandidateFiles(
+        'implementation',
+        'Run',
+        { params: 2, results: 1 }
+    );
+    assert(
+        'arity prefilter keeps the matching multiline declaration',
+        shapedRunCandidates.includes(implementationFile)
+    );
+    assert(
+        'arity prefilter rejects a different parameter and result count',
+        !shapedRunCandidates.includes(arityNoiseFile)
+    );
+    assert(
+        'arity prefilter also rejects a common name with one parameter',
+        !shapedRunCandidates.includes(wrongFile)
     );
     assert(
         'legacy receiver regex misses deliberately split declaration',

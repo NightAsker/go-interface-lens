@@ -2,6 +2,15 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.0.5] - 2026-08-19
+
+### Changed
+
+- Prefilter ripgrep declaration candidates by the target method's parameter and
+  result counts before loading complete workspace or locked-dependency packages.
+  The lightweight scanner handles multiline declarations, grouped names, nested
+  function types, and generics, while retaining uncertain files for Tree-sitter.
+
 ## [2.0.4] - 2026-08-19
 
 ### Changed

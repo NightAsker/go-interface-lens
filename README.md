@@ -1,6 +1,6 @@
 # Go Interface Lens
 
-[![Version](https://img.shields.io/badge/version-2.0.4-blue.svg)](https://github.com/NightAsker/go-interface-lens)
+[![Version](https://img.shields.io/badge/version-2.0.5-blue.svg)](https://github.com/NightAsker/go-interface-lens)
 [![VSCode](https://img.shields.io/badge/VSCode-1.76+-green.svg)](https://code.visualstudio.com/)
 
 一个面向大型 Go 工程的 VS Code / Cursor 接口导航扩展。它在接口、接口方法和具体实现之间提供双向 CodeLens，同时使用按查询的声明搜索和按需 AST 校验兼顾响应速度与查找准确性。
@@ -13,6 +13,7 @@
 
 - 激活和 CodeLens 展示只解析当前编辑器文档，不建立 workspace 索引，也不启动 AST Worker。
 - 点击 CodeLens 后先解析目标所在包，再由 ripgrep 按方法声明搜索文件内容，仅加载命中的完整包。
+- ripgrep 命中的文件会先按目标方法的入参和出参数量粗筛，数量不符的同名声明不会触发完整包加载。
 - 候选包中的类型别名和嵌入关系会按需递归扩展；Tree-sitter 最终校验完整方法集和签名，不会把普通函数调用当成声明。
 - 每个接口只选择一个较长的方法名作为候选锚点，避免为完整方法集重复扫描 workspace 和模块缓存。
 - 已完成的查询直接使用内存缓存，未变化的文件可从持久化 AST 缓存恢复。

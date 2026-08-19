@@ -30,6 +30,7 @@ async function main() {
     const ordinaryRefDir = path.join(modCache, 'example.com', 'ordinaryref@v1.0.0');
     const callNoiseDir = path.join(modCache, 'example.com', 'callnoise@v1.0.0');
     const aliasImplDir = path.join(modCache, 'example.com', 'aliasimpl@v1.0.0');
+    const arityNoiseDir = path.join(modCache, 'example.com', 'aritynoise@v1.0.0');
     const goRoot = path.join(tmp, 'goroot');
     const standardDir = path.join(goRoot, 'src', 'standard', 'sort');
     fs.mkdirSync(root, { recursive: true });
@@ -44,10 +45,11 @@ async function main() {
     fs.mkdirSync(ordinaryRefDir, { recursive: true });
     fs.mkdirSync(callNoiseDir, { recursive: true });
     fs.mkdirSync(aliasImplDir, { recursive: true });
+    fs.mkdirSync(arityNoiseDir, { recursive: true });
     fs.mkdirSync(standardDir, { recursive: true });
     fs.writeFileSync(
         path.join(root, 'go.mod'),
-        'module example.com/project\n\ngo 1.22\n\nrequire (\n\texample.com/dep v1.0.0\n\texample.com/aliasdep v1.0.0\n\texample.com/depimpl v1.0.0\n\texample.com/iface v1.0.0\n\texample.com/wrapper v1.0.0\n\texample.com/noisealias v1.0.0\n\texample.com/anchornoise v1.0.0\n\texample.com/ordinaryref v1.0.0\n\texample.com/callnoise v1.0.0\n\texample.com/aliasimpl v1.0.0\n)\n'
+        'module example.com/project\n\ngo 1.22\n\nrequire (\n\texample.com/dep v1.0.0\n\texample.com/aliasdep v1.0.0\n\texample.com/depimpl v1.0.0\n\texample.com/iface v1.0.0\n\texample.com/wrapper v1.0.0\n\texample.com/noisealias v1.0.0\n\texample.com/anchornoise v1.0.0\n\texample.com/ordinaryref v1.0.0\n\texample.com/callnoise v1.0.0\n\texample.com/aliasimpl v1.0.0\n\texample.com/aritynoise v1.0.0\n)\n'
     );
     const implementationFile = path.join(root, 'impl.go');
     fs.writeFileSync(
@@ -83,6 +85,17 @@ async function main() {
     fs.writeFileSync(path.join(ordinaryRefDir, 'go.mod'), 'module example.com/ordinaryref\n\ngo 1.22\n');
     fs.writeFileSync(path.join(callNoiseDir, 'go.mod'), 'module example.com/callnoise\n\ngo 1.22\n');
     fs.writeFileSync(path.join(aliasImplDir, 'go.mod'), 'module example.com/aliasimpl\n\ngo 1.22\n');
+    fs.writeFileSync(path.join(arityNoiseDir, 'go.mod'), 'module example.com/aritynoise\n\ngo 1.22\n');
+    const arityNoiseFile = path.join(arityNoiseDir, 'noise.go');
+    fs.writeFileSync(
+        arityNoiseFile,
+        [
+            'package aritynoise',
+            'type WrongInterface interface { HandleMessage(first, second, third string) error }',
+            'type WrongImplementation struct{}',
+            'func (WrongImplementation) HandleMessage(first, second, third string) error { return nil }',
+        ].join('\n') + '\n'
+    );
     fs.writeFileSync(path.join(noiseAliasDir, 'noise.go'), 'package noisealias\ntype Payload struct{}\n');
     for (let i = 0; i < 8; i++) {
         fs.writeFileSync(
@@ -227,6 +240,31 @@ async function main() {
     await index.ensureBuilt(root);
 
     console.log('== lazy AST dependency filtering ==');
+    const arityLockedDirs = index._dependencySearchDirs(modCache);
+    const shapedImplementationCandidates = await index._dependencyImplementationCandidates(
+        modCache,
+        'HandleMessage',
+        arityLockedDirs,
+        { params: 2, results: 1 }
+    );
+    assert(
+        'dependency arity prefilter keeps a matching receiver declaration',
+        shapedImplementationCandidates.includes(dependencyImplementationFile)
+    );
+    assert(
+        'dependency arity prefilter rejects a wrong-arity receiver declaration',
+        !shapedImplementationCandidates.includes(arityNoiseFile)
+    );
+    const shapedInterfaceCandidates = await index._dependencyInterfaceCandidates(
+        modCache,
+        'HandleMessage',
+        arityLockedDirs,
+        { params: 2, results: 1 }
+    );
+    assert(
+        'dependency arity prefilter rejects a wrong-arity interface declaration',
+        !shapedInterfaceCandidates.includes(arityNoiseFile)
+    );
     const interfaces = await index.findInterfacesAst('ExternalImpl', 'ExternalOnly', {
         receiverFile: implementationFile,
     });
