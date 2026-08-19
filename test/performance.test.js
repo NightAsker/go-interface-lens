@@ -70,7 +70,7 @@ async function main() {
     const buildMs = Number(process.hrtime.bigint() - buildStarted) / 1e6;
     const parsedAfterStartup = index.getAstStats().parsed;
     const workersAfterStartup = index.astPool.workers.length;
-    const rareCandidates = index._candidatePackagesForMethods(['RareMethod']);
+    const filesAfterStartup = index.files.size;
 
     const coldStarted = process.hrtime.bigint();
     const cold = await index.findImplementationsAst('Rare', interfaceFile);
@@ -95,7 +95,7 @@ async function main() {
     const restoredMs = Number(process.hrtime.bigint() - restoredStarted) / 1e6;
 
     console.log('== lazy AST performance (402 Go files) ==');
-    console.log(`  startup regex index : ${buildMs.toFixed(1)}ms`);
+    console.log(`  root registration   : ${buildMs.toFixed(1)}ms`);
     console.log(`  AST cold query      : ${coldMs.toFixed(1)}ms`);
     console.log(`  AST cached query    : ${cachedMs.toFixed(2)}ms`);
     console.log(`  restored AST query  : ${restoredMs.toFixed(2)}ms`);
@@ -105,13 +105,13 @@ async function main() {
     assert('cached AST query preserves result', cached.length === 1 && cached[0].name === 'Impl');
     assert('second on-demand query finds its implementation', second.length === 1 && second[0].name === '*CachedImpl');
     assert('reverse on-demand query finds the interface', reverse.length === 1 && reverse[0].name === 'Rare');
-    assert('startup regex indexing stays within broad budget', buildMs < 5000);
-    assert('startup candidate indexing does not parse any file with WASM', parsedAfterStartup === 0);
+    assert('root registration stays within broad budget', buildMs < 5000);
+    assert('root registration does not retain workspace source metadata', filesAfterStartup === 0);
+    assert('root registration does not parse any file with WASM', parsedAfterStartup === 0);
     assert('startup does not create parser workers', workersAfterStartup === 0);
     assert('cold candidate AST query stays within broad budget', coldMs < 2000);
     assert('cached query stays responsive', cachedMs < 100);
     assert('cold query parses candidates instead of the whole workspace', parsedAfterColdQuery <= 4);
-    assert('unrelated local embeds do not inflate candidates', rareCandidates.size <= 2);
     assert('restart remains lazy until a query arrives', restoredWorkersBeforeQuery === 0);
     assert('restart query restores declaration ASTs from disk', restoredIndex.getAstStats().diskHits > 0);
     assert('restored AST query preserves implementation results', restored.length === 1 && restored[0].name === '*CachedImpl');

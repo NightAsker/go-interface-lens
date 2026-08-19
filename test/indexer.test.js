@@ -95,7 +95,6 @@ async function main() {
 
     idx.dispose();
 
-    await chunkedIndexBuildYields();
     await invertedIndexStopsAfterFirstMatch();
     await sameNameDifferentPackages();
     await sameNameInterfacesStayPackageScoped();
@@ -221,29 +220,6 @@ async function predeclaredAliasesCanonicalizeCompositeResults() {
         'declaration AST matches interface{} and any recursively inside result types',
         idx.findImplementations('CompositeResults', astFile).some((result) => result.name === 'Impl')
     );
-    idx.dispose();
-}
-
-async function chunkedIndexBuildYields() {
-    const idx = new WorkspaceIndex(cfg, () => {});
-    const fixtureDir = path.join(__dirname, 'fixtures', 'pkg');
-    const files = [path.join(fixtureDir, 'store.go'), path.join(fixtureDir, 'embed.go')];
-    const previousSlice = WorkspaceIndex.INDEX_TIME_SLICE_MS;
-    let yields = 0;
-
-    WorkspaceIndex.INDEX_TIME_SLICE_MS = 0;
-    idx._yieldToEventLoop = async () => {
-        yields += 1;
-    };
-    try {
-        await idx._indexFilesInChunks(files);
-    } finally {
-        WorkspaceIndex.INDEX_TIME_SLICE_MS = previousSlice;
-    }
-
-    console.log('\n== chunked index build yields ==');
-    assert('indexes every file through async batches', idx.files.size === files.length);
-    assert('yields between synchronous parse slices', yields === files.length);
     idx.dispose();
 }
 

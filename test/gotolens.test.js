@@ -53,10 +53,11 @@ const vscodeStub = Object.assign({}, realStub, {
     commands: { registerCommand: () => ({ dispose() {} }) },
 });
 // getConfiguration is read by extension.js; provide a permissive config.
+let excludedFolders = ['vendor'];
 vscodeStub.workspace = Object.assign({}, realStub.workspace, {
     getConfiguration: () => ({
         get: (key, def) => {
-            if (key === 'excludedFolders') return ['vendor'];
+            if (key === 'excludedFolders') return excludedFolders;
             if (key === 'excludedFilePatterns') return [];
             if (key === 'excludedTypePatterns') return [];
             if (key === 'searchDependencies') return false;
@@ -77,7 +78,7 @@ void origResolve;
 
 const { WorkspaceIndex } = require(path.join(__dirname, '..', 'src', 'indexer'));
 const extension = require(path.join(__dirname, '..', 'extension.js'));
-const { assert, done } = require(path.join(__dirname, 'harness'));
+const { assert, eq, done } = require(path.join(__dirname, 'harness'));
 
 // A fake document over a real on-disk Go file.
 function fakeDocument(filePath) {
@@ -223,6 +224,25 @@ async function main() {
         'editor parsing ignores syntax errors inside removed function bodies',
         !declarationParse.hasSyntaxError
     );
+
+    let excludedDocumentReads = 0;
+    const excludedDocument = {
+        fileName: path.join(root, 'cache', 'overpass@v1.2.3', 'hidden.go'),
+        uri: { fsPath: path.join(root, 'cache', 'overpass@v1.2.3', 'hidden.go') },
+        version: 1,
+        getText: () => {
+            excludedDocumentReads += 1;
+            return 'package hidden\ntype Hidden interface { Run() }\n';
+        },
+    };
+    excludedFolders = ['*overpass*'];
+    eq(
+        'folder wildcard suppresses CodeLens before document parsing',
+        await interfaceProvider.provideCodeLenses(excludedDocument),
+        []
+    );
+    eq('excluded editor document never reaches Tree-sitter', excludedDocumentReads, 0);
+    excludedFolders = ['vendor'];
 
     let backgroundBuilds = 0;
     extension._test.setWorkspaceIndex({

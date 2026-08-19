@@ -23,11 +23,17 @@ async function main() {
     const wrongDir = path.join(root, 'wrong');
     const baseDir = path.join(root, 'base');
     const pigeonDir = path.join(root, 'pigeon');
+    const alphaDir = path.join(root, 'alpha');
+    const betaDir = path.join(root, 'beta');
+    const assembledDir = path.join(root, 'assembled');
     fs.mkdirSync(apiDir, { recursive: true });
     fs.mkdirSync(implDir, { recursive: true });
     fs.mkdirSync(wrongDir, { recursive: true });
     fs.mkdirSync(baseDir, { recursive: true });
     fs.mkdirSync(pigeonDir, { recursive: true });
+    fs.mkdirSync(alphaDir, { recursive: true });
+    fs.mkdirSync(betaDir, { recursive: true });
+    fs.mkdirSync(assembledDir, { recursive: true });
     fs.writeFileSync(path.join(root, 'go.mod'), 'module example.com/project\n\ngo 1.22\n');
 
     const interfaceFile = path.join(apiDir, 'service.go');
@@ -68,6 +74,10 @@ async function main() {
             '    base.Remote',
             '    Local() error',
             '}',
+            'type CompositeEmbedding interface {',
+            '    Alpha() error',
+            '    Beta() error',
+            '}',
             'type Number interface { ~int | int64 }',
         ].join('\n')
     );
@@ -86,6 +96,34 @@ async function main() {
             'type Remote interface { Remote() error }',
             'type Base struct{}',
             'func (Base) Remote() error { return nil }',
+        ].join('\n')
+    );
+    fs.writeFileSync(
+        path.join(alphaDir, 'alpha.go'),
+        [
+            'package alpha',
+            'type Part struct{}',
+            'func (Part) Alpha() error { return nil }',
+        ].join('\n')
+    );
+    fs.writeFileSync(
+        path.join(betaDir, 'beta.go'),
+        [
+            'package beta',
+            'type Part struct{}',
+            'func (Part) Beta() error { return nil }',
+        ].join('\n')
+    );
+    fs.writeFileSync(
+        path.join(assembledDir, 'combined.go'),
+        [
+            'package assembled',
+            'import "example.com/project/alpha"',
+            'import "example.com/project/beta"',
+            'type Combined struct {',
+            '    alpha.Part',
+            '    beta.Part',
+            '}',
         ].join('\n')
     );
 
@@ -121,6 +159,22 @@ async function main() {
             'type WrongEnterLeaveMsgResponse struct{}',
             'type WrongEnterLeaveService struct{}',
             'func (WrongEnterLeaveService) PutConversationIntoLeaveMsg(ctx context.Context, req *pigeon_conversation_paas.EnterLeaveMsgRequest) (*WrongEnterLeaveMsgResponse, error) { return nil, nil }',
+        ].join('\n')
+    );
+    const bodyNoiseFile = path.join(wrongDir, 'body-noise.go');
+    fs.writeFileSync(
+        bodyNoiseFile,
+        [
+            'package wrong',
+            'type Multiline struct{}',
+            'func (receiver *Multiline) Declared(',
+            '    value string,',
+            ') error {',
+            '    BodyOnlyCall()',
+            '    type Local struct { BodyEmbedded }',
+            '    return nil',
+            '}',
+            'var callback = func() { FunctionLiteralOnly() }',
         ].join('\n')
     );
     fs.writeFileSync(
@@ -202,7 +256,33 @@ async function main() {
     });
     await index.ensureBuilt(root);
 
-    console.log('== regex recall followed by lazy AST filtering ==');
+    console.log('== query-driven rg candidates followed by lazy AST filtering ==');
+    eq('registering a root keeps the workspace source index empty', index.files.size, 0);
+    eq('registering a root does not create AST workers', index.astPool.workers.length, 0);
+    const declaredCandidates = await index._workspaceCandidateFiles(
+        'implementation',
+        'Declared'
+    );
+    assert(
+        'workspace rg keeps multiline method declarations',
+        declaredCandidates.includes(bodyNoiseFile)
+    );
+    const bodyCandidates = await index._workspaceCandidateFiles(
+        'implementation',
+        'BodyOnlyCall'
+    );
+    assert(
+        'workspace rg rejects calls from named function bodies',
+        !bodyCandidates.includes(bodyNoiseFile)
+    );
+    const literalCandidates = await index._workspaceCandidateFiles(
+        'implementation',
+        'FunctionLiteralOnly'
+    );
+    assert(
+        'workspace rg rejects calls from package-level function literals',
+        !literalCandidates.includes(bodyNoiseFile)
+    );
     assert(
         'legacy receiver regex misses deliberately split declaration',
         !index.findImplementations('Service', interfaceFile).some((result) => result.name === 'Worker')
@@ -275,6 +355,15 @@ async function main() {
         combined.map((result) => result.name).sort(),
         ['Direct', 'Promoted']
     );
+    const compositeEmbedding = await index.findImplementationsAst(
+        'CompositeEmbedding',
+        interfaceFile
+    );
+    eq(
+        'type-reference expansion finds implementations assembled from partial cross-package embeds',
+        compositeEmbedding.map((result) => result.name),
+        ['Combined']
+    );
     const delegated = await index.findImplementationsAst('Delegated', interfaceFile);
     eq(
         'struct embedding an imported interface or its alias inherits its method set',
@@ -334,7 +423,11 @@ async function main() {
     index.updateOverlay(
         implementationFile,
         `${diskImplementation}\ntype OverlayWorker struct{}\n` +
-            'func (OverlayWorker) Run(_ ctx.Context, callback func(string) error) error { return nil }\n'
+            'func (OverlayWorker) Run(_ ctx.Context, callback func(string) error) error { OverlayBodyOnly(); return nil }\n'
+    );
+    assert(
+        'unsaved declaration candidates remove calls from function bodies',
+        !index._candidateFilesByMethod.has('OverlayBodyOnly')
     );
     const withOverlay = await index.findImplementationsAst('Service', interfaceFile);
     assert(

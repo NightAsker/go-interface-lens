@@ -2,7 +2,23 @@
 
 All notable changes to Go Interface Lens are documented here.
 
-## Unreleased
+## [2.0.4] - 2026-08-19
+
+### Changed
+
+- Support `*` and `?` wildcards in `goInterfaceLens.excludedFolders` and reject
+  matching paths before they can enter Tree-sitter parsing.
+- Remove the full-workspace lightweight candidate index and its persistent
+  cache. Startup now only registers workspace roots and installs file watchers.
+- Search file contents for receiver-method and interface declarations with
+  ripgrep per query, load only matching complete packages, then recursively
+  expand aliases and embedded types before exact Tree-sitter verification.
+- Include partial anchor-method providers during type-reference expansion so
+  implementations assembled from multiple cross-package embeds are found.
+- Bound on-demand workspace loading to eight packages at a time and 16 source
+  reads per selected package.
+- Remove function bodies before Tree-sitter parses selected packages while
+  preserving function signatures, source offsets, and line numbers.
 
 ## [2.0.3] - 2026-08-19
 

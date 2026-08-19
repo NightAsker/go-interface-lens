@@ -24,94 +24,84 @@ const config = () => ({
     astConcurrency: 2,
 });
 
-async function buildObservedIndex(root, cacheDir) {
-    const index = new WorkspaceIndex(config, () => {}, { cacheDir });
-    let indexed = 0;
-    let restored = 0;
-    const indexText = index._indexText.bind(index);
-    const restoreCandidateFile = index._restoreCandidateFile.bind(index);
-    index._indexText = (...args) => {
-        indexed += 1;
-        return indexText(...args);
-    };
-    index._restoreCandidateFile = (...args) => {
-        restored += 1;
-        return restoreCandidateFile(...args);
-    };
-    await index.ensureBuilt(root);
-    return { index, indexed, restored };
-}
-
 async function main() {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'go-interface-candidate-cache-'));
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'go-interface-workspace-candidates-'));
     const root = path.join(tmp, 'project');
     const apiDir = path.join(root, 'api');
     const implDir = path.join(root, 'impl');
+    const noiseDir = path.join(root, 'noise');
     const cacheDir = path.join(tmp, 'cache');
     fs.mkdirSync(apiDir, { recursive: true });
     fs.mkdirSync(implDir, { recursive: true });
+    fs.mkdirSync(noiseDir, { recursive: true });
+    fs.mkdirSync(cacheDir, { recursive: true });
     fs.writeFileSync(path.join(root, 'go.mod'), 'module example.com/cache\n\ngo 1.22\n');
 
     const apiFile = path.join(apiDir, 'service.go');
     const implFile = path.join(implDir, 'impl.go');
-    fs.writeFileSync(
-        apiFile,
-        [
-            'package api',
-            'import "io"',
-            'type Service interface { Run() error }',
-            'type ReaderHolder struct { io.Reader }',
-        ].join('\n')
-    );
+    fs.writeFileSync(apiFile, 'package api\ntype Service interface { Run() error }\n');
     fs.writeFileSync(
         implFile,
-        ['package impl', 'type Impl struct{}', 'func (Impl) Run() error { return nil }'].join('\n')
+        'package impl\ntype Impl struct{}\nfunc (Impl) Run() error { return nil }\n'
     );
+    for (let i = 0; i < 50; i++) {
+        fs.writeFileSync(
+            path.join(noiseDir, `noise-${i}.go`),
+            `package noise\ntype Noise${i} struct{}\nfunc (Noise${i}) Other${i}() {}\n`
+        );
+    }
 
-    console.log('== persistent lightweight candidate index ==');
-    fs.mkdirSync(cacheDir, { recursive: true });
+    console.log('== query-driven workspace candidate cache ==');
     const obsoleteRelation = path.join(cacheDir, 'interface-relations-v1-old.json');
     const obsoleteDependencyBatch = path.join(cacheDir, 'dependency-candidates-v1-old.json');
+    const obsoleteCandidateIndex = path.join(cacheDir, 'candidate-index-v4-old.json');
     const unrelatedCache = path.join(cacheDir, 'unrelated.json');
     fs.writeFileSync(obsoleteRelation, '{}');
     fs.writeFileSync(obsoleteDependencyBatch, '{}');
+    fs.writeFileSync(obsoleteCandidateIndex, '{}');
     fs.writeFileSync(unrelatedCache, '{}');
-    const first = await buildObservedIndex(root, cacheDir);
+
+    const first = new WorkspaceIndex(config, () => {}, { cacheDir });
+    await first.ensureBuilt(root);
     assert('removed relation cache artifacts are cleaned during upgrade', !fs.existsSync(obsoleteRelation));
     assert('removed dependency batch artifacts are cleaned during upgrade', !fs.existsSync(obsoleteDependencyBatch));
+    assert('removed candidate index artifacts are cleaned during upgrade', !fs.existsSync(obsoleteCandidateIndex));
     assert('upgrade cleanup preserves unrelated cache files', fs.existsSync(unrelatedCache));
-    eq('first build reads every Go source', first.indexed, 2);
-    eq('first build has no persisted candidates to restore', first.restored, 0);
-    const cacheFile = first.index._candidateCacheFile(root);
-    assert('first build writes a workspace-scoped candidate cache', fs.existsSync(cacheFile));
-    first.index.dispose();
+    eq('root registration reads no workspace source files', first.files.size, 0);
+    eq('root registration starts no AST workers', first.astPool.workers.length, 0);
+    assert(
+        'root registration does not create a persistent full-workspace candidate cache',
+        !fs.readdirSync(cacheDir).some((name) => name.startsWith('candidate-index-'))
+    );
 
-    const second = await buildObservedIndex(root, cacheDir);
-    eq('unchanged restart reads no Go source text', second.indexed, 0);
-    eq('unchanged restart restores every candidate entry', second.restored, 2);
-    const apiMetadata = second.index._candidateMetadataByFile.get(apiFile);
-    assert('cached imports survive serialization', apiMetadata.imports.get('io') === 'io');
-    assert('cached embedded references survive serialization', apiMetadata.embeddedReferences.has('io.Reader'));
-    const implementations = await second.index.findImplementationsAst('Service', apiFile);
-    eq('restored candidates still drive precise AST lookup', implementations.map((item) => item.name), ['Impl']);
-    second.index.dispose();
+    const firstCandidateRequest = first._workspaceCandidateFiles('implementation', 'Run');
+    const sharedCandidateRequest = first._workspaceCandidateFiles('implementation', 'Run');
+    assert('identical workspace candidate scans share one in-flight promise', firstCandidateRequest === sharedCandidateRequest);
+    const candidates = await firstCandidateRequest;
+    eq('rg returns only the matching implementation file', candidates, [implFile]);
 
-    fs.appendFileSync(implFile, '\nfunc (Impl) Stop() {}\n');
-    const third = await buildObservedIndex(root, cacheDir);
-    eq('incremental restart reads only the changed file', third.indexed, 1);
-    eq('incremental restart restores the unchanged file', third.restored, 1);
-    assert('changed method is present in the refreshed candidate index', third.index._candidateFilesByMethod.has('Stop'));
-    third.index.dispose();
+    const implementations = await first.findImplementationsAst('Service', apiFile);
+    eq('on-demand candidates drive precise AST lookup', implementations.map((item) => item.name), ['Impl']);
+    assert('unrelated source files never enter the AST worker pool', first.getAstStats().parsed <= 2);
+    await first.astPool.flush();
+    first.dispose();
 
-    fs.unlinkSync(apiFile);
-    const fourth = await buildObservedIndex(root, cacheDir);
-    eq('deleted source is removed from the in-memory index', fourth.index.files.size, 1);
-    const payload = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
-    eq('deleted source is removed from the persisted index', payload.files.length, 1);
-    fourth.index.clear();
-    assert('clearing the extension cache removes the candidate cache', !fs.existsSync(cacheFile));
-    fourth.index.dispose();
+    const restored = new WorkspaceIndex(config, () => {}, { cacheDir });
+    await restored.ensureBuilt(root);
+    eq('restart still reads no workspace source files during root registration', restored.files.size, 0);
+    eq('restart still starts without AST workers', restored.astPool.workers.length, 0);
+    const restoredResults = await restored.findImplementationsAst('Service', apiFile);
+    eq('restored AST cache preserves query results', restoredResults.map((item) => item.name), ['Impl']);
+    assert('candidate packages restore declarations from the AST disk cache', restored.getAstStats().diskHits > 0);
 
+    const updatedSource = 'package impl\ntype Impl struct{}\nfunc (Impl) Stop() error { return nil }\n';
+    fs.writeFileSync(implFile, updatedSource);
+    restored.updateFileText(implFile, updatedSource);
+    eq('file changes invalidate workspace candidate scans', restored._workspaceCandidateCache.size, 0);
+    const stopped = await restored.findImplementationsAst('Service', apiFile);
+    eq('file changes invalidate cached query results', stopped, []);
+
+    restored.dispose();
     fs.rmSync(tmp, { recursive: true, force: true });
     done();
 }

@@ -7,6 +7,7 @@ const { WorkspaceIndex } = require('./src/indexer');
 const { resolveSearchRoots } = require('./src/search');
 const { parseGoDeclarations } = require('./src/ast');
 const { DEFAULT_AST_CONCURRENCY } = require('./src/ast-cache');
+const { normalizeWildcardPatterns, createFolderMatcher } = require('./src/path-filter');
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -35,10 +36,10 @@ function getConfiguration() {
 function shouldExclude(filePath, receiverType) {
     const config = getConfiguration();
 
-    const pathParts = filePath.split(path.sep);
-    for (const folder of config.excludedFolders) {
-        if (pathParts.includes(folder)) return true;
-    }
+    const folderMatcher = createFolderMatcher(
+        normalizeWildcardPatterns(config.excludedFolders)
+    );
+    if (folderMatcher(path.dirname(filePath))) return true;
 
     const fileName = path.basename(filePath);
     for (const pattern of config.excludedFilePatterns) {
@@ -121,6 +122,8 @@ class GoCodeLensProvider {
 
     async provideCodeLenses(document) {
         const codeLenses = [];
+        const filePath = document.fileName || (document.uri && document.uri.fsPath);
+        if (filePath && shouldExclude(filePath)) return codeLenses;
         const parsed = await parseDocument(document);
 
         const lineRange = (index) =>
@@ -346,8 +349,13 @@ function activate(context) {
     if (typeof vscode.workspace.onDidChangeConfiguration === 'function') {
         context.subscriptions.push(
             vscode.workspace.onDidChangeConfiguration((event) => {
-                if (!event.affectsConfiguration('goInterfaceLens.excludedPackagePatterns')) return;
-                log('Package exclusion patterns changed; rebuilding workspace index');
+                if (
+                    !event.affectsConfiguration('goInterfaceLens.excludedFolders') &&
+                    !event.affectsConfiguration('goInterfaceLens.excludedPackagePatterns')
+                ) {
+                    return;
+                }
+                log('Path exclusion patterns changed; clearing navigation caches');
                 workspaceIndex.clear();
                 provider._onDidChangeCodeLenses.fire();
             })

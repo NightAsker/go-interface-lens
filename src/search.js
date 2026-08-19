@@ -6,13 +6,9 @@ const fs = require('fs');
 const path = require('path');
 
 /**
- * File discovery for Go sources.
- *
- * Prefers ripgrep (bundled with VS Code) because it is multi-threaded and
- * honours .gitignore, then falls back to a system `rg`, then to a plain Node
- * directory walk. Arguments are always passed as an argv array via execFile —
- * never interpolated into a shell string — so method / type names can never
- * cause shell injection.
+ * On-demand Go declaration candidate searches. Prefer VS Code's bundled
+ * ripgrep, then fall back to a system `rg`. Arguments are always passed as an
+ * argv array via execFile so method and type names cannot cause shell injection.
  */
 
 let cachedRgPath;
@@ -46,34 +42,6 @@ function findRipgrep() {
 
     cachedRgPath = null; // fall back to PATH `rg`
     return cachedRgPath;
-}
-
-/**
- * List all *.go files under root, excluding common vendored / generated
- * directories at the walk level. Returns absolute paths.
- *
- * @param {string} root workspace path
- * @param {string[]} excludedFolders
- * @returns {Promise<string[]>}
- */
-async function listGoFiles(root, excludedFolders) {
-    const rg = findRipgrep();
-    const args = ['--files', '--glob', '*.go'];
-    for (const folder of excludedFolders) {
-        args.push('--glob', `!**/${folder}/**`);
-    }
-
-    try {
-        const out = await runExec(rg || 'rg', args, root);
-        return out
-            .split('\n')
-            .map((l) => l.trim())
-            .filter(Boolean)
-            .map((l) => (path.isAbsolute(l) ? l : path.join(root, l)));
-    } catch (_) {
-        // Fallback: manual walk.
-        return walkGoFiles(root, new Set(excludedFolders));
-    }
 }
 
 /**
@@ -300,33 +268,6 @@ function runExecResult(cmd, args, cwd, timeout) {
 }
 
 /**
- * @param {string} dir
- * @param {Set<string>} excluded
- * @param {string[]} acc
- * @returns {string[]}
- */
-function walkGoFiles(dir, excluded, acc) {
-    acc = acc || [];
-    let entries;
-    try {
-        entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch (_) {
-        return acc;
-    }
-    for (const entry of entries) {
-        if (entry.isDirectory()) {
-            if (excluded.has(entry.name) || entry.name === '.git' || entry.name === 'node_modules') {
-                continue;
-            }
-            walkGoFiles(path.join(dir, entry.name), excluded, acc);
-        } else if (entry.isFile() && entry.name.endsWith('.go')) {
-            acc.push(path.join(dir, entry.name));
-        }
-    }
-    return acc;
-}
-
-/**
  * Resolve the set of search roots to index for a given document.
  *
  * The implementations of an interface almost always live in the user's own
@@ -365,7 +306,6 @@ function resolveSearchRoots(documentUri) {
 }
 
 module.exports = {
-    listGoFiles,
     resolveSearchRoots,
     findRipgrep,
     resolveGoModCache,

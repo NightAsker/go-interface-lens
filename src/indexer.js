@@ -3,7 +3,6 @@
 const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
 const { execFile } = require('child_process');
 
 const {
@@ -17,7 +16,6 @@ const {
     BUILTIN_INTERFACES,
 } = require('./signatures');
 const {
-    listGoFiles,
     resolveGoModCache,
     grepInterfaceFilesForMethod,
     grepImplementationFilesForMethod,
@@ -25,24 +23,19 @@ const {
 } = require('./search');
 const { findGoMod, resolveLockedModuleDirs, resolveModuleImportDirectory } = require('./gomod');
 const { currentBuildContext, shouldIncludeGoFile } = require('./build');
+const { maskGoFunctionBodies } = require('./go-source');
+const {
+    normalizeWildcardPatterns,
+    compileWildcardPattern,
+    createFolderMatcher,
+} = require('./path-filter');
 const {
     AstWorkerPool,
     DEFAULT_AST_CONCURRENCY,
 } = require('./ast-cache');
 
-const CANDIDATE_CACHE_SCHEMA = 3;
-const CANDIDATE_CACHE_WRITE_DELAY_MS = 500;
-
-function compilePackagePattern(pattern) {
-    if (typeof pattern !== 'string' || !pattern.trim()) return null;
-    let source = '^';
-    for (const character of pattern.trim()) {
-        if (character === '*') source += '.*';
-        else if (character === '?') source += '.';
-        else source += character.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&');
-    }
-    return new RegExp(`${source}$`);
-}
+const WORKSPACE_PACKAGE_LOAD_CONCURRENCY = 8;
+const PACKAGE_READ_CONCURRENCY = 16;
 
 const NON_METHOD_CALLS = new Set([
     'if',
@@ -105,154 +98,40 @@ function scanCandidateMethodNames(text) {
     return names;
 }
 
-const CANDIDATE_TYPE_REFERENCE =
-    String.raw`\*?(?:[A-Z_a-z]\w*\.)?[A-Z_a-z]\w*(?:\s*\[(?:[^\[\]\n]|\[[^\]\n]*\])*\])?`;
-const EMBED_ONLY_LINE_RE = new RegExp(
-    String.raw`^\s*${CANDIDATE_TYPE_REFERENCE}\s*(?:\x60[^\x60\n]*\x60)?\s*;?\s*$`,
-    'm'
-);
-const INLINE_EMBED_RE = new RegExp(
-    String.raw`(?:\{|;)\s*${CANDIDATE_TYPE_REFERENCE}\s*(?=;|\})`
-);
-const CAPTURED_TYPE_REFERENCE =
-    String.raw`\*?(?:([A-Z_a-z]\w*)\.)?([A-Z_a-z]\w*)(?:\s*\[(?:[^\[\]\n]|\[[^\]\n]*\])*\])?`;
-const EMBED_ONLY_LINE_CAPTURE_RE = new RegExp(
-    String.raw`^\s*${CAPTURED_TYPE_REFERENCE}\s*(?:\x60[^\x60\n]*\x60)?\s*;?\s*(?://.*)?$`,
-    'gm'
-);
-const INLINE_EMBED_CAPTURE_RE = new RegExp(
-    String.raw`(?:\{|;)\s*${CAPTURED_TYPE_REFERENCE}\s*(?=;|\})`,
-    'g'
-);
-const TYPE_ALIAS_RE = new RegExp(
-    String.raw`^\s*type\s+([A-Z_a-z]\w*)(?:\s*\[[^\]\n]*\])?\s*=\s*(${CANDIDATE_TYPE_REFERENCE})`,
-    'gm'
-);
-const GROUPED_TYPE_ALIAS_RE = new RegExp(
-    String.raw`^\s*([A-Z_a-z]\w*)(?:\s*\[[^\]\n]*\])?\s*=\s*(${CANDIDATE_TYPE_REFERENCE})`,
-    'gm'
-);
-
 function scanPackageName(text) {
     const match = text.match(/^\s*package\s+([A-Z_a-z]\w*)/m);
     return match ? match[1] : null;
 }
 
-function mayContainEmbeddedType(text) {
-    if (!/\b(?:struct|interface)\b/.test(text)) return false;
-    return EMBED_ONLY_LINE_RE.test(text) || INLINE_EMBED_RE.test(text);
-}
-
-function defaultImportAlias(importPath) {
-    const parts = importPath.split('/').filter(Boolean);
-    let alias = parts.pop() || '';
-    if (/^v\d+$/.test(alias) && parts.length > 0) alias = parts.pop();
-    return alias;
-}
-
-function scanImports(text) {
-    const imports = new Map();
-    const record = (alias, importPath) => {
-        const effectiveAlias = alias || defaultImportAlias(importPath);
-        if (effectiveAlias && effectiveAlias !== '_') imports.set(effectiveAlias, importPath);
+function scanTouchedDeclaration(text) {
+    const declarationText = maskGoFunctionBodies(text).text;
+    return {
+        declarationText,
+        metadata: {
+            syntax: 'touched-file-metadata-v1',
+            packageName: scanPackageName(declarationText),
+            interfaces: new Map(),
+            types: new Map(),
+        },
     };
-    const single = /^\s*import\s+(?:([A-Z_a-z]\w*|[._])\s+)?(["`])([^"`\n]+)\2/gm;
-    let match;
-    while ((match = single.exec(text))) record(match[1], match[3]);
-
-    const blocks = /^\s*import\s*\(([\s\S]*?)^\s*\)/gm;
-    while ((match = blocks.exec(text))) {
-        const specs = /^\s*(?:([A-Z_a-z]\w*|[._])\s+)?(["`])([^"`\n]+)\2/gm;
-        let spec;
-        while ((spec = specs.exec(match[1]))) record(spec[1], spec[3]);
-    }
-    return imports;
 }
 
-function normalizedCandidateReference(reference) {
-    return reference
-        .replace(/^\s*\*\s*/, '')
-        .replace(/\s*\[(?:[^\[\]\n]|\[[^\]\n]*\])*\]\s*$/, '');
-}
-
-function scanTypeAliases(text) {
-    const aliases = new Map();
-    let match;
-    TYPE_ALIAS_RE.lastIndex = 0;
-    while ((match = TYPE_ALIAS_RE.exec(text))) {
-        aliases.set(match[1], normalizedCandidateReference(match[2]));
-    }
-    const blocks = /^\s*type\s*\(([\s\S]*?)^\s*\)/gm;
-    while ((match = blocks.exec(text))) {
-        GROUPED_TYPE_ALIAS_RE.lastIndex = 0;
-        let alias;
-        while ((alias = GROUPED_TYPE_ALIAS_RE.exec(match[1]))) {
-            aliases.set(alias[1], normalizedCandidateReference(alias[2]));
+async function mapWithConcurrency(values, concurrency, iteratee) {
+    const items = [...values];
+    if (items.length === 0) return [];
+    const results = new Array(items.length);
+    let next = 0;
+    const workers = Array.from(
+        { length: Math.min(items.length, Math.max(1, concurrency)) },
+        async () => {
+            while (next < items.length) {
+                const index = next++;
+                results[index] = await iteratee(items[index], index);
+            }
         }
-    }
-    return aliases;
-}
-
-function scanEmbeddedReferences(text) {
-    const references = new Set();
-    const collect = (matcher) => {
-        matcher.lastIndex = 0;
-        let match;
-        while ((match = matcher.exec(text))) {
-            references.add(match[1] ? `${match[1]}.${match[2]}` : match[2]);
-        }
-    };
-    collect(EMBED_ONLY_LINE_CAPTURE_RE);
-    collect(INLINE_EMBED_CAPTURE_RE);
-    return references;
-}
-
-function scanFileMetadata(text) {
-    const hasEmbeds = mayContainEmbeddedType(text);
-    const embeddedReferences = hasEmbeds ? scanEmbeddedReferences(text) : new Set();
-    const aliases = scanTypeAliases(text);
-    const imports = hasEmbeds || aliases.size > 0 ? scanImports(text) : new Map();
-    return {
-        syntax: 'candidate-index-v3',
-        packageName: scanPackageName(text),
-        imports,
-        aliases,
-        interfaces: new Map(),
-        types: new Map(),
-        hasEmbeds,
-        embeddedReferences,
-        unresolvedEmbeds: hasEmbeds && embeddedReferences.size === 0,
-        hasDotImport: imports.has('.'),
-    };
-}
-
-function serializeCandidateMetadata(metadata) {
-    return {
-        syntax: metadata.syntax,
-        packageName: metadata.packageName,
-        imports: [...(metadata.imports || new Map())],
-        aliases: [...(metadata.aliases || new Map())],
-        hasEmbeds: !!metadata.hasEmbeds,
-        embeddedReferences: [...(metadata.embeddedReferences || new Set())],
-        unresolvedEmbeds: !!metadata.unresolvedEmbeds,
-        hasDotImport: !!metadata.hasDotImport,
-    };
-}
-
-function deserializeCandidateMetadata(metadata) {
-    if (!metadata || metadata.syntax !== 'candidate-index-v3') return null;
-    return {
-        syntax: metadata.syntax,
-        packageName: metadata.packageName || null,
-        imports: new Map(metadata.imports || []),
-        aliases: new Map(metadata.aliases || []),
-        interfaces: new Map(),
-        types: new Map(),
-        hasEmbeds: !!metadata.hasEmbeds,
-        embeddedReferences: new Set(metadata.embeddedReferences || []),
-        unresolvedEmbeds: !!metadata.unresolvedEmbeds,
-        hasDotImport: !!metadata.hasDotImport,
-    };
+    );
+    await Promise.all(workers);
+    return results;
 }
 
 // A Go package is identified by its directory plus declared package name. The
@@ -484,13 +363,12 @@ function instantiateSelectors(selectors, typeParameters, typeArguments) {
 }
 
 /**
- * Workspace-wide, incrementally maintained index of Go interfaces and types.
+ * Query-driven workspace declaration resolver.
  *
- * The original extension re-ran grep across the whole tree on every click.
- * This index is built once (lazily, per root) and then kept fresh with a
- * FileSystemWatcher, so lookups become in-memory map operations. For large
- * repositories this is what makes navigation feel instant compared to gopls,
- * while signature-aware matching keeps it accurate.
+ * Startup registers roots only. Each navigation query uses ripgrep to locate
+ * declaration candidates, loads complete matching packages, and asks
+ * Tree-sitter for the exact method-set view. Watcher events invalidate query
+ * and package caches without requiring a full-workspace source index.
  */
 class WorkspaceIndex {
     /**
@@ -502,8 +380,8 @@ class WorkspaceIndex {
         this.log = log || (() => {});
         this.options = options || {};
 
-        // Startup files contain lightweight candidate metadata only. Precise
-        // declaration IR is produced lazily by Tree-sitter for selected files.
+        // Parsed declarations and watcher/overlay metadata for files touched by
+        // queries or edits. Root registration leaves this map empty.
         this.files = new Map();
         // Unsaved editor buffers override the corresponding on-disk parse result
         // in merged views without forcing a workspace rebuild.
@@ -528,33 +406,33 @@ class WorkspaceIndex {
         // CodeLens providers can recompute). Plain callbacks; no vscode types.
         this._changeListeners = new Set();
 
-        // The startup scan records broad method-name candidates only. Exact Go
-        // declarations are parsed lazily, in workers, for candidate packages.
+        // On-demand package loads and unsaved overlays retain broad method-name
+        // metadata. Exact declarations are parsed lazily for query candidates.
         this._candidateFilesByMethod = new Map();
         this._candidateMethodsByFile = new Map();
         this._packageFiles = new Map();
         this._packageKeyByFile = new Map();
         this._packageKeysByDirectory = new Map();
-        this._embeddedFiles = new Set();
-        this._candidateMetadataByFile = new Map();
-        this._embeddedPackageGraph = null;
         this._astQueryCache = new Map();
         this._astInflight = new Map();
         this._astGeneration = 1;
         this._pendingInvalidationFiles = new Set();
         this._disposed = false;
         this._importPathByDirectory = new Map();
+        this._folderPatternCacheKey = null;
+        this._folderMatcher = () => false;
         this._packagePatternCacheKey = null;
         this._packagePatternMatchers = [];
         this._packageKeyByImportPath = new Map();
         this._externalImportDirectoryCache = new Map();
         this._externalPackageCache = new Map();
+        this._workspacePackageCache = new Map();
+        this._workspaceCandidateCache = new Map();
         this._dependencyCandidateCache = new Map();
         this._dependencyImplementationCandidateCache = new Map();
         this._dependencyTypeReferenceCandidateCache = new Map();
         this._goRootPromise = null;
-        this._candidateCacheDir = this.options.cacheDir || '';
-        this._candidateCacheStates = new Map();
+        this._storageDir = this.options.cacheDir || '';
         this._clearObsoleteCacheFiles();
         const cfg = this.getConfig();
         this.astPool = this.options.disableAst
@@ -567,16 +445,17 @@ class WorkspaceIndex {
     }
 
     _clearObsoleteCacheFiles() {
-        if (!this._candidateCacheDir) return;
+        if (!this._storageDir) return;
         try {
-            for (const name of fs.readdirSync(this._candidateCacheDir)) {
+            for (const name of fs.readdirSync(this._storageDir)) {
                 if (
                     !name.startsWith('interface-relations-') &&
-                    !name.startsWith('dependency-candidates-')
+                    !name.startsWith('dependency-candidates-') &&
+                    !name.startsWith('candidate-index-')
                 ) {
                     continue;
                 }
-                fs.unlinkSync(path.join(this._candidateCacheDir, name));
+                fs.unlinkSync(path.join(this._storageDir, name));
             }
         } catch (error) {
             if (error.code !== 'ENOENT') {
@@ -624,298 +503,9 @@ class WorkspaceIndex {
         return p;
     }
 
-    _candidateCacheFingerprint(cfg) {
-        return JSON.stringify({
-            goos: this._buildContext.goos,
-            goarch: this._buildContext.goarch,
-            tags: [...this._buildContext.tags].sort(),
-            excludedFolders: [...(cfg.excludedFolders || [])].sort(),
-            excludedPackagePatterns: this._normalizedPackagePatterns(cfg),
-        });
-    }
-
-    _candidateCacheFile(root) {
-        if (!this._candidateCacheDir) return '';
-        const key = crypto
-            .createHash('sha1')
-            .update(path.normalize(root))
-            .digest('hex')
-            .slice(0, 16);
-        return path.join(
-            this._candidateCacheDir,
-            `candidate-index-v${CANDIDATE_CACHE_SCHEMA}-${key}.json`
-        );
-    }
-
-    async _loadCandidateCache(root, cfg) {
-        const normalizedRoot = path.normalize(root);
-        if (this._candidateCacheStates.has(normalizedRoot)) {
-            return this._candidateCacheStates.get(normalizedRoot);
-        }
-        const state = {
-            root: normalizedRoot,
-            cacheFile: this._candidateCacheFile(normalizedRoot),
-            fingerprint: this._candidateCacheFingerprint(cfg),
-            entries: new Map(),
-            dirty: false,
-            writeTimer: null,
-            writePromise: null,
-        };
-        this._candidateCacheStates.set(normalizedRoot, state);
-        if (!state.cacheFile) return state;
-        try {
-            const payload = JSON.parse(await fs.promises.readFile(state.cacheFile, 'utf8'));
-            if (
-                payload.schema === CANDIDATE_CACHE_SCHEMA &&
-                path.normalize(payload.root || '') === normalizedRoot &&
-                payload.fingerprint === state.fingerprint &&
-                Array.isArray(payload.files)
-            ) {
-                for (const item of payload.files) {
-                    if (!Array.isArray(item) || typeof item[0] !== 'string' || !item[1]) continue;
-                    const entry = item[1];
-                    if (entry.included !== false && !deserializeCandidateMetadata(entry.metadata)) {
-                        continue;
-                    }
-                    state.entries.set(path.normalize(item[0]), entry);
-                }
-            }
-        } catch (err) {
-            if (err.code !== 'ENOENT') this.log(`Candidate index cache load failed: ${err.message}`);
-        }
-        return state;
-    }
-
-    _candidateCacheEntry(file, stat, included) {
-        if (!included) {
-            return { mtimeMs: stat.mtimeMs, size: stat.size, included: false };
-        }
-        const metadata = this._candidateMetadataByFile.get(path.normalize(file));
-        if (!metadata) return null;
-        return {
-            mtimeMs: stat.mtimeMs,
-            size: stat.size,
-            included: true,
-            methods: [...(this._candidateMethodsByFile.get(path.normalize(file)) || [])],
-            metadata: serializeCandidateMetadata(metadata),
-        };
-    }
-
-    _restoreCandidateFile(file, entry) {
-        if (!entry || entry.included === false) return true;
-        const metadata = deserializeCandidateMetadata(entry.metadata);
-        if (!metadata) return false;
-        const normalized = path.normalize(file);
-        this.files.set(normalized, metadata);
-        this._recordCandidateFile(normalized, '', metadata, new Set(entry.methods || []));
-        return true;
-    }
-
-    _markCandidateCacheDirty(state) {
-        if (!state || !state.cacheFile) return;
-        state.dirty = true;
-    }
-
-    _scheduleCandidateCacheWrite(state) {
-        if (!state || !state.cacheFile || state.writeTimer) return;
-        state.writeTimer = setTimeout(() => {
-            state.writeTimer = null;
-            this._flushCandidateCache(state).catch((err) => {
-                this.log(`Candidate index cache write failed: ${err.message}`);
-            });
-        }, CANDIDATE_CACHE_WRITE_DELAY_MS);
-        if (typeof state.writeTimer.unref === 'function') state.writeTimer.unref();
-    }
-
-    async _flushCandidateCache(state) {
-        if (!state || !state.cacheFile) return;
-        if (state.writePromise) {
-            await state.writePromise;
-            if (state.dirty) return this._flushCandidateCache(state);
-            return;
-        }
-        if (!state.dirty) return;
-        state.dirty = false;
-        const payload = JSON.stringify({
-            schema: CANDIDATE_CACHE_SCHEMA,
-            root: state.root,
-            fingerprint: state.fingerprint,
-            files: [...state.entries],
-        });
-        const temporary = `${state.cacheFile}.${process.pid}.tmp`;
-        state.writePromise = (async () => {
-            await fs.promises.mkdir(this._candidateCacheDir, { recursive: true });
-            await fs.promises.writeFile(temporary, payload);
-            await fs.promises.rename(temporary, state.cacheFile);
-        })();
-        try {
-            await state.writePromise;
-        } catch (err) {
-            state.dirty = true;
-            this._scheduleCandidateCacheWrite(state);
-            throw err;
-        } finally {
-            state.writePromise = null;
-        }
-        if (state.dirty) this._scheduleCandidateCacheWrite(state);
-    }
-
-    _isFileInCandidateCache(state, file) {
-        const relative = path.relative(state.root, path.normalize(file));
-        return (
-            relative === '' ||
-            (!path.isAbsolute(relative) &&
-                relative !== '..' &&
-                !relative.startsWith(`..${path.sep}`))
-        );
-    }
-
-    _updateCandidateCachesForFile(file) {
-        const normalized = path.normalize(file);
-        let stat;
-        try {
-            stat = fs.statSync(normalized);
-        } catch (_) {
-            return;
-        }
-        for (const state of this._candidateCacheStates.values()) {
-            if (!this._isFileInCandidateCache(state, normalized)) continue;
-            const entry = this._candidateCacheEntry(normalized, stat, this.files.has(normalized));
-            if (!entry) continue;
-            state.entries.set(normalized, entry);
-            this._markCandidateCacheDirty(state);
-            this._scheduleCandidateCacheWrite(state);
-        }
-    }
-
-    _removeFromCandidateCaches(file) {
-        const normalized = path.normalize(file);
-        for (const state of this._candidateCacheStates.values()) {
-            if (!state.entries.delete(normalized)) continue;
-            this._markCandidateCacheDirty(state);
-            this._scheduleCandidateCacheWrite(state);
-        }
-    }
-
     async _build(root) {
-        const cfg = this.getConfig();
-        const t0 = Date.now();
-        const discovered = await listGoFiles(root, cfg.excludedFolders);
-        const goFiles = discovered.filter(
-            (file) => !this._isExcluded(file) && shouldIncludeGoFile(file, '', this._buildContext)
-        );
-        this.log(`Indexing ${goFiles.length} Go files under ${root}`);
-
-        const candidateState = await this._loadCandidateCache(root, cfg);
-        const persistedState = candidateState.cacheFile ? candidateState : null;
-        const cacheStats = await this._indexFilesInChunks(goFiles, persistedState);
-        if (persistedState) {
-            const liveFiles = new Set(goFiles.map((file) => path.normalize(file)));
-            for (const cachedFile of [...persistedState.entries.keys()]) {
-                if (liveFiles.has(cachedFile)) continue;
-                persistedState.entries.delete(cachedFile);
-                this._markCandidateCacheDirty(persistedState);
-            }
-            await this._flushCandidateCache(persistedState);
-        }
-        this._invalidateMerged();
-        this.log(
-            `Index built in ${Date.now() - t0}ms ` +
-                `(${cacheStats.restored} cached, ${cacheStats.indexed} read)`
-        );
+        this.log(`Registered on-demand workspace root ${path.normalize(root)}`);
         this._installWatcher();
-    }
-
-    /**
-     * Read and parse the initial file set without monopolising the extension-host
-     * event loop. Reads are issued in small parallel batches; parsing remains
-     * synchronous (the parser is CPU-only), but is split into short time slices
-     * with a setImmediate yield between slices. This keeps editor input,
-     * CodeLens requests, and cancellation/close events responsive while a large
-     * workspace is being indexed.
-     *
-     * @param {string[]} goFiles absolute file paths
-     */
-    async _indexFilesInChunks(goFiles, candidateState) {
-        const concurrency = Math.max(1, WorkspaceIndex.INDEX_READ_CONCURRENCY);
-        const timeSliceMs = Math.max(0, WorkspaceIndex.INDEX_TIME_SLICE_MS);
-        let sliceStarted = Date.now();
-        let restored = 0;
-        let indexed = 0;
-
-        for (let start = 0; start < goFiles.length; start += concurrency) {
-            const batch = goFiles.slice(start, start + concurrency);
-            const sources = await Promise.all(
-                batch.map(async (file) => {
-                    try {
-                        const normalized = path.normalize(file);
-                        const cached = candidateState && candidateState.entries.get(normalized);
-                        if (candidateState) {
-                            if (cached) {
-                                const stat = await fs.promises.stat(normalized);
-                                if (cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
-                                    return { file: normalized, cached, stat };
-                                }
-                                const text = await fs.promises.readFile(normalized, 'utf8');
-                                return { file: normalized, text, stat };
-                            }
-                            const handle = await fs.promises.open(normalized, 'r');
-                            try {
-                                const stat = await handle.stat();
-                                const text = await handle.readFile('utf8');
-                                return { file: normalized, text, stat };
-                            } finally {
-                                await handle.close();
-                            }
-                        }
-                        const text = await fs.promises.readFile(file, 'utf8');
-                        if (!shouldIncludeGoFile(file, text, this._buildContext)) return null;
-                        return { file, text };
-                    } catch (err) {
-                        this.log(`Failed to read ${file}: ${err.message}`);
-                        return null;
-                    }
-                })
-            );
-
-            for (const source of sources) {
-                if (!source) continue;
-                if (source.cached) {
-                    if (this._restoreCandidateFile(source.file, source.cached)) {
-                        restored += 1;
-                        continue;
-                    }
-                }
-                if (!shouldIncludeGoFile(source.file, source.text, this._buildContext)) {
-                    if (candidateState) {
-                        candidateState.entries.set(
-                            source.file,
-                            this._candidateCacheEntry(source.file, source.stat, false)
-                        );
-                        this._markCandidateCacheDirty(candidateState);
-                    }
-                    indexed += 1;
-                    continue;
-                }
-                this._indexText(source.file, source.text);
-                if (candidateState) {
-                    const entry = this._candidateCacheEntry(source.file, source.stat, true);
-                    if (entry) candidateState.entries.set(source.file, entry);
-                    this._markCandidateCacheDirty(candidateState);
-                }
-                indexed += 1;
-
-                if (Date.now() - sliceStarted >= timeSliceMs) {
-                    await this._yieldToEventLoop();
-                    sliceStarted = Date.now();
-                }
-            }
-        }
-        return { restored, indexed };
-    }
-
-    _yieldToEventLoop() {
-        return new Promise((resolve) => setImmediate(resolve));
     }
 
     _removeCandidateFile(absPath) {
@@ -952,9 +542,6 @@ class WorkspaceIndex {
             }
         }
         this._packageKeyByFile.delete(normalized);
-        this._embeddedFiles.delete(normalized);
-        this._candidateMetadataByFile.delete(normalized);
-        this._embeddedPackageGraph = null;
     }
 
     _recordCandidateFile(absPath, text, parsed, candidateNames) {
@@ -968,9 +555,7 @@ class WorkspaceIndex {
         }
         const packageKey = packageKeyFor(normalized, parsed.packageName);
         this._packageKeyByImportPath.clear();
-        this._embeddedPackageGraph = null;
         this._packageKeyByFile.set(normalized, packageKey);
-        this._candidateMetadataByFile.set(normalized, parsed);
         const directory = path.dirname(normalized);
         if (!this._packageKeysByDirectory.has(directory)) {
             this._packageKeysByDirectory.set(directory, new Set());
@@ -978,7 +563,6 @@ class WorkspaceIndex {
         this._packageKeysByDirectory.get(directory).add(packageKey);
         if (!this._packageFiles.has(packageKey)) this._packageFiles.set(packageKey, new Set());
         this._packageFiles.get(packageKey).add(normalized);
-        if (parsed.hasEmbeds) this._embeddedFiles.add(normalized);
     }
 
     _indexText(absPath, text, invalidateAst) {
@@ -989,9 +573,10 @@ class WorkspaceIndex {
                 if (invalidateAst && this.astPool) this.astPool.invalidate(absPath);
                 return;
             }
-            const parsed = scanFileMetadata(text);
+            const touched = scanTouchedDeclaration(text);
+            const parsed = touched.metadata;
             this.files.set(absPath, parsed);
-            this._recordCandidateFile(absPath, text, parsed);
+            this._recordCandidateFile(absPath, touched.declarationText, parsed);
             if (invalidateAst && this.astPool) this.astPool.invalidate(absPath);
         } catch (err) {
             this.log(`Failed to parse ${absPath}: ${err.message}`);
@@ -1002,7 +587,6 @@ class WorkspaceIndex {
         try {
             const text = fs.readFileSync(absPath, 'utf8');
             this._indexText(absPath, text, true);
-            this._updateCandidateCachesForFile(absPath);
         } catch (err) {
             this.log(`Failed to index ${absPath}: ${err.message}`);
         }
@@ -1014,7 +598,6 @@ class WorkspaceIndex {
         this.overlayTexts.delete(absPath);
         this._removeCandidateFile(absPath);
         if (this.astPool) this.astPool.invalidate(absPath);
-        this._removeFromCandidateCaches(absPath);
     }
 
     updateOverlay(absPath, text, notify) {
@@ -1025,9 +608,14 @@ class WorkspaceIndex {
             if (notify !== false) this._emitChange();
             return;
         }
-        this.overlays.set(absPath, scanFileMetadata(text));
+        const touched = scanTouchedDeclaration(text);
+        this.overlays.set(absPath, touched.metadata);
         this.overlayTexts.set(absPath, text);
-        this._recordCandidateFile(absPath, text, this.overlays.get(absPath));
+        this._recordCandidateFile(
+            absPath,
+            touched.declarationText,
+            this.overlays.get(absPath)
+        );
         this._invalidateMerged([absPath]);
         if (notify !== false) this._emitChange();
     }
@@ -1038,8 +626,9 @@ class WorkspaceIndex {
         if (this.astPool) this.astPool.clearOverlay(absPath);
         try {
             const text = fs.readFileSync(absPath, 'utf8');
-            const parsed = this.files.get(absPath) || scanFileMetadata(text);
-            this._recordCandidateFile(absPath, text, parsed);
+            const touched = scanTouchedDeclaration(text);
+            const parsed = this.files.get(absPath) || touched.metadata;
+            this._recordCandidateFile(absPath, touched.declarationText, parsed);
         } catch (_) {
             this._removeCandidateFile(absPath);
         }
@@ -1051,7 +640,6 @@ class WorkspaceIndex {
         this.overlays.delete(absPath);
         this.overlayTexts.delete(absPath);
         this._indexText(absPath, text, true);
-        this._updateCandidateCachesForFile(absPath);
         this._invalidateMerged([absPath]);
         this._emitChange();
     }
@@ -1070,6 +658,17 @@ class WorkspaceIndex {
         this._astGeneration += 1;
         this._astQueryCache.clear();
         this._astInflight.clear();
+        this._workspaceCandidateCache.clear();
+        if (Array.isArray(changedFiles) && changedFiles.length > 0) {
+            const directories = new Set(changedFiles.map((file) => path.dirname(path.normalize(file))));
+            for (const key of [...this._workspacePackageCache.keys()]) {
+                const separator = key.indexOf('\0');
+                const directory = separator === -1 ? key : key.slice(0, separator);
+                if (directories.has(directory)) this._workspacePackageCache.delete(key);
+            }
+        } else {
+            this._workspacePackageCache.clear();
+        }
     }
 
     /**
@@ -1874,10 +1473,12 @@ class WorkspaceIndex {
 
     _isExcluded(filePath) {
         const cfg = this.getConfig();
-        const parts = filePath.split(path.sep);
-        for (const folder of cfg.excludedFolders) {
-            if (parts.includes(folder)) return true;
+        const folderKey = JSON.stringify(normalizeWildcardPatterns(cfg.excludedFolders));
+        if (this._folderPatternCacheKey !== folderKey) {
+            this._folderPatternCacheKey = folderKey;
+            this._folderMatcher = createFolderMatcher(JSON.parse(folderKey));
         }
+        if (this._folderMatcher(path.dirname(filePath))) return true;
         const fileName = path.basename(filePath);
         for (const pattern of cfg.excludedFilePatterns || []) {
             if (fileName.includes(pattern)) return true;
@@ -1886,10 +1487,7 @@ class WorkspaceIndex {
     }
 
     _normalizedPackagePatterns(cfg) {
-        return [...new Set((cfg.excludedPackagePatterns || [])
-            .filter((pattern) => typeof pattern === 'string')
-            .map((pattern) => pattern.trim())
-            .filter(Boolean))].sort();
+        return normalizeWildcardPatterns(cfg.excludedPackagePatterns);
     }
 
     _packagePatternKey() {
@@ -1902,7 +1500,7 @@ class WorkspaceIndex {
         if (this._packagePatternCacheKey !== key) {
             this._packagePatternCacheKey = key;
             this._packagePatternMatchers = JSON.parse(key)
-                .map(compilePackagePattern)
+                .map(compileWildcardPattern)
                 .filter(Boolean);
         }
         return this._packagePatternMatchers.some((matcher) => matcher.test(importPath));
@@ -1942,6 +1540,234 @@ class WorkspaceIndex {
         return [...(files || [])].filter(
             (file) => !this._isPackageExcluded(this._importPathForFile(file))
         );
+    }
+
+    _workspaceRoots() {
+        return [...this._builds.keys()].map(path.normalize);
+    }
+
+    _isWorkspaceDirectory(directory) {
+        const normalized = path.normalize(directory);
+        return this._workspaceRoots().some((root) => {
+            const relative = path.relative(root, normalized);
+            return (
+                relative === '' ||
+                (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`))
+            );
+        });
+    }
+
+    _selectAnchorMethod(methodKeys) {
+        return [...methodKeys]
+            .map(bareMethodName)
+            .sort((left, right) => right.length - left.length || left.localeCompare(right))[0];
+    }
+
+    _workspaceCandidateFiles(kind, methodName) {
+        const roots = this._workspaceRoots();
+        const key = [
+            kind,
+            methodName,
+            this._packagePatternKey(),
+            JSON.stringify(normalizeWildcardPatterns(this.getConfig().excludedFolders)),
+            ...roots,
+        ].join('\0');
+        if (this._workspaceCandidateCache.has(key)) {
+            return this._workspaceCandidateCache.get(key);
+        }
+        const search =
+            kind === 'implementation'
+                ? grepImplementationFilesForMethod
+                : grepInterfaceFilesForMethod;
+        const request = Promise.all(
+            roots.map((root) => search(root, methodName, Number.MAX_SAFE_INTEGER))
+        ).then((groups) => {
+            const files = new Set(groups.flat().map(path.normalize));
+            for (const file of this._candidateFilesByMethod.get(methodName) || []) {
+                files.add(path.normalize(file));
+            }
+            return [...files].filter(
+                (file) =>
+                    !this._isExcluded(file) &&
+                    shouldIncludeGoFile(file, '', this._buildContext)
+            );
+        });
+        this._workspaceCandidateCache.set(key, request);
+        return request;
+    }
+
+    _workspaceTypeReferenceCandidates(typeNames) {
+        const names = [...new Set(typeNames)].sort();
+        if (names.length === 0) return Promise.resolve([]);
+        const roots = this._workspaceRoots();
+        const key = [
+            'type-reference',
+            names.join(','),
+            this._packagePatternKey(),
+            JSON.stringify(normalizeWildcardPatterns(this.getConfig().excludedFolders)),
+            ...roots,
+        ].join('\0');
+        if (this._workspaceCandidateCache.has(key)) {
+            return this._workspaceCandidateCache.get(key);
+        }
+        const request = Promise.all(
+            roots.map((root) =>
+                grepGoFilesForTypeNames(root, names, Number.MAX_SAFE_INTEGER)
+            )
+        ).then((groups) =>
+            [...new Set(groups.flat().map(path.normalize))].filter(
+                (file) =>
+                    !this._isExcluded(file) &&
+                    shouldIncludeGoFile(file, '', this._buildContext)
+            )
+        );
+        this._workspaceCandidateCache.set(key, request);
+        return request;
+    }
+
+    _registerParsedWorkspacePackage(files, importPath) {
+        for (const [file, info] of files) {
+            const normalized = path.normalize(file);
+            const packageKey = packageKeyFor(normalized, info.packageName);
+            this._packageKeyByFile.set(normalized, packageKey);
+            const directory = path.dirname(normalized);
+            if (!this._packageKeysByDirectory.has(directory)) {
+                this._packageKeysByDirectory.set(directory, new Set());
+            }
+            this._packageKeysByDirectory.get(directory).add(packageKey);
+            if (!this._packageFiles.has(packageKey)) this._packageFiles.set(packageKey, new Set());
+            this._packageFiles.get(packageKey).add(normalized);
+            if (importPath) this._packageKeyByImportPath.set(importPath, packageKey);
+        }
+    }
+
+    async _loadWorkspaceDirectory(directory, priority) {
+        if (!this.astPool) return null;
+        const normalizedDirectory = path.normalize(directory);
+        const importPath = this._importPathForDirectory(normalizedDirectory);
+        if (this._isPackageExcluded(importPath)) return null;
+        const cacheKey = `${normalizedDirectory}\0${importPath || ''}`;
+        const requestedPriority = Number.isFinite(priority) ? priority : 200;
+        const cached = this._workspacePackageCache.get(cacheKey);
+        if (cached) {
+            if (requestedPriority > cached.priority) {
+                cached.priority = requestedPriority;
+                if (cached.sources) {
+                    void this._parseAstFiles(cached.sources, requestedPriority).catch(() => {});
+                }
+            }
+            return cached.promise;
+        }
+
+        const entry = { priority: requestedPriority, sources: null, promise: null };
+        entry.promise = (async () => {
+            let entries;
+            try {
+                entries = await fs.promises.readdir(normalizedDirectory, { withFileTypes: true });
+            } catch (_) {
+                return null;
+            }
+            const files = new Set(
+                entries
+                    .filter(
+                        (item) =>
+                            item.isFile() &&
+                            item.name.endsWith('.go') &&
+                            !item.name.endsWith('_test.go')
+                    )
+                    .map((item) => path.join(normalizedDirectory, item.name))
+            );
+            for (const file of this.overlayTexts.keys()) {
+                if (path.dirname(file) === normalizedDirectory && file.endsWith('.go')) files.add(file);
+            }
+            const sources = await mapWithConcurrency(
+                [...files].filter(
+                    (file) =>
+                        !this._isExcluded(file) &&
+                        shouldIncludeGoFile(file, '', this._buildContext)
+                ),
+                PACKAGE_READ_CONCURRENCY,
+                async (file) => {
+                    try {
+                        const overlay = this.overlayTexts.get(file);
+                        const text = overlay === undefined
+                            ? await fs.promises.readFile(file, 'utf8')
+                            : overlay;
+                        if (!shouldIncludeGoFile(file, text, this._buildContext)) return null;
+                        return overlay === undefined
+                            ? { file, diskText: text, declarationOnly: true }
+                            : { file, text, declarationOnly: true };
+                    } catch (_) {
+                        return null;
+                    }
+                }
+            );
+            entry.sources = sources.filter(Boolean);
+            const parsed = await this._parseAstFiles(entry.sources, entry.priority);
+            const parsedFiles = new Map(
+                [...parsed].map(([file, info]) => [
+                    file,
+                    { ...info, importPath: importPath || null, externalSource: false },
+                ])
+            );
+            this._registerParsedWorkspacePackage(parsedFiles, importPath);
+            return { directory: normalizedDirectory, files: parsedFiles };
+        })()
+            .catch((error) => {
+                this.log(`Workspace package parse failed for ${normalizedDirectory}: ${error.message}`);
+                return null;
+            })
+            .finally(() => {
+                entry.sources = null;
+            });
+        this._workspacePackageCache.set(cacheKey, entry);
+        return entry.promise;
+    }
+
+    async _loadWorkspaceCandidatePackages(files, priority, astFiles) {
+        const loadedDirectories = new Set([...astFiles.keys()].map((file) => path.dirname(file)));
+        const directories = new Set();
+        for (const file of files || []) {
+            const directory = path.dirname(file);
+            if (!loadedDirectories.has(directory)) directories.add(directory);
+        }
+        const packages = await mapWithConcurrency(
+            directories,
+            WORKSPACE_PACKAGE_LOAD_CONCURRENCY,
+            (directory) => this._loadWorkspaceDirectory(directory, priority)
+        );
+        for (const packageInfo of packages) {
+            if (!packageInfo) continue;
+            for (const [file, info] of packageInfo.files) astFiles.set(file, info);
+        }
+        return directories;
+    }
+
+    _matchingBuiltinTypeNames(methods) {
+        const names = new Set();
+        for (const [identity, builtinMethods] of BUILTIN_INTERFACES) {
+            if (identity.startsWith('@{') || !satisfies(methods, builtinMethods)) continue;
+            const dot = identity.lastIndexOf('.');
+            names.add(dot === -1 ? identity : identity.slice(dot + 1));
+        }
+        return names;
+    }
+
+    _typeNamesWithMethod(view, methodName, externalOnly) {
+        const names = new Set();
+        const { types } = view._merged();
+        for (const [typeKey, info] of types) {
+            if (info.interfaceAlias || (!!externalOnly !== !!info.externalSource)) continue;
+            const methodSets = view._resolveTypeMethodSetsCached(typeKey, types);
+            if (
+                [...methodSets.pointer.keys()].some(
+                    (name) => bareMethodName(name) === methodName
+                )
+            ) {
+                names.add(info.name);
+            }
+        }
+        return names;
     }
 
     /** Build (and memoize) the merged interface / type views. */
@@ -2293,144 +2119,6 @@ class WorkspaceIndex {
         return this._packageKeyByFile.get(path.normalize(file)) || null;
     }
 
-    _buildEmbeddedPackageGraph() {
-        if (this._embeddedPackageGraph) return this._embeddedPackageGraph;
-
-        const reverse = new Map();
-        const external = new Set();
-        const builtinByMethod = new Map();
-        const aliasesByPackage = new Map();
-
-        for (const [file, metadata] of this._candidateMetadataByFile) {
-            const packageKey = this._packageKeyByFile.get(file);
-            if (!packageKey) continue;
-            if (!aliasesByPackage.has(packageKey)) aliasesByPackage.set(packageKey, new Map());
-            const aliases = aliasesByPackage.get(packageKey);
-            for (const [name, reference] of metadata.aliases || []) {
-                aliases.set(name, {
-                    reference,
-                    imports: metadata.imports || new Map(),
-                    hasDotImport: !!metadata.hasDotImport,
-                });
-            }
-        }
-
-        const resolveReference = (packageKey, reference, imports, hasDotImport, seen) => {
-            const imported = reference.match(/^([A-Z_a-z]\w*)\.([A-Z_a-z]\w*)$/);
-            if (imported) {
-                const importPath = imports && imports.get(imported[1]);
-                if (!importPath) return { kind: 'external' };
-                const targetPackage = this._packageForImportPath(importPath);
-                return targetPackage
-                    ? { kind: 'workspace', packageKey: targetPackage }
-                    : { kind: 'external' };
-            }
-            if (BUILTIN_INTERFACES.has(reference)) {
-                return { kind: 'builtin', name: reference };
-            }
-            const alias = aliasesByPackage.get(packageKey) && aliasesByPackage.get(packageKey).get(reference);
-            if (alias) {
-                const aliasKey = `${packageKey}\0${reference}`;
-                if (seen && seen.has(aliasKey)) return { kind: 'external' };
-                const nextSeen = new Set(seen || []);
-                nextSeen.add(aliasKey);
-                return resolveReference(
-                    packageKey,
-                    alias.reference,
-                    alias.imports,
-                    alias.hasDotImport,
-                    nextSeen
-                );
-            }
-            if (hasDotImport) return { kind: 'external' };
-            return { kind: 'workspace', packageKey };
-        };
-
-        const addResolvedTarget = (ownerPackage, resolved) => {
-            if (!resolved) return;
-            if (resolved.kind === 'external') {
-                external.add(ownerPackage);
-                return;
-            }
-            if (resolved.kind === 'builtin') {
-                for (const methodName of BUILTIN_INTERFACES.get(resolved.name).keys()) {
-                    if (!builtinByMethod.has(methodName)) builtinByMethod.set(methodName, new Set());
-                    builtinByMethod.get(methodName).add(ownerPackage);
-                }
-                return;
-            }
-            if (resolved.packageKey === ownerPackage) return;
-            if (!reverse.has(resolved.packageKey)) reverse.set(resolved.packageKey, new Set());
-            reverse.get(resolved.packageKey).add(ownerPackage);
-        };
-
-        for (const [file, metadata] of this._candidateMetadataByFile) {
-            const packageKey = this._packageKeyByFile.get(file);
-            if (!packageKey) continue;
-            if (metadata.unresolvedEmbeds) external.add(packageKey);
-            for (const reference of metadata.embeddedReferences || []) {
-                addResolvedTarget(
-                    packageKey,
-                    resolveReference(
-                        packageKey,
-                        reference,
-                        metadata.imports || new Map(),
-                        !!metadata.hasDotImport
-                    )
-                );
-            }
-            for (const [name] of metadata.aliases || []) {
-                addResolvedTarget(
-                    packageKey,
-                    resolveReference(
-                        packageKey,
-                        name,
-                        metadata.imports || new Map(),
-                        !!metadata.hasDotImport
-                    )
-                );
-            }
-        }
-
-        this._embeddedPackageGraph = { reverse, external, builtinByMethod };
-        return this._embeddedPackageGraph;
-    }
-
-    _candidatePackagesForMethods(methodNames) {
-        const embeddedGraph = this._buildEmbeddedPackageGraph();
-
-        const sets = [];
-        for (const methodKey of methodNames) {
-            const methodName = bareMethodName(methodKey);
-            const packages = new Set(embeddedGraph.external);
-            for (const packageKey of embeddedGraph.builtinByMethod.get(methodName) || []) {
-                packages.add(packageKey);
-            }
-            for (const file of this._candidateFilesByMethod.get(methodName) || []) {
-                const packageKey = this._packageKeyByFile.get(file);
-                if (packageKey) packages.add(packageKey);
-            }
-            const pending = [...packages];
-            for (let index = 0; index < pending.length; index++) {
-                for (const embeddingPackage of embeddedGraph.reverse.get(pending[index]) || []) {
-                    if (packages.has(embeddingPackage)) continue;
-                    packages.add(embeddingPackage);
-                    pending.push(embeddingPackage);
-                }
-            }
-            sets.push(packages);
-        }
-        if (sets.length === 0) return new Set();
-        sets.sort((a, b) => a.size - b.size);
-        const candidates = new Set(sets[0]);
-        for (let i = 1; i < sets.length; i++) {
-            for (const packageKey of [...candidates]) {
-                if (!sets[i].has(packageKey)) candidates.delete(packageKey);
-            }
-        }
-        return candidates;
-    }
-
     async _parseAstPackages(packageKeys, priority) {
         if (!this.astPool) throw new Error('lazy AST index is disabled');
         const requests = [];
@@ -2447,7 +2135,16 @@ class WorkspaceIndex {
             }
         }
         if (requests.length === 0) return new Map();
-        return this.astPool.parseFiles(requests, priority === undefined ? 100 : priority);
+        return this._parseAstFiles(requests, priority === undefined ? 100 : priority);
+    }
+
+    _parseAstFiles(requests, priority) {
+        if (!this.astPool) throw new Error('lazy AST index is disabled');
+        const included = (requests || []).filter(
+            (request) => request && request.file && !this._isExcluded(request.file)
+        );
+        if (included.length === 0) return Promise.resolve(new Map());
+        return this.astPool.parseFiles(included, priority);
     }
 
     _packageForImportPath(importPath) {
@@ -2502,6 +2199,32 @@ class WorkspaceIndex {
         return this._goRootPromise;
     }
 
+    _resolveWorkspaceImportDirectory(importPath) {
+        for (const root of this._workspaceRoots()) {
+            try {
+                const goModPath = findGoMod(root);
+                if (!goModPath) continue;
+                const source = fs.readFileSync(goModPath, 'utf8');
+                const moduleMatch = source.match(/^\s*module\s+(\S+)/m);
+                if (!moduleMatch) continue;
+                const modulePath = moduleMatch[1];
+                if (importPath !== modulePath && !importPath.startsWith(`${modulePath}/`)) {
+                    continue;
+                }
+                const suffix = importPath === modulePath
+                    ? []
+                    : importPath.slice(modulePath.length + 1).split('/').filter(Boolean);
+                const directory = path.join(path.dirname(goModPath), ...suffix);
+                if (fs.existsSync(directory) && fs.statSync(directory).isDirectory()) {
+                    return directory;
+                }
+            } catch (_) {
+                // Try the next registered root.
+            }
+        }
+        return null;
+    }
+
     async _resolveExternalImportDirectory(importPath) {
         if (this._isPackageExcluded(importPath)) return null;
         const segments = importPath && importPath.split('/');
@@ -2519,6 +2242,8 @@ class WorkspaceIndex {
         const request = (async () => {
             const cfg = this.getConfig();
             const modCache = resolveGoModCache(cfg.goModCache);
+            const workspaceDirectory = this._resolveWorkspaceImportDirectory(importPath);
+            if (workspaceDirectory) return workspaceDirectory;
             for (const root of this._builds.keys()) {
                 const directory = resolveModuleImportDirectory(root, importPath, modCache);
                 if (directory) return directory;
@@ -2544,6 +2269,9 @@ class WorkspaceIndex {
         if (!this.astPool || this._isPackageExcluded(importPath)) return null;
         const directory = await this._resolveExternalImportDirectory(importPath);
         if (!directory) return null;
+        if (this._isWorkspaceDirectory(directory)) {
+            return this._loadWorkspaceDirectory(directory, priority);
+        }
         return this._loadExternalDirectory(directory, importPath, priority);
     }
 
@@ -2559,9 +2287,7 @@ class WorkspaceIndex {
             if (requestedPriority > cached.priority) {
                 cached.priority = requestedPriority;
                 if (cached.sources) {
-                    void this.astPool
-                        .parseFiles(cached.sources, requestedPriority)
-                        .catch(() => {});
+                    void this._parseAstFiles(cached.sources, requestedPriority).catch(() => {});
                 }
             }
             return cached.promise;
@@ -2599,7 +2325,7 @@ class WorkspaceIndex {
                 })
             );
             entry.sources = sources.filter(Boolean);
-            const parsed = await this.astPool.parseFiles(entry.sources, entry.priority);
+            const parsed = await this._parseAstFiles(entry.sources, entry.priority);
             return {
                 directory: normalizedDirectory,
                 files: new Map(
@@ -2851,36 +2577,101 @@ class WorkspaceIndex {
     }
 
     async _buildImplementationAstContext(interfaceName, interfaceFile) {
+        const interfacePackageInfo = await this._loadWorkspaceDirectory(
+            path.dirname(interfaceFile),
+            200
+        );
+        if (!interfacePackageInfo) return null;
+        const interfaceFiles = new Map(interfacePackageInfo.files);
         const interfacePackage = this._packageForFile(interfaceFile);
-        if (!interfacePackage) return null;
-        const interfaceFiles = await this._parseAstPackages(new Set([interfacePackage]), 200);
         const interfaceClosure = await this._expandEmbeddedAstPackages(
-            new Set([interfacePackage]),
+            new Set(interfacePackage ? [interfacePackage] : []),
             interfaceFiles,
             200
         );
         const interfaceView = this._createAstView(interfaceClosure.astFiles);
         const descriptor = this._interfaceDescriptor(interfaceView, interfaceName, interfaceFile);
         if (!descriptor) return null;
-        const candidates = this._candidatePackagesForMethods(descriptor.resolved.methods.keys());
-        candidates.add(interfacePackage);
-        for (const packageKey of interfaceClosure.packages) candidates.add(packageKey);
-        const remainingCandidates = new Set(candidates);
-        for (const packageKey of interfaceClosure.packages) remainingCandidates.delete(packageKey);
-        const candidateFiles = await this._parseAstPackages(remainingCandidates, 200);
+
+        const anchorMethod = this._selectAnchorMethod(descriptor.resolved.methods.keys());
+        if (!anchorMethod) return null;
+        const [implementationCandidates, interfaceCandidates] = await Promise.all([
+            this._workspaceCandidateFiles('implementation', anchorMethod),
+            this._workspaceCandidateFiles('interface', anchorMethod),
+        ]);
+        const candidateFiles = new Set([
+            ...implementationCandidates,
+            ...interfaceCandidates,
+        ]);
         const astFiles = new Map(interfaceClosure.astFiles);
-        for (const [file, info] of candidateFiles) astFiles.set(file, info);
-        const closure = await this._expandEmbeddedAstPackages(candidates, astFiles, 200);
-        const aliasExpansion = await this._expandSignatureAliasPackages(
-            closure.astFiles,
-            descriptor.resolved.methods.keys(),
-            200
+        const loadedDirectories = await this._loadWorkspaceCandidatePackages(
+            candidateFiles,
+            200,
+            astFiles
+        );
+
+        let aliasExpansion = null;
+        const searchedTypeNames = new Set();
+        const builtinNames = this._matchingBuiltinTypeNames(descriptor.resolved.methods);
+        for (let round = 0; round < 10; round++) {
+            const packages = new Set(
+                [...astFiles.keys()].map((file) => this._packageForFile(file)).filter(Boolean)
+            );
+            const closure = await this._expandEmbeddedAstPackages(packages, astFiles, 200);
+            aliasExpansion = await this._expandSignatureAliasPackages(
+                closure.astFiles,
+                descriptor.resolved.methods.keys(),
+                200
+            );
+            astFiles.clear();
+            for (const [file, info] of aliasExpansion.astFiles) astFiles.set(file, info);
+
+            const view = aliasExpansion.view;
+            const names = new Set(builtinNames);
+            for (const name of this._typeNamesWithMethod(view, anchorMethod, false)) {
+                names.add(name);
+            }
+            for (const result of view.findImplementations(interfaceName, interfaceFile, {
+                includeExternal: true,
+            })) {
+                names.add(result.name.replace(/^\*/, ''));
+            }
+            const { interfaces } = view._merged();
+            const target = view._interfaceDescriptor(view, interfaceName, interfaceFile);
+            if (target) {
+                for (const [interfaceKey, info] of interfaces) {
+                    if (info.constraint) continue;
+                    const resolved = view._resolveInterfaceMethodsCached(interfaceKey, interfaces);
+                    if (satisfies(target.resolved.methods, resolved.methods)) names.add(info.name);
+                }
+            }
+            for (const name of searchedTypeNames) names.delete(name);
+            if (names.size === 0) break;
+            for (const name of names) searchedTypeNames.add(name);
+
+            const references = await this._workspaceTypeReferenceCandidates(names);
+            for (const file of references) candidateFiles.add(file);
+            const before = astFiles.size;
+            const additions = await this._loadWorkspaceCandidatePackages(
+                references,
+                200,
+                astFiles
+            );
+            for (const directory of additions) loadedDirectories.add(directory);
+            if (astFiles.size === before) break;
+        }
+        if (!aliasExpansion) return null;
+        const candidates = new Set(
+            [...astFiles.keys()].map((file) => this._packageForFile(file)).filter(Boolean)
         );
         return {
             astFiles: aliasExpansion.astFiles,
             view: aliasExpansion.view,
             candidatePackages: candidates,
             descriptor,
+            workspaceCandidateFiles: [...candidateFiles],
+            workspaceCandidateDirectories: [...loadedDirectories],
+            workspaceAnchorMethod: anchorMethod,
         };
     }
 
@@ -2910,14 +2701,10 @@ class WorkspaceIndex {
             if (!cacheRoot) return context;
             const requestPriority = Number.isFinite(priority) ? priority : 200;
 
-            const methodKeys = [...context.descriptor.resolved.methods.keys()];
-            if (methodKeys.length === 0) return context;
-            methodKeys.sort((left, right) => {
-                const leftCount = (this._candidateFilesByMethod.get(bareMethodName(left)) || new Set()).size;
-                const rightCount = (this._candidateFilesByMethod.get(bareMethodName(right)) || new Set()).size;
-                return leftCount - rightCount;
-            });
-            const anchorMethod = bareMethodName(methodKeys[0]);
+            const anchorMethod = this._selectAnchorMethod(
+                context.descriptor.resolved.methods.keys()
+            );
+            if (!anchorMethod) return context;
             const dependencyDirs = this._dependencySearchDirs(cacheRoot);
             if (dependencyDirs === null) return context;
             const [implementationCandidates, interfaceCandidates] = await Promise.all([
@@ -2999,6 +2786,9 @@ class WorkspaceIndex {
                         .filter((result) => result.external)
                         .map((result) => result.name.replace(/^\*/, ''))
                 );
+                for (const name of this._typeNamesWithMethod(view, anchorMethod, true)) {
+                    names.add(name);
+                }
                 const { interfaces } = view._merged();
                 const target = view._interfaceDescriptor(view, interfaceName, interfaceFile);
                 if (target) {
@@ -3105,44 +2895,79 @@ class WorkspaceIndex {
         const receiverFile = opts && opts.receiverFile;
         const key = `reverse\0${receiverFile || ''}\0${receiverType}\0${methodName}`;
         return this._cachedAstQuery(key, async () => {
-            const receiverPackage = this._packageForFile(receiverFile);
-            if (!receiverPackage) return [];
+            if (!receiverFile) return [];
             const started = Date.now();
-            const candidates = this._candidatePackagesForMethods([methodName]);
-            candidates.add(receiverPackage);
-            const astFiles = await this._parseAstPackages(candidates, 200);
-            const closure = await this._expandEmbeddedAstPackages(candidates, astFiles, 200);
-            const aliasExpansion = await this._expandSignatureAliasPackages(
-                closure.astFiles,
-                [methodName],
+            const receiverPackageInfo = await this._loadWorkspaceDirectory(
+                path.dirname(receiverFile),
                 200
             );
-            const view = aliasExpansion.view;
-            const local = view._collectLocalInterfaces(receiverType, methodName, {
-                receiverFile,
-            });
-            const results = local.results;
-            let receiverAstFiles = aliasExpansion.astFiles;
-            const cfg = this.getConfig();
-            if (
-                cfg.searchDependencies !== false &&
-                receiverAstFiles.size === 0
-            ) {
-                const receiverCandidates = this._candidatePackagesForMethods([methodName]);
-                receiverCandidates.add(receiverPackage);
-                const receiverFiles = await this._parseAstPackages(receiverCandidates, 200);
-                const receiverClosure = await this._expandEmbeddedAstPackages(
-                    receiverCandidates,
-                    receiverFiles,
-                    200
+            if (!receiverPackageInfo) return [];
+            const interfaceCandidates = await this._workspaceCandidateFiles(
+                'interface',
+                methodName
+            );
+            const astFiles = new Map(receiverPackageInfo.files);
+            const loadedDirectories = await this._loadWorkspaceCandidatePackages(
+                interfaceCandidates,
+                200,
+                astFiles
+            );
+
+            const builtinNames = new Set();
+            for (const [identity, methods] of BUILTIN_INTERFACES) {
+                if (identity.startsWith('@{')) continue;
+                if (![...methods.keys()].some((name) => bareMethodName(name) === methodName)) continue;
+                const dot = identity.lastIndexOf('.');
+                builtinNames.add(dot === -1 ? identity : identity.slice(dot + 1));
+            }
+            const searchedTypeNames = new Set();
+            let aliasExpansion = null;
+            let results = [];
+            for (let round = 0; round < 10; round++) {
+                const packages = new Set(
+                    [...astFiles.keys()].map((file) => this._packageForFile(file)).filter(Boolean)
                 );
-                const receiverAliases = await this._expandSignatureAliasPackages(
-                    receiverClosure.astFiles,
+                const closure = await this._expandEmbeddedAstPackages(packages, astFiles, 200);
+                aliasExpansion = await this._expandSignatureAliasPackages(
+                    closure.astFiles,
                     [methodName],
                     200
                 );
-                receiverAstFiles = receiverAliases.astFiles;
+                astFiles.clear();
+                for (const [file, info] of aliasExpansion.astFiles) astFiles.set(file, info);
+
+                const view = aliasExpansion.view;
+                results = view._collectLocalInterfaces(receiverType, methodName, {
+                    receiverFile,
+                }).results;
+                const names = new Set([...builtinNames, ...results.map((result) => result.name)]);
+                const { interfaces } = view._merged();
+                for (const [interfaceKey, info] of interfaces) {
+                    if (info.constraint) continue;
+                    const resolved = view._resolveInterfaceMethodsCached(interfaceKey, interfaces);
+                    if ([...resolved.methods.keys()].some(
+                        (name) => bareMethodName(name) === methodName
+                    )) {
+                        names.add(info.name);
+                    }
+                }
+                for (const name of searchedTypeNames) names.delete(name);
+                if (names.size === 0) break;
+                for (const name of names) searchedTypeNames.add(name);
+
+                const references = await this._workspaceTypeReferenceCandidates(names);
+                const before = astFiles.size;
+                const additions = await this._loadWorkspaceCandidatePackages(
+                    references,
+                    200,
+                    astFiles
+                );
+                for (const directory of additions) loadedDirectories.add(directory);
+                if (astFiles.size === before) break;
             }
+            if (!aliasExpansion) return [];
+            let receiverAstFiles = aliasExpansion.astFiles;
+            const cfg = this.getConfig();
             if (cfg.searchDependencies !== false) {
                 const cacheRoot = resolveGoModCache(cfg.goModCache);
                 if (cacheRoot) {
@@ -3156,7 +2981,7 @@ class WorkspaceIndex {
                 }
             }
             this.log(
-                `AST reverse query ${receiverType}.${methodName}: ${candidates.size} package(s), ` +
+                `AST reverse query ${receiverType}.${methodName}: ${loadedDirectories.size + 1} package(s), ` +
                     `${receiverAstFiles.size} file(s), ${Date.now() - started}ms`
             );
             return dedupeResults(results);
@@ -3180,6 +3005,7 @@ class WorkspaceIndex {
         const sources = await Promise.all(
             candidates.map(async (file) => {
                 try {
+                    if (this._isExcluded(file)) return null;
                     if (!shouldIncludeGoFile(file, '', this._buildContext)) return null;
                     const text = await fs.promises.readFile(file, 'utf8');
                     if (!shouldIncludeGoFile(file, text, this._buildContext)) return null;
@@ -3193,7 +3019,7 @@ class WorkspaceIndex {
         if (requests.length === 0) return [];
         let parsed;
         try {
-            const candidateFiles = await this.astPool.parseFiles(requests, 200);
+            const candidateFiles = await this._parseAstFiles(requests, 200);
             parsed = new Map(
                 [...candidateFiles].map(([file, info]) => [
                     file,
@@ -3691,6 +3517,7 @@ class WorkspaceIndex {
         for (const file of candidates) {
             let parsed;
             try {
+                if (this._isExcluded(file)) continue;
                 if (!shouldIncludeGoFile(file, '', this._buildContext)) continue;
                 const source = fs.readFileSync(file, 'utf8');
                 if (!shouldIncludeGoFile(file, source, this._buildContext)) continue;
@@ -3824,30 +3651,14 @@ class WorkspaceIndex {
         this._packageFiles.clear();
         this._packageKeyByFile.clear();
         this._packageKeysByDirectory.clear();
-        this._embeddedFiles.clear();
-        this._candidateMetadataByFile.clear();
-        this._embeddedPackageGraph = null;
         this._packageKeyByImportPath.clear();
         this._externalImportDirectoryCache.clear();
         this._externalPackageCache.clear();
+        this._workspacePackageCache.clear();
+        this._workspaceCandidateCache.clear();
         this._dependencyCandidateCache.clear();
         this._dependencyImplementationCandidateCache.clear();
         this._dependencyTypeReferenceCandidateCache.clear();
-        for (const state of this._candidateCacheStates.values()) {
-            if (state.writeTimer) clearTimeout(state.writeTimer);
-            state.writeTimer = null;
-            state.entries.clear();
-            state.dirty = false;
-            if (!state.cacheFile) continue;
-            try {
-                fs.unlinkSync(state.cacheFile);
-            } catch (err) {
-                if (err.code !== 'ENOENT') {
-                    this.log(`Candidate index cache clear failed: ${err.message}`);
-                }
-            }
-        }
-        this._candidateCacheStates.clear();
         if (this.astPool) this.astPool.clear();
         this._invalidateMerged();
         this._builds.clear();
@@ -3867,11 +3678,6 @@ class WorkspaceIndex {
             this.astPool.dispose();
             this.astPool = null;
         }
-        for (const state of this._candidateCacheStates.values()) {
-            if (state.writeTimer) clearTimeout(state.writeTimer);
-            state.writeTimer = null;
-        }
-        this._candidateCacheStates.clear();
         this.files.clear();
         this.overlays.clear();
         this.overlayTexts.clear();
@@ -3880,12 +3686,11 @@ class WorkspaceIndex {
         this._packageFiles.clear();
         this._packageKeyByFile.clear();
         this._packageKeysByDirectory.clear();
-        this._embeddedFiles.clear();
-        this._candidateMetadataByFile.clear();
-        this._embeddedPackageGraph = null;
         this._packageKeyByImportPath.clear();
         this._externalImportDirectoryCache.clear();
         this._externalPackageCache.clear();
+        this._workspacePackageCache.clear();
+        this._workspaceCandidateCache.clear();
         this._dependencyCandidateCache.clear();
         this._dependencyImplementationCandidateCache.clear();
         this._dependencyTypeReferenceCandidateCache.clear();
@@ -3896,11 +3701,6 @@ class WorkspaceIndex {
 // Window over which bursts of watcher events are coalesced into a single merged
 // view invalidation.
 WorkspaceIndex.INVALIDATE_DEBOUNCE_MS = 150;
-// Number of file reads issued together during initial indexing. Bounded
-// concurrency improves throughput without loading the whole workspace into RAM.
-WorkspaceIndex.INDEX_READ_CONCURRENCY = 16;
-// Maximum synchronous parse time before yielding back to the extension host.
-WorkspaceIndex.INDEX_TIME_SLICE_MS = 8;
 
 /**
  * De-duplicate result records by their location identity (name + file + line),

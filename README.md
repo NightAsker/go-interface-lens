@@ -1,9 +1,9 @@
 # Go Interface Lens
 
-[![Version](https://img.shields.io/badge/version-2.0.3-blue.svg)](https://github.com/NightAsker/go-interface-lens)
+[![Version](https://img.shields.io/badge/version-2.0.4-blue.svg)](https://github.com/NightAsker/go-interface-lens)
 [![VSCode](https://img.shields.io/badge/VSCode-1.76+-green.svg)](https://code.visualstudio.com/)
 
-一个面向大型 Go 工程的 VS Code / Cursor 接口导航扩展。它在接口、接口方法和具体实现之间提供双向 CodeLens，同时使用轻量候选索引和按需 AST 校验兼顾响应速度与查找准确性。
+一个面向大型 Go 工程的 VS Code / Cursor 接口导航扩展。它在接口、接口方法和具体实现之间提供双向 CodeLens，同时使用按查询的声明搜索和按需 AST 校验兼顾响应速度与查找准确性。
 
 不依赖 gopls；激活和 CodeLens 渲染期间不扫描 workspace，导航数据全部按需构建。
 
@@ -12,8 +12,9 @@
 ### 快速启动，按需精确查找
 
 - 激活和 CodeLens 展示只解析当前编辑器文档，不建立 workspace 索引，也不启动 AST Worker。
-- 点击 CodeLens 后才建立轻量的方法名候选索引，并仅解析接口所在包、可能包含实现的候选包，以及当前查询命中的锁定依赖包。
-- 每个接口只选择一个低频方法作为依赖候选锚点，避免为完整方法集重复扫描模块缓存。
+- 点击 CodeLens 后先解析目标所在包，再由 ripgrep 按方法声明搜索文件内容，仅加载命中的完整包。
+- 候选包中的类型别名和嵌入关系会按需递归扩展；Tree-sitter 最终校验完整方法集和签名，不会把普通函数调用当成声明。
+- 每个接口只选择一个较长的方法名作为候选锚点，避免为完整方法集重复扫描 workspace 和模块缓存。
 - 已完成的查询直接使用内存缓存，未变化的文件可从持久化 AST 缓存恢复。
 
 ### Tree-sitter Go WASM 精确解析
@@ -28,7 +29,7 @@
 - 本地或跨包嵌入的 struct、interface 和类型别名。
 - 标准库接口、`go.mod` 锁定依赖中的接口与具体实现、local replace、module replace 和 GOROOT 源码。
 - workspace 与锁定依赖中的正反向关系均在点击后按当前目标计算，不建立整库关系表。
-- 锁定依赖候选按接口中的低频方法逐次收窄，仅加载命中的包；跨包 alias、embed 和方法位置在同一次查询上下文中解析。
+- 锁定依赖候选按接口中的单个方法锚点收窄，仅加载命中的包；跨包 alias、embed 和方法位置在同一次查询上下文中解析。
 - AST 缓存按 pack 合并读取；未变化的 workspace 和依赖声明可跨重启复用，但查询结果不会持久化为整库关系快照。
 - import 别名、包内别名、跨包别名链和复合别名。
 - `byte`/`uint8`、`rune`/`int32`、`any`/`interface{}` 等价关系，并尊重包级同名声明遮蔽。
@@ -68,6 +69,7 @@ func (r *PostgresUserRepository) FindByID(
 ### 为大型工程控制开销
 
 - 候选包 AST 使用 1-32 个 Worker Thread 并发解析，默认上限为 32，并按可用 CPU 和内存自适应收缩。
+- workspace 候选包最多同时加载 8 个；每个选中包最多并发读取 16 个源码文件。两者只作用于已被声明搜索命中的包，不会全量读取 workspace。
 - Tree-sitter 解析前会清空函数体内容，仅保留函数签名、原始行号和源码偏移。
 - 相同文件的并发解析请求会自动合并。
 - 依赖接口只在工作区查找不到结果时按需搜索，不全量索引 module cache。
@@ -118,14 +120,14 @@ WASM、Go grammar WASM 和 MIT 许可证；依赖包里的其他语言 grammar �
 | 配置项 | 默认值 | 作用 |
 | --- | --- | --- |
 | `goInterfaceLens.astConcurrency` | `32` | 候选包 AST Worker 上限，可设置为 `1-32`；实际并发按可用 CPU 和内存自适应 |
-| `goInterfaceLens.excludedFolders` | `mocks, mock, testdata, vendor` | 排除指定目录 |
+| `goInterfaceLens.excludedFolders` | `mocks, mock, testdata, vendor` | 按目录路径排除候选加载和 Tree-sitter 解析；支持 `*`、`?` 通配符 |
 | `goInterfaceLens.excludedFilePatterns` | `_mock.go, mock_, .pb.go, _test.go` | 排除文件名中包含指定文本的文件 |
 | `goInterfaceLens.excludedTypePatterns` | `Mock, mock, Stub, Fake` | 排除名称中包含指定文本的类型 |
-| `goInterfaceLens.excludedPackagePatterns` | 空 | 按 Go import path 排除工作区索引和依赖解析；`*` 匹配任意字符（包括 `/`），`?` 匹配单个字符 |
+| `goInterfaceLens.excludedPackagePatterns` | 空 | 按 Go import path 排除工作区候选包和依赖解析；`*` 匹配任意字符（包括 `/`），`?` 匹配单个字符 |
 | `goInterfaceLens.searchDependencies` | `true` | 正反向导航时按需搜索 `go.mod` 锁定依赖中的接口与具体实现；无锁信息时仅搜索显式配置的依赖根 |
 | `goInterfaceLens.goModCache` | 空 | 手动指定 Go module cache；为空时自动探测 |
 
-修改包路径排除规则后，插件会自动清理旧索引；下一次导航查询会按新规则重建，无需重启扩展。
+修改包路径排除规则后，插件会自动清理查询缓存；下一次导航查询会按新规则重新搜索，无需重启扩展。
 
 示例：
 
@@ -142,7 +144,8 @@ WASM、Go grammar WASM 和 MIT 许可证；依赖包里的其他语言 grammar �
     "mock",
     "testdata",
     "vendor",
-    "generated"
+    "generated",
+    "*overpass*"
   ],
   "goInterfaceLens.excludedFilePatterns": [
     "_mock.go",
@@ -168,8 +171,8 @@ AST Worker 使用 `os.availableParallelism()` 感知宿主机或容器可用 CPU
 
 开发环境中的合成测试包含 402 个 Go 文件：
 
-- 启动候选索引约 `47ms`，Tree-sitter WASM 解析文件数为 `0`。
-- 首次 AST 查询约 `37ms`。
+- workspace 根注册约 `0.1ms`，读取 Go 源码数和 Tree-sitter WASM 解析文件数均为 `0`。
+- 首次按需查询约 `90ms`。
 - 缓存查询约 `0ms`。
 - 一次稀有方法查询只解析 2 个候选文件。
 
@@ -182,7 +185,7 @@ AST Worker 使用 `os.availableParallelism()` 感知宿主机或容器可用 CPU
 | `Go: Show Implementations` | 查看接口的完整实现 |
 | `Go: Show Method Implementations` | 查看接口方法实现 |
 | `Go: Goto Interface` | 从接收者方法跳转到接口 |
-| `Go: Clear Implementation Lens Cache` | 清除索引和查询缓存 |
+| `Go: Clear Implementation Lens Cache` | 清除 AST 和查询缓存 |
 
 前三个命令通常由对应 CodeLens 携带上下文调用。清理缓存命令可以直接从 Command Palette 执行。
 
