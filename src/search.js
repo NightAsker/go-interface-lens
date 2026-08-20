@@ -7,6 +7,7 @@ const path = require('path');
 const { hasCompatibleMethodArity } = require('./go-arity');
 
 const ARITY_PREFILTER_READ_CONCURRENCY = 32;
+const RIPGREP_PROCESS_CONCURRENCY = 4;
 
 /**
  * On-demand Go declaration candidate searches. Prefer VS Code's bundled
@@ -115,16 +116,13 @@ async function grepInterfaceFilesForMethod(root, methodName, maxFiles, searchDir
         '1',
         '-e',
         `(?:^\\s*${methodName}\\s*\\(|\\binterface\\s*\\{[^}]*\\b${methodName}\\s*\\()`,
-        '--',
     ];
 
     // Search targets: either the specific locked-version directories, or `.`
     // (the whole root). Passed after `--` so they are always treated as paths.
     const targets = Array.isArray(searchDirs) && searchDirs.length > 0 ? searchDirs : ['.'];
-    for (const t of targets) args.push(t);
-
     try {
-        const out = await runExec(rg || 'rg', args, root, 20000);
+        const out = await runRipgrepShards(rg || 'rg', args, targets, root, 20000);
         const files = out
             .split('\n')
             .map((l) => l.trim())
@@ -161,13 +159,11 @@ async function grepImplementationFilesForMethod(root, methodName, maxFiles, sear
         '1',
         '-e',
         `\\bfunc\\s*\\([^)]*\\)\\s*${methodName}\\s*\\(`,
-        '--',
     ];
     const targets = Array.isArray(searchDirs) && searchDirs.length > 0 ? searchDirs : ['.'];
-    for (const target of targets) args.push(target);
 
     try {
-        const out = await runExec(rg || 'rg', args, root, 20000);
+        const out = await runRipgrepShards(rg || 'rg', args, targets, root, 20000);
         const files = out
             .split('\n')
             .map((line) => line.trim())
@@ -251,13 +247,11 @@ async function grepGoFilesForTypeNames(root, typeNames, maxFiles, searchDirs) {
         '1',
         '-e',
         `(?:${directAlias}|${groupedAlias}|${embeddedField})`,
-        '--',
     ];
     const targets = Array.isArray(searchDirs) && searchDirs.length > 0 ? searchDirs : ['.'];
-    for (const target of targets) args.push(target);
 
     try {
-        const out = await runExec(rg || 'rg', args, root, 20000);
+        const out = await runRipgrepShards(rg || 'rg', args, targets, root, 20000);
         return out
             .split('\n')
             .map((line) => line.trim())
@@ -267,6 +261,28 @@ async function grepGoFilesForTypeNames(root, typeNames, maxFiles, searchDirs) {
     } catch (_) {
         return [];
     }
+}
+
+function splitSearchTargets(targets, concurrency = RIPGREP_PROCESS_CONCURRENCY) {
+    const values = [...(targets || [])];
+    if (values.length === 0) return [];
+    const groupCount = Math.min(
+        values.length,
+        Math.max(1, Number.isInteger(concurrency) ? concurrency : RIPGREP_PROCESS_CONCURRENCY)
+    );
+    const groups = Array.from({ length: groupCount }, () => []);
+    for (let index = 0; index < values.length; index++) {
+        groups[index % groupCount].push(values[index]);
+    }
+    return groups;
+}
+
+async function runRipgrepShards(cmd, args, targets, cwd, timeout) {
+    const groups = splitSearchTargets(targets);
+    const outputs = await Promise.all(
+        groups.map((group) => runExec(cmd, [...args, '--', ...group], cwd, timeout))
+    );
+    return outputs.filter(Boolean).join('\n');
 }
 
 /**
@@ -351,4 +367,5 @@ module.exports = {
     grepInterfaceFilesForMethod,
     grepImplementationFilesForMethod,
     grepGoFilesForTypeNames,
+    splitSearchTargets,
 };

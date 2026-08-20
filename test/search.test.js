@@ -13,7 +13,10 @@ Module._resolveFilename = function (request, ...rest) {
 };
 
 const vscode = require(stubPath);
-const { resolveSearchRoots } = require(path.join(__dirname, '..', 'src', 'search'));
+const {
+    resolveSearchRoots,
+    splitSearchTargets,
+} = require(path.join(__dirname, '..', 'src', 'search'));
 const { eq, assert, done } = require(path.join(__dirname, 'harness'));
 
 const uri = (p) => ({ fsPath: p });
@@ -62,5 +65,20 @@ vscode.workspace.getWorkspaceFolder = () => undefined;
     console.log('  got:', roots);
     eq('fallback to file dir', roots, ['/tmp/loose']);
 }
+
+console.log('\n== ripgrep target sharding ==');
+
+eq('empty target list creates no process group', splitSearchTargets([]), []);
+eq('one target keeps a single ripgrep process', splitSearchTargets(['/a']), [['/a']]);
+eq(
+    'dependency directories are distributed across four ripgrep processes',
+    splitSearchTargets(['/a', '/b', '/c', '/d', '/e', '/f']),
+    [['/a', '/e'], ['/b', '/f'], ['/c'], ['/d']]
+);
+eq(
+    'an explicit lower process ceiling remains supported',
+    splitSearchTargets(['/a', '/b', '/c'], 2),
+    [['/a', '/c'], ['/b']]
+);
 
 done();

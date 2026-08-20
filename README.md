@@ -1,6 +1,6 @@
 # Go Interface Lens
 
-[![Version](https://img.shields.io/badge/version-2.0.5-blue.svg)](https://github.com/NightAsker/go-interface-lens)
+[![Version](https://img.shields.io/badge/version-2.0.6-blue.svg)](https://github.com/NightAsker/go-interface-lens)
 [![VSCode](https://img.shields.io/badge/VSCode-1.76+-green.svg)](https://code.visualstudio.com/)
 
 一个面向大型 Go 工程的 VS Code / Cursor 接口导航扩展。它在接口、接口方法和具体实现之间提供双向 CodeLens，同时使用按查询的声明搜索和按需 AST 校验兼顾响应速度与查找准确性。
@@ -70,6 +70,7 @@ func (r *PostgresUserRepository) FindByID(
 ### 为大型工程控制开销
 
 - 候选包 AST 使用 1-32 个 Worker Thread 并发解析，默认上限为 32，并按可用 CPU 和内存自适应收缩。
+- 锁定依赖目录会轮询分配给最多 4 个并发 ripgrep 进程，每个进程继续使用 ripgrep 自身的自动线程数；单根 workspace 搜索仍使用单进程。
 - workspace 候选包最多同时加载 8 个；每个选中包最多并发读取 16 个源码文件。两者只作用于已被声明搜索命中的包，不会全量读取 workspace。
 - Tree-sitter 解析前会清空函数体内容，仅保留函数签名、原始行号和源码偏移。
 - 相同文件的并发解析请求会自动合并。

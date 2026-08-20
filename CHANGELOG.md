@@ -2,6 +2,14 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.0.6] - 2026-08-20
+
+### Changed
+
+- Split explicit locked-dependency search directories across up to four
+  concurrent ripgrep processes. Each process retains ripgrep's automatic
+  internal threading; single-root workspace searches remain single-process.
+
 ## [2.0.5] - 2026-08-19
 
 ### Changed
