@@ -2,6 +2,15 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.0.7] - 2026-08-20
+
+### Changed
+
+- Raise locked-dependency ripgrep sharding to a CPU-aware ceiling of 16
+  processes and enforce that ceiling globally across concurrent interface,
+  implementation, and type-reference searches. Ripgrep retains automatic
+  internal threading.
+
 ## [2.0.6] - 2026-08-20
 
 ### Changed

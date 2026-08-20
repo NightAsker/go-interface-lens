@@ -16,6 +16,8 @@ const vscode = require(stubPath);
 const {
     resolveSearchRoots,
     splitSearchTargets,
+    resolveRipgrepProcessConcurrency,
+    createConcurrencyGate,
 } = require(path.join(__dirname, '..', 'src', 'search'));
 const { eq, assert, done } = require(path.join(__dirname, 'harness'));
 
@@ -70,15 +72,44 @@ console.log('\n== ripgrep target sharding ==');
 
 eq('empty target list creates no process group', splitSearchTargets([]), []);
 eq('one target keeps a single ripgrep process', splitSearchTargets(['/a']), [['/a']]);
+const dependencyTargets = Array.from({ length: 18 }, (_, index) => `/dep-${index}`);
 eq(
-    'dependency directories are distributed across four ripgrep processes',
-    splitSearchTargets(['/a', '/b', '/c', '/d', '/e', '/f']),
-    [['/a', '/e'], ['/b', '/f'], ['/c'], ['/d']]
+    'dependency directories are distributed across sixteen ripgrep processes',
+    splitSearchTargets(dependencyTargets, 16),
+    [
+        ['/dep-0', '/dep-16'],
+        ['/dep-1', '/dep-17'],
+        ...Array.from({ length: 14 }, (_, index) => [`/dep-${index + 2}`]),
+    ]
 );
 eq(
     'an explicit lower process ceiling remains supported',
     splitSearchTargets(['/a', '/b', '/c'], 2),
     [['/a', '/c'], ['/b']]
 );
+eq('ripgrep concurrency follows available CPUs', resolveRipgrepProcessConcurrency(12), 12);
+eq('ripgrep concurrency is capped at sixteen', resolveRipgrepProcessConcurrency(64), 16);
 
-done();
+async function testSharedConcurrencyGate() {
+    const gate = createConcurrencyGate(3);
+    let active = 0;
+    let peak = 0;
+    await Promise.all(
+        Array.from({ length: 12 }, () =>
+            gate(async () => {
+                active++;
+                peak = Math.max(peak, active);
+                await new Promise((resolve) => setImmediate(resolve));
+                active--;
+            })
+        )
+    );
+    eq('shared process gate enforces its global ceiling', peak, 3);
+}
+
+testSharedConcurrencyGate()
+    .then(done)
+    .catch((error) => {
+        console.error(error);
+        process.exitCode = 1;
+    });

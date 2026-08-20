@@ -3,11 +3,52 @@
 const vscode = require('vscode');
 const { execFile } = require('child_process');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { hasCompatibleMethodArity } = require('./go-arity');
 
 const ARITY_PREFILTER_READ_CONCURRENCY = 32;
-const RIPGREP_PROCESS_CONCURRENCY = 4;
+const MAX_RIPGREP_PROCESS_CONCURRENCY = 16;
+
+function resolveRipgrepProcessConcurrency(parallelism) {
+    let available = parallelism;
+    if (!Number.isInteger(available) || available < 1) {
+        available =
+            typeof os.availableParallelism === 'function'
+                ? os.availableParallelism()
+                : (os.cpus() || []).length;
+    }
+    return Math.min(MAX_RIPGREP_PROCESS_CONCURRENCY, Math.max(1, available || 1));
+}
+
+function createConcurrencyGate(concurrency) {
+    const limit = Math.max(1, Number.isInteger(concurrency) ? concurrency : 1);
+    const queue = [];
+    let active = 0;
+
+    const drain = () => {
+        while (active < limit && queue.length > 0) {
+            const entry = queue.shift();
+            active++;
+            Promise.resolve()
+                .then(entry.task)
+                .then(entry.resolve, entry.reject)
+                .finally(() => {
+                    active--;
+                    drain();
+                });
+        }
+    };
+
+    return (task) =>
+        new Promise((resolve, reject) => {
+            queue.push({ task, resolve, reject });
+            drain();
+        });
+}
+
+const RIPGREP_PROCESS_CONCURRENCY = resolveRipgrepProcessConcurrency();
+const runWithRipgrepProcessSlot = createConcurrencyGate(RIPGREP_PROCESS_CONCURRENCY);
 
 /**
  * On-demand Go declaration candidate searches. Prefer VS Code's bundled
@@ -280,7 +321,11 @@ function splitSearchTargets(targets, concurrency = RIPGREP_PROCESS_CONCURRENCY) 
 async function runRipgrepShards(cmd, args, targets, cwd, timeout) {
     const groups = splitSearchTargets(targets);
     const outputs = await Promise.all(
-        groups.map((group) => runExec(cmd, [...args, '--', ...group], cwd, timeout))
+        groups.map((group) =>
+            runWithRipgrepProcessSlot(() =>
+                runExec(cmd, [...args, '--', ...group], cwd, timeout)
+            )
+        )
     );
     return outputs.filter(Boolean).join('\n');
 }
@@ -368,4 +413,6 @@ module.exports = {
     grepImplementationFilesForMethod,
     grepGoFilesForTypeNames,
     splitSearchTargets,
+    resolveRipgrepProcessConcurrency,
+    createConcurrencyGate,
 };
