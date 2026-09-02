@@ -2,6 +2,15 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.0.8] - 2026-09-02
+
+### Fixed
+
+- Discover ripgrep in the `@vscode/ripgrep-universal` layout used by current
+  VS Code Server releases, so Remote-SSH implementation searches do not
+  silently return empty results when `rg` is absent from the remote `PATH`.
+- Log ripgrep launch failures with the affected search kind and root.
+
 ## [2.0.7] - 2026-08-20
 
 ### Changed

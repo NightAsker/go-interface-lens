@@ -58,6 +58,47 @@ const runWithRipgrepProcessSlot = createConcurrencyGate(RIPGREP_PROCESS_CONCURRE
 
 let cachedRgPath;
 
+function bundledRipgrepCandidates(appRoot, platform, arch) {
+    if (!appRoot) return [];
+    const runtimePlatform = platform || process.platform;
+    const runtimeArch = arch || process.arch;
+    const bin = runtimePlatform === 'win32' ? 'rg.exe' : 'rg';
+    const universalTarget = `${runtimePlatform}-${runtimeArch}`;
+    return [
+        path.join(appRoot, 'node_modules', '@vscode', 'ripgrep', 'bin', bin),
+        path.join(appRoot, 'node_modules.asar.unpacked', '@vscode', 'ripgrep', 'bin', bin),
+        path.join(
+            appRoot,
+            'node_modules',
+            '@vscode',
+            'ripgrep-universal',
+            'bin',
+            universalTarget,
+            bin
+        ),
+        path.join(
+            appRoot,
+            'node_modules.asar.unpacked',
+            '@vscode',
+            'ripgrep-universal',
+            'bin',
+            universalTarget,
+            bin
+        ),
+    ];
+}
+
+function findBundledRipgrep(appRoot, platform, arch) {
+    for (const candidate of bundledRipgrepCandidates(appRoot, platform, arch)) {
+        try {
+            if (fs.existsSync(candidate)) return candidate;
+        } catch (_) {
+            // Try the next known VS Code / VS Code Server layout.
+        }
+    }
+    return null;
+}
+
 /**
  * Locate a ripgrep binary. VS Code ships one under its install root.
  * @returns {string|null}
@@ -65,28 +106,14 @@ let cachedRgPath;
 function findRipgrep() {
     if (cachedRgPath !== undefined) return cachedRgPath;
 
-    const candidates = [];
-    const appRoot = vscode.env.appRoot;
-    if (appRoot) {
-        const base = path.join(appRoot, 'node_modules', '@vscode', 'ripgrep', 'bin');
-        const baseAlt = path.join(appRoot, 'node_modules.asar.unpacked', '@vscode', 'ripgrep', 'bin');
-        const bin = process.platform === 'win32' ? 'rg.exe' : 'rg';
-        candidates.push(path.join(base, bin), path.join(baseAlt, bin));
-    }
-
-    for (const c of candidates) {
-        try {
-            if (fs.existsSync(c)) {
-                cachedRgPath = c;
-                return cachedRgPath;
-            }
-        } catch (_) {
-            // ignore
-        }
-    }
-
-    cachedRgPath = null; // fall back to PATH `rg`
+    cachedRgPath = findBundledRipgrep(vscode.env.appRoot);
     return cachedRgPath;
+}
+
+function logSearchFailure(log, kind, root, error) {
+    if (typeof log !== 'function') return;
+    const reason = error && error.message ? error.message : String(error);
+    log(`ripgrep ${kind} search failed under ${root}: ${reason}`);
 }
 
 /**
@@ -139,9 +166,17 @@ function resolveGoModCache(override) {
  * @param {number} [maxFiles] cap on candidate files
  * @param {string[]} [searchDirs] restrict search to these absolute directories
  * @param {{params:number,results:number}} [arity] optional declaration shape prefilter
+ * @param {(message:string)=>void} [log] diagnostic logger
  * @returns {Promise<string[]>}
  */
-async function grepInterfaceFilesForMethod(root, methodName, maxFiles, searchDirs, arity) {
+async function grepInterfaceFilesForMethod(
+    root,
+    methodName,
+    maxFiles,
+    searchDirs,
+    arity,
+    log
+) {
     if (!/^[A-Za-z_]\w*$/.test(methodName)) return []; // guard the regex input
     const rg = findRipgrep();
     const cap = maxFiles || 200;
@@ -170,7 +205,8 @@ async function grepInterfaceFilesForMethod(root, methodName, maxFiles, searchDir
             .filter(Boolean)
             .map((l) => (path.isAbsolute(l) ? l : path.join(root, l)));
         return filterFilesByMethodArity(files, methodName, 'interface', arity, cap);
-    } catch (_) {
+    } catch (error) {
+        logSearchFailure(log, 'interface', root, error);
         return [];
     }
 }
@@ -185,9 +221,17 @@ async function grepInterfaceFilesForMethod(root, methodName, maxFiles, searchDir
  * @param {number} [maxFiles] cap on candidate files
  * @param {string[]} [searchDirs] restrict search to locked module directories
  * @param {{params:number,results:number}} [arity] optional declaration shape prefilter
+ * @param {(message:string)=>void} [log] diagnostic logger
  * @returns {Promise<string[]>}
  */
-async function grepImplementationFilesForMethod(root, methodName, maxFiles, searchDirs, arity) {
+async function grepImplementationFilesForMethod(
+    root,
+    methodName,
+    maxFiles,
+    searchDirs,
+    arity,
+    log
+) {
     if (!/^[A-Za-z_]\w*$/.test(methodName)) return [];
     const rg = findRipgrep();
     const cap = maxFiles || 400;
@@ -211,7 +255,8 @@ async function grepImplementationFilesForMethod(root, methodName, maxFiles, sear
             .filter(Boolean)
             .map((line) => (path.isAbsolute(line) ? line : path.join(root, line)));
         return filterFilesByMethodArity(files, methodName, 'implementation', arity, cap);
-    } catch (_) {
+    } catch (error) {
+        logSearchFailure(log, 'implementation', root, error);
         return [];
     }
 }
@@ -259,9 +304,10 @@ async function filterFilesByMethodArity(files, methodName, kind, arity, maxFiles
  * @param {Iterable<string>} typeNames candidate embedded type names
  * @param {number} [maxFiles] cap on candidate files
  * @param {string[]} [searchDirs] restrict search to locked module directories
+ * @param {(message:string)=>void} [log] diagnostic logger
  * @returns {Promise<string[]>}
  */
-async function grepGoFilesForTypeNames(root, typeNames, maxFiles, searchDirs) {
+async function grepGoFilesForTypeNames(root, typeNames, maxFiles, searchDirs, log) {
     const names = [...new Set(typeNames)].filter((name) => /^[A-Za-z_]\w*$/.test(name)).sort();
     if (names.length === 0) return [];
     const rg = findRipgrep();
@@ -299,7 +345,8 @@ async function grepGoFilesForTypeNames(root, typeNames, maxFiles, searchDirs) {
             .filter(Boolean)
             .map((line) => (path.isAbsolute(line) ? line : path.join(root, line)))
             .slice(0, cap);
-    } catch (_) {
+    } catch (error) {
+        logSearchFailure(log, 'type-reference', root, error);
         return [];
     }
 }
@@ -408,6 +455,8 @@ function resolveSearchRoots(documentUri) {
 module.exports = {
     resolveSearchRoots,
     findRipgrep,
+    bundledRipgrepCandidates,
+    findBundledRipgrep,
     resolveGoModCache,
     grepInterfaceFilesForMethod,
     grepImplementationFilesForMethod,

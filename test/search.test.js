@@ -1,5 +1,7 @@
 'use strict';
 
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 // Redirect `require('vscode')` to the headless stub so we can drive
@@ -15,6 +17,8 @@ Module._resolveFilename = function (request, ...rest) {
 const vscode = require(stubPath);
 const {
     resolveSearchRoots,
+    bundledRipgrepCandidates,
+    findBundledRipgrep,
     splitSearchTargets,
     resolveRipgrepProcessConcurrency,
     createConcurrencyGate,
@@ -67,6 +71,30 @@ vscode.workspace.getWorkspaceFolder = () => undefined;
     console.log('  got:', roots);
     eq('fallback to file dir', roots, ['/tmp/loose']);
 }
+
+console.log('\n== bundled ripgrep discovery ==');
+const appRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'go-interface-lens-app-root-'));
+const universalRg = path.join(
+    appRoot,
+    'node_modules',
+    '@vscode',
+    'ripgrep-universal',
+    'bin',
+    'linux-x64',
+    'rg'
+);
+fs.mkdirSync(path.dirname(universalRg), { recursive: true });
+fs.writeFileSync(universalRg, '');
+assert(
+    'candidate paths include the current VS Code Server ripgrep-universal layout',
+    bundledRipgrepCandidates(appRoot, 'linux', 'x64').includes(universalRg)
+);
+eq(
+    'bundled ripgrep discovery finds the current VS Code Server layout',
+    findBundledRipgrep(appRoot, 'linux', 'x64'),
+    universalRg
+);
+fs.rmSync(appRoot, { recursive: true, force: true });
 
 console.log('\n== ripgrep target sharding ==');
 

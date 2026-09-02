@@ -1600,7 +1600,14 @@ class WorkspaceIndex {
                 : grepInterfaceFilesForMethod;
         const request = Promise.all(
             roots.map((root) =>
-                search(root, methodName, Number.MAX_SAFE_INTEGER, undefined, arity)
+                search(
+                    root,
+                    methodName,
+                    Number.MAX_SAFE_INTEGER,
+                    undefined,
+                    arity,
+                    this.log
+                )
             )
         ).then((groups) => {
             const files = new Set(groups.flat().map(path.normalize));
@@ -1633,7 +1640,13 @@ class WorkspaceIndex {
         }
         const request = Promise.all(
             roots.map((root) =>
-                grepGoFilesForTypeNames(root, names, Number.MAX_SAFE_INTEGER)
+                grepGoFilesForTypeNames(
+                    root,
+                    names,
+                    Number.MAX_SAFE_INTEGER,
+                    undefined,
+                    this.log
+                )
             )
         ).then((groups) =>
             [...new Set(groups.flat().map(path.normalize))].filter(
@@ -3112,7 +3125,8 @@ class WorkspaceIndex {
             methodName,
             normalizedDirs.length > 0 ? Number.MAX_SAFE_INTEGER : undefined,
             normalizedDirs,
-            arity
+            arity,
+            this.log
         ).then((files) => this._filterDependencyFiles(files)).catch((error) => {
             if (this._dependencyCandidateCache.get(key) === request) {
                 this._dependencyCandidateCache.delete(key);
@@ -3135,7 +3149,8 @@ class WorkspaceIndex {
             methodName,
             normalizedDirs.length > 0 ? Number.MAX_SAFE_INTEGER : undefined,
             normalizedDirs,
-            arity
+            arity,
+            this.log
         ).then((files) => this._filterDependencyFiles(files)).catch((error) => {
             if (this._dependencyImplementationCandidateCache.get(key) === request) {
                 this._dependencyImplementationCandidateCache.delete(key);
@@ -3159,7 +3174,8 @@ class WorkspaceIndex {
             cacheRoot,
             names,
             normalizedDirs.length > 0 ? Number.MAX_SAFE_INTEGER : undefined,
-            normalizedDirs
+            normalizedDirs,
+            this.log
         ).then((files) => this._filterDependencyFiles(files)).catch((error) => {
             if (this._dependencyTypeReferenceCandidateCache.get(key) === request) {
                 this._dependencyTypeReferenceCandidateCache.delete(key);
