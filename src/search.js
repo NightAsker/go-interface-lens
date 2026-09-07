@@ -6,6 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { hasCompatibleMethodArity } = require('./go-arity');
+const { normalizeWildcardPatterns, createFolderMatcher } = require('./path-filter');
 
 const ARITY_PREFILTER_READ_CONCURRENCY = 32;
 const MAX_RIPGREP_PROCESS_CONCURRENCY = 16;
@@ -116,6 +117,22 @@ function logSearchFailure(log, kind, root, error) {
     log(`ripgrep ${kind} search failed under ${root}: ${reason}`);
 }
 
+function prepareSearch(root, args, searchDirs, options) {
+    const folders = normalizeWildcardPatterns(options.excludedFolders);
+    const excludedDirectory = createFolderMatcher(folders);
+    const targets = (Array.isArray(searchDirs) && searchDirs.length > 0 ? searchDirs : ['.'])
+        .filter((target) => !excludedDirectory(path.resolve(root, target)));
+    const filteredArgs = [...args];
+    // Only push down patterns with equivalent glob semantics. The file predicate
+    // handles complex paths and literal glob characters before any arity reads.
+    for (const folder of folders) {
+        if (/^[A-Za-z0-9_.*?@+-]+$/.test(folder)) {
+            filteredArgs.push('--glob', `!**/${folder}/**`);
+        }
+    }
+    return { args: filteredArgs, targets };
+}
+
 /**
  * Resolve the Go module cache directory, where downloaded dependency sources
  * live (the interface may be declared there while implemented in the project).
@@ -167,6 +184,7 @@ function resolveGoModCache(override) {
  * @param {string[]} [searchDirs] restrict search to these absolute directories
  * @param {{params:number,results:number}} [arity] optional declaration shape prefilter
  * @param {(message:string)=>void} [log] diagnostic logger
+ * @param {{excludedFolders?:string[],includeFile?:function}} [options] path prefilters
  * @returns {Promise<string[]>}
  */
 async function grepInterfaceFilesForMethod(
@@ -175,7 +193,8 @@ async function grepInterfaceFilesForMethod(
     maxFiles,
     searchDirs,
     arity,
-    log
+    log,
+    options = {}
 ) {
     if (!/^[A-Za-z_]\w*$/.test(methodName)) return []; // guard the regex input
     const rg = findRipgrep();
@@ -196,14 +215,16 @@ async function grepInterfaceFilesForMethod(
 
     // Search targets: either the specific locked-version directories, or `.`
     // (the whole root). Passed after `--` so they are always treated as paths.
-    const targets = Array.isArray(searchDirs) && searchDirs.length > 0 ? searchDirs : ['.'];
+    const search = prepareSearch(root, args, searchDirs, options);
+    if (search.targets.length === 0) return [];
     try {
-        const out = await runRipgrepShards(rg || 'rg', args, targets, root, 20000);
+        const out = await runRipgrepShards(rg || 'rg', search.args, search.targets, root, 20000);
         const files = out
             .split('\n')
             .map((l) => l.trim())
             .filter(Boolean)
-            .map((l) => (path.isAbsolute(l) ? l : path.join(root, l)));
+            .map((l) => (path.isAbsolute(l) ? l : path.join(root, l)))
+            .filter((file) => !options.includeFile || options.includeFile(file));
         return filterFilesByMethodArity(files, methodName, 'interface', arity, cap);
     } catch (error) {
         logSearchFailure(log, 'interface', root, error);
@@ -222,6 +243,7 @@ async function grepInterfaceFilesForMethod(
  * @param {string[]} [searchDirs] restrict search to locked module directories
  * @param {{params:number,results:number}} [arity] optional declaration shape prefilter
  * @param {(message:string)=>void} [log] diagnostic logger
+ * @param {{excludedFolders?:string[],includeFile?:function}} [options] path prefilters
  * @returns {Promise<string[]>}
  */
 async function grepImplementationFilesForMethod(
@@ -230,7 +252,8 @@ async function grepImplementationFilesForMethod(
     maxFiles,
     searchDirs,
     arity,
-    log
+    log,
+    options = {}
 ) {
     if (!/^[A-Za-z_]\w*$/.test(methodName)) return [];
     const rg = findRipgrep();
@@ -245,15 +268,17 @@ async function grepImplementationFilesForMethod(
         '-e',
         `\\bfunc\\s*\\([^)]*\\)\\s*${methodName}\\s*\\(`,
     ];
-    const targets = Array.isArray(searchDirs) && searchDirs.length > 0 ? searchDirs : ['.'];
+    const search = prepareSearch(root, args, searchDirs, options);
+    if (search.targets.length === 0) return [];
 
     try {
-        const out = await runRipgrepShards(rg || 'rg', args, targets, root, 20000);
+        const out = await runRipgrepShards(rg || 'rg', search.args, search.targets, root, 20000);
         const files = out
             .split('\n')
             .map((line) => line.trim())
             .filter(Boolean)
-            .map((line) => (path.isAbsolute(line) ? line : path.join(root, line)));
+            .map((line) => (path.isAbsolute(line) ? line : path.join(root, line)))
+            .filter((file) => !options.includeFile || options.includeFile(file));
         return filterFilesByMethodArity(files, methodName, 'implementation', arity, cap);
     } catch (error) {
         logSearchFailure(log, 'implementation', root, error);
@@ -305,9 +330,10 @@ async function filterFilesByMethodArity(files, methodName, kind, arity, maxFiles
  * @param {number} [maxFiles] cap on candidate files
  * @param {string[]} [searchDirs] restrict search to locked module directories
  * @param {(message:string)=>void} [log] diagnostic logger
+ * @param {{excludedFolders?:string[],includeFile?:function}} [options] path prefilters
  * @returns {Promise<string[]>}
  */
-async function grepGoFilesForTypeNames(root, typeNames, maxFiles, searchDirs, log) {
+async function grepGoFilesForTypeNames(root, typeNames, maxFiles, searchDirs, log, options = {}) {
     const names = [...new Set(typeNames)].filter((name) => /^[A-Za-z_]\w*$/.test(name)).sort();
     if (names.length === 0) return [];
     const rg = findRipgrep();
@@ -335,15 +361,17 @@ async function grepGoFilesForTypeNames(root, typeNames, maxFiles, searchDirs, lo
         '-e',
         `(?:${directAlias}|${groupedAlias}|${embeddedField})`,
     ];
-    const targets = Array.isArray(searchDirs) && searchDirs.length > 0 ? searchDirs : ['.'];
+    const search = prepareSearch(root, args, searchDirs, options);
+    if (search.targets.length === 0) return [];
 
     try {
-        const out = await runRipgrepShards(rg || 'rg', args, targets, root, 20000);
+        const out = await runRipgrepShards(rg || 'rg', search.args, search.targets, root, 20000);
         return out
             .split('\n')
             .map((line) => line.trim())
             .filter(Boolean)
             .map((line) => (path.isAbsolute(line) ? line : path.join(root, line)))
+            .filter((file) => !options.includeFile || options.includeFile(file))
             .slice(0, cap);
     } catch (error) {
         logSearchFailure(log, 'type-reference', root, error);

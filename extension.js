@@ -351,6 +351,7 @@ function activate(context) {
             vscode.workspace.onDidChangeConfiguration((event) => {
                 if (
                     !event.affectsConfiguration('goInterfaceLens.excludedFolders') &&
+                    !event.affectsConfiguration('goInterfaceLens.excludedFilePatterns') &&
                     !event.affectsConfiguration('goInterfaceLens.excludedPackagePatterns')
                 ) {
                     return;

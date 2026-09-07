@@ -94,6 +94,50 @@ async function main() {
     eq('restored AST cache preserves query results', restoredResults.map((item) => item.name), ['Impl']);
     assert('candidate packages restore declarations from the AST disk cache', restored.getAstStats().diskHits > 0);
 
+    console.log('\n== unchanged dirty documents preserve cached and in-flight queries ==');
+    const dirtySource = 'package impl\ntype Impl struct{}\nfunc (Impl) Run() error { return nil }\n';
+    restored.updateOverlay(implFile, dirtySource, false);
+    const dirtyResults = await restored.findImplementationsAst('Service', apiFile);
+    const dirtyCandidates = restored._workspaceCandidateFiles('implementation', 'Run');
+    await dirtyCandidates;
+    const parsedBeforeResync = restored.getAstStats().parsed;
+    const generationBeforeResync = restored._astGeneration;
+    let notifications = 0;
+    restored.onDidChange(() => { notifications++; });
+    restored.updateOverlay(implFile, dirtySource);
+    eq('identical overlay does not invalidate the index generation', restored._astGeneration, generationBeforeResync);
+    eq('identical overlay does not refresh CodeLens', notifications, 0);
+    assert(
+        'identical overlay preserves the workspace candidate scan',
+        dirtyCandidates === restored._workspaceCandidateFiles('implementation', 'Run')
+    );
+    assert(
+        'identical overlay returns the previously cached query result',
+        dirtyResults === await restored.findImplementationsAst('Service', apiFile)
+    );
+    eq('identical overlay performs no additional AST parsing', restored.getAstStats().parsed, parsedBeforeResync);
+
+    let finish;
+    let runs = 0;
+    const pending = new Promise((resolve) => { finish = resolve; });
+    const work = () => { runs++; return pending; };
+    const inflight = restored._cachedAstQuery('overlay-inflight', work);
+    await Promise.resolve();
+    restored.updateOverlay(implFile, dirtySource, false);
+    assert('identical overlay preserves an in-flight query', inflight === restored._cachedAstQuery('overlay-inflight', work));
+    finish([]);
+    await inflight;
+    eq('identical overlay does not restart query work', runs, 1);
+
+    restored.updateOverlay(implFile, dirtySource.replace('Run()', 'Stop()'));
+    eq('a real unsaved declaration edit changes query results', await restored.findImplementationsAst('Service', apiFile), []);
+    eq('a real unsaved edit notifies listeners', notifications, 1);
+    restored.clearOverlay(implFile);
+    eq('closing an overlay restores the on-disk declaration',
+        (await restored.findImplementationsAst('Service', apiFile)).map((item) => item.name), ['Impl']);
+    restored.updateOverlay(implFile, dirtySource, false);
+    assert('the same text is registered again after closing an overlay', restored.overlayTexts.has(implFile));
+
     const updatedSource = 'package impl\ntype Impl struct{}\nfunc (Impl) Stop() error { return nil }\n';
     fs.writeFileSync(implFile, updatedSource);
     restored.updateFileText(implFile, updatedSource);

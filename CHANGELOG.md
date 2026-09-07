@@ -2,6 +2,16 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.0.9] - 2026-09-07
+
+### Changed
+
+- Preserve cached and in-flight navigation results when an unchanged dirty
+  document is synchronized again.
+- Apply workspace and dependency path exclusions before arity-prefilter source
+  reads, and push compatible directory patterns into ripgrep to skip excluded
+  subtrees. Refresh search caches when file exclusion settings change.
+
 ## [2.0.8] - 2026-09-02
 
 ### Fixed

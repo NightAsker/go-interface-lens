@@ -626,6 +626,9 @@ class WorkspaceIndex {
             if (notify !== false) this._emitChange();
             return;
         }
+        // A navigation click can resync a document already handled by the edit
+        // debounce. Preserve in-flight searches and cached results in that case.
+        if (this.overlayTexts.get(absPath) === text) return;
         const touched = scanTouchedDeclaration(text);
         this.overlays.set(absPath, touched.metadata);
         this.overlayTexts.set(absPath, text);
@@ -1512,6 +1515,25 @@ class WorkspaceIndex {
         return JSON.stringify(this._normalizedPackagePatterns(this.getConfig()));
     }
 
+    _candidateFilterKey() {
+        const cfg = this.getConfig();
+        return JSON.stringify([
+            normalizeWildcardPatterns(cfg.excludedFolders),
+            cfg.excludedFilePatterns || [],
+            this._normalizedPackagePatterns(cfg),
+        ]);
+    }
+
+    _candidateSearchOptions() {
+        const cfg = this.getConfig();
+        return {
+            excludedFolders: cfg.excludedFolders,
+            includeFile: (file) =>
+                !this._isExcluded(file) &&
+                shouldIncludeGoFile(file, '', this._buildContext),
+        };
+    }
+
     _isPackageExcluded(importPath) {
         if (!importPath) return false;
         const key = this._packagePatternKey();
@@ -1587,8 +1609,7 @@ class WorkspaceIndex {
             kind,
             methodName,
             arityCacheKey(arity),
-            this._packagePatternKey(),
-            JSON.stringify(normalizeWildcardPatterns(this.getConfig().excludedFolders)),
+            this._candidateFilterKey(),
             ...roots,
         ].join('\0');
         if (this._workspaceCandidateCache.has(key)) {
@@ -1606,7 +1627,8 @@ class WorkspaceIndex {
                     Number.MAX_SAFE_INTEGER,
                     undefined,
                     arity,
-                    this.log
+                    this.log,
+                    this._candidateSearchOptions()
                 )
             )
         ).then((groups) => {
@@ -1631,8 +1653,7 @@ class WorkspaceIndex {
         const key = [
             'type-reference',
             names.join(','),
-            this._packagePatternKey(),
-            JSON.stringify(normalizeWildcardPatterns(this.getConfig().excludedFolders)),
+            this._candidateFilterKey(),
             ...roots,
         ].join('\0');
         if (this._workspaceCandidateCache.has(key)) {
@@ -1645,7 +1666,8 @@ class WorkspaceIndex {
                     names,
                     Number.MAX_SAFE_INTEGER,
                     undefined,
-                    this.log
+                    this.log,
+                    this._candidateSearchOptions()
                 )
             )
         ).then((groups) =>
@@ -3115,7 +3137,7 @@ class WorkspaceIndex {
 
     _dependencyInterfaceCandidates(cacheRoot, methodName, lockedDirs, arity) {
         const normalizedDirs = [...(lockedDirs || [])].map(path.normalize).sort();
-        const key = `${this._packagePatternKey()}\0${path.normalize(cacheRoot)}\0${methodName}\0${arityCacheKey(arity)}\0${normalizedDirs.join('\0')}`;
+        const key = `${this._candidateFilterKey()}\0${path.normalize(cacheRoot)}\0${methodName}\0${arityCacheKey(arity)}\0${normalizedDirs.join('\0')}`;
         if (this._dependencyCandidateCache.has(key)) {
             return this._dependencyCandidateCache.get(key);
         }
@@ -3126,7 +3148,8 @@ class WorkspaceIndex {
             normalizedDirs.length > 0 ? Number.MAX_SAFE_INTEGER : undefined,
             normalizedDirs,
             arity,
-            this.log
+            this.log,
+            this._candidateSearchOptions()
         ).then((files) => this._filterDependencyFiles(files)).catch((error) => {
             if (this._dependencyCandidateCache.get(key) === request) {
                 this._dependencyCandidateCache.delete(key);
@@ -3139,7 +3162,7 @@ class WorkspaceIndex {
 
     _dependencyImplementationCandidates(cacheRoot, methodName, lockedDirs, arity) {
         const normalizedDirs = [...(lockedDirs || [])].map(path.normalize).sort();
-        const key = `${this._packagePatternKey()}\0${path.normalize(cacheRoot)}\0${methodName}\0${arityCacheKey(arity)}\0${normalizedDirs.join('\0')}`;
+        const key = `${this._candidateFilterKey()}\0${path.normalize(cacheRoot)}\0${methodName}\0${arityCacheKey(arity)}\0${normalizedDirs.join('\0')}`;
         if (this._dependencyImplementationCandidateCache.has(key)) {
             return this._dependencyImplementationCandidateCache.get(key);
         }
@@ -3150,7 +3173,8 @@ class WorkspaceIndex {
             normalizedDirs.length > 0 ? Number.MAX_SAFE_INTEGER : undefined,
             normalizedDirs,
             arity,
-            this.log
+            this.log,
+            this._candidateSearchOptions()
         ).then((files) => this._filterDependencyFiles(files)).catch((error) => {
             if (this._dependencyImplementationCandidateCache.get(key) === request) {
                 this._dependencyImplementationCandidateCache.delete(key);
@@ -3165,7 +3189,7 @@ class WorkspaceIndex {
     _dependencyTypeReferenceCandidates(cacheRoot, typeNames, lockedDirs) {
         const normalizedDirs = [...(lockedDirs || [])].map(path.normalize).sort();
         const names = [...new Set(typeNames)].sort();
-        const key = `${this._packagePatternKey()}\0${path.normalize(cacheRoot)}\0${names.join(',')}\0${normalizedDirs.join('\0')}`;
+        const key = `${this._candidateFilterKey()}\0${path.normalize(cacheRoot)}\0${names.join(',')}\0${normalizedDirs.join('\0')}`;
         if (this._dependencyTypeReferenceCandidateCache.has(key)) {
             return this._dependencyTypeReferenceCandidateCache.get(key);
         }
@@ -3175,7 +3199,8 @@ class WorkspaceIndex {
             names,
             normalizedDirs.length > 0 ? Number.MAX_SAFE_INTEGER : undefined,
             normalizedDirs,
-            this.log
+            this.log,
+            this._candidateSearchOptions()
         ).then((files) => this._filterDependencyFiles(files)).catch((error) => {
             if (this._dependencyTypeReferenceCandidateCache.get(key) === request) {
                 this._dependencyTypeReferenceCandidateCache.delete(key);

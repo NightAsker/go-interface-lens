@@ -1,6 +1,6 @@
 # Go Interface Lens
 
-[![Version](https://img.shields.io/badge/version-2.0.8-blue.svg)](https://github.com/NightAsker/go-interface-lens)
+[![Version](https://img.shields.io/badge/version-2.0.9-blue.svg)](https://github.com/NightAsker/go-interface-lens)
 [![VSCode](https://img.shields.io/badge/VSCode-1.76+-green.svg)](https://code.visualstudio.com/)
 
 一个面向大型 Go 工程的 VS Code / Cursor 接口导航扩展。它在接口、接口方法和具体实现之间提供双向 CodeLens，同时使用按查询的声明搜索和按需 AST 校验兼顾响应速度与查找准确性。
@@ -77,6 +77,8 @@ func (r *PostgresUserRepository) FindByID(
 - 依赖接口只在工作区查找不到结果时按需搜索，不全量索引 module cache。
 - 外部依赖中的 concrete type 不会混入工作区实现结果。
 - 文件监听、未保存 overlay 和查询结果都支持增量失效。
+- 相同的未保存内容重复同步时复用查询缓存，保留正在执行的搜索；实际编辑后仍会刷新结果。
+- 目录、文件名和包路径排除规则在候选源码读取前生效；可直接转换的目录规则同时用于跳过 ripgrep 扫描。
 - 支持 multi-root workspace，并保持同名包、同名接口和同名类型相互隔离。
 
 VSIX 从锁定的上游版本原样携带 Tree-sitter JavaScript runtime、核心 runtime
@@ -129,7 +131,7 @@ WASM、Go grammar WASM 和 MIT 许可证；依赖包里的其他语言 grammar �
 | `goInterfaceLens.searchDependencies` | `true` | 正反向导航时按需搜索 `go.mod` 锁定依赖中的接口与具体实现；无锁信息时仅搜索显式配置的依赖根 |
 | `goInterfaceLens.goModCache` | 空 | 手动指定 Go module cache；为空时自动探测 |
 
-修改包路径排除规则后，插件会自动清理查询缓存；下一次导航查询会按新规则重新搜索，无需重启扩展。
+修改目录、文件名或包路径排除规则后，插件会自动清理查询缓存；下一次导航查询会按新规则重新搜索，无需重启扩展。
 
 示例：
 

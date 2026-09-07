@@ -14,6 +14,11 @@ Module._resolveFilename = function (request, ...rest) {
 
 const { WorkspaceIndex } = require('../src/indexer');
 const { createFolderMatcher } = require('../src/path-filter');
+const {
+    grepImplementationFilesForMethod,
+    grepInterfaceFilesForMethod,
+    grepGoFilesForTypeNames,
+} = require('../src/search');
 const { assert, eq, done } = require('./harness');
 
 function write(file, text) {
@@ -91,6 +96,87 @@ async function main() {
     eq('AST request keeps the allowed file only', received, [allowedFile]);
     assert('stale excluded candidates are blocked before Tree-sitter', !received.includes(excludedFile));
     index.astPool.parseFiles = originalParseFiles;
+
+    console.log('\n== path exclusions precede candidate source reads ==');
+    const excludedByFile = path.join(root, 'allowed', 'worker_mock.go');
+    const excludedByPackage = path.join(root, 'private', 'generated', 'worker.go');
+    const excludedByComplexFolder = path.join(root, 'client-http', 'nested', 'generated', 'worker.go');
+    const excludedByLiteralFolder = path.join(root, '[skip]', 'worker.go');
+    const allowedSimilarFolder = path.join(root, 'worker_mock.go', 'worker.go');
+    const allowedSimilarName = path.join(root, 'overpass.go');
+    const allowedLiteralName = path.join(root, 's', 'worker.go');
+    const included = [allowedFile, allowedSimilarFolder, allowedSimilarName, allowedLiteralName].sort();
+    const excluded = [excludedFile, excludedByFile, excludedByPackage, excludedByComplexFolder, excludedByLiteralFolder];
+    const source = [
+        'package sample',
+        'type Worker struct{}',
+        'func (Worker) Run() error { return nil }',
+        'type Service interface { Run() error }',
+        'type Related = Worker',
+    ].join('\n');
+    for (const file of [...included, ...excluded]) write(file, source);
+    settings.excludedFolders = ['*overpass*', 'client-*/generated', '[skip]'];
+    settings.excludedFilePatterns = ['_mock.go'];
+    settings.excludedPackagePatterns = ['example.com/project/private/*'];
+    const arity = { params: 0, results: 1 };
+    const readFile = fs.promises.readFile;
+    let reads = [];
+    fs.promises.readFile = async function (file, ...args) {
+        if (String(file).endsWith('.go')) reads.push(String(file));
+        return readFile.call(this, file, ...args);
+    };
+    try {
+        for (const kind of ['implementation', 'interface']) {
+            reads = [];
+            const found = await index._workspaceCandidateFiles(kind, 'Run', arity);
+            eq(`${kind} search retains allowed paths`, found.sort(), included);
+            eq(`${kind} arity prefilter reads only allowed files`, reads.sort(), included);
+        }
+        for (const method of ['_dependencyImplementationCandidates', '_dependencyInterfaceCandidates']) {
+            reads = [];
+            const found = await index[method](root, 'Run', [root], arity);
+            eq(`${method} retains allowed paths`, found.sort(), included);
+            eq(`${method} skips excluded source reads`, reads.sort(), included);
+        }
+        eq('workspace type-reference candidates honor the same exclusions',
+            (await index._workspaceTypeReferenceCandidates(['Worker'])).sort(), included);
+        eq('dependency type-reference candidates honor the same exclusions',
+            (await index._dependencyTypeReferenceCandidates(root, ['Worker'], [root])).sort(), included);
+    } finally {
+        fs.promises.readFile = readFile;
+    }
+
+    console.log('\n== directory glob pushdown and bounded results ==');
+    for (const search of [grepImplementationFilesForMethod, grepInterfaceFilesForMethod]) {
+        const found = await search(root, 'Run', 100, undefined, undefined, undefined,
+            { excludedFolders: ['*overpass*'] });
+        assert(`${search.name} excludes directories in ripgrep without a result predicate`, !found.includes(excludedFile));
+        assert(`${search.name} retains similarly named files`, found.includes(allowedSimilarName));
+        eq(`${search.name} handles an explicitly excluded search root`,
+            await search(path.dirname(excludedFile), 'Run', 100, undefined, arity, undefined,
+                { excludedFolders: ['*overpass*'] }), []);
+        eq(`${search.name} filters before applying the result cap`,
+            await search(root, 'Run', 1, undefined, arity, undefined,
+                { includeFile: (file) => file === allowedFile }), [allowedFile]);
+    }
+    assert('type-reference ripgrep skips excluded directories',
+        !(await grepGoFilesForTypeNames(root, ['Worker'], 100, undefined, undefined,
+            { excludedFolders: ['*overpass*'] })).includes(excludedFile));
+
+    console.log('\n== file and folder settings change candidate cache identities ==');
+    const oldWorkspace = index._workspaceCandidateFiles('implementation', 'Run', arity);
+    const oldDependency = index._dependencyImplementationCandidates(root, 'Run', [root], arity);
+    settings.excludedFilePatterns = [];
+    const newWorkspace = index._workspaceCandidateFiles('implementation', 'Run', arity);
+    const newDependency = index._dependencyImplementationCandidates(root, 'Run', [root], arity);
+    assert('file rule changes refresh workspace candidate searches', oldWorkspace !== newWorkspace);
+    assert('file rule changes refresh dependency candidate searches', oldDependency !== newDependency);
+    assert('removing the file rule restores its candidates', (await newWorkspace).includes(excludedByFile));
+    await newDependency;
+    settings.excludedFolders = [];
+    const withFolders = index._dependencyImplementationCandidates(root, 'Run', [root], arity);
+    assert('folder rule changes refresh dependency candidate searches', newDependency !== withFolders);
+    assert('removing the folder rule restores its candidates', (await withFolders).includes(excludedFile));
 
     index.dispose();
     fs.rmSync(tmp, { recursive: true, force: true });
