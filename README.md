@@ -1,6 +1,6 @@
 # Go Interface Lens
 
-[![Version](https://img.shields.io/badge/version-2.1.5-blue.svg)](https://github.com/NightAsker/go-interface-lens)
+[![Version](https://img.shields.io/badge/version-2.1.6-blue.svg)](https://github.com/NightAsker/go-interface-lens)
 [![VSCode](https://img.shields.io/badge/VSCode-1.76+-green.svg)](https://code.visualstudio.com/)
 
 一个面向大型 Go 工程的 VS Code / Cursor 接口导航扩展。它在接口、接口方法和具体实现之间提供双向 CodeLens，同时使用按查询的声明搜索和按需 AST 校验兼顾响应速度与查找准确性。

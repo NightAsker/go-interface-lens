@@ -2,6 +2,14 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.1.6] - 2026-09-23
+
+### Changed
+
+- Match VS Code's compact tree twistie sizing for source-search result rows.
+- Use the Go file glyph from VS Code's file icon artwork instead of a generic
+  document outline.
+
 ## [2.1.5] - 2026-09-23
 
 ### Fixed
