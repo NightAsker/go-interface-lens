@@ -2,6 +2,14 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.1.7] - 2026-09-23
+
+### Changed
+
+- Match VS Code Search colors, workbench typography, and result-row spacing.
+- Hide the browser-provided search-field clear button so the input stays native-looking.
+- Keep result text and line numbers aligned with the native SearchView foreground and sizing.
+
 ## [2.1.6] - 2026-09-23
 
 ### Changed

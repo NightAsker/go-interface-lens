@@ -255,15 +255,19 @@ class SourceSearchViewProvider {
       --accent: var(--vscode-textLink-foreground, #4daafc);
       --badge: var(--vscode-badge-background, #4d4d4d);
       --badge-fg: var(--vscode-badge-foreground, #fff);
-      --code: var(--vscode-textPreformat-foreground, var(--vscode-foreground));
+      --input-fg: var(--vscode-input-foreground, var(--vscode-foreground));
+      --placeholder: var(--vscode-input-placeholderForeground, var(--vscode-descriptionForeground, #8b949e));
+      --result-fg: var(--vscode-list-foreground, var(--vscode-foreground));
+      --result-muted: var(--vscode-descriptionForeground, var(--muted));
     }
     * { box-sizing: border-box; }
     html, body { padding: 0; margin: 0; width: 100%; height: 100%; overflow: hidden; }
     body {
-      color: var(--vscode-foreground);
+      color: var(--result-fg);
       background: var(--vscode-sideBar-background, var(--vscode-editor-background));
       font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, sans-serif);
       font-size: var(--vscode-font-size, 13px);
+      font-weight: 400;
       line-height: 1.45;
     }
     button, input, select { font: inherit; color: inherit; }
@@ -279,10 +283,13 @@ class SourceSearchViewProvider {
     .search-toggle svg { width: 16px; height: 16px; }
     .search-box { flex: 1; min-width: 0; display: flex; align-items: center; gap: 0; height: 26px; margin-left: 18px; padding: 0 2px 0 0; background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 3px; }
     .search-box:focus-within { border-color: var(--vscode-focusBorder, #007fd4); }
-    #query { flex: 1 1 auto; width: auto; min-width: 0; height: 24px; padding: 3px 0 3px 6px; background: transparent; border: 0; outline: 0; }
-    #query::placeholder { color: var(--muted); }
+    #query { flex: 1 1 auto; width: auto; min-width: 0; height: 24px; padding: 3px 0 3px 6px; background: transparent; border: 0; outline: 0; color: var(--input-fg); font-size: var(--vscode-font-size, 13px); line-height: 18px; }
+    #query::placeholder { color: var(--placeholder); opacity: 1; }
+    #query::-webkit-search-cancel-button,
+    #query::-webkit-search-decoration { -webkit-appearance: none; appearance: none; display: none; }
+    #query::-ms-clear { display: none; }
     .search-filter-controls { position: relative; z-index: 2; display: inline-flex; align-items: center; gap: 1px; flex: 0 0 auto; pointer-events: auto; }
-    .search-filter-btn { display: inline-flex; align-items: center; justify-content: center; min-width: 25px; height: 22px; padding: 0 3px; border-radius: 3px; color: var(--vscode-icon-foreground, var(--muted)); font-size: 13px; line-height: 1; user-select: none; }
+    .search-filter-btn { display: inline-flex; align-items: center; justify-content: center; min-width: 25px; height: 22px; padding: 0 3px; border-radius: 3px; color: var(--vscode-icon-foreground, var(--result-muted)); font-size: var(--vscode-font-size, 13px); font-weight: 400; line-height: 1; user-select: none; }
     .search-filter-btn:hover { background: var(--hover); color: var(--vscode-foreground); }
     .search-filter-btn.active { color: var(--vscode-inputOption-activeForeground, var(--accent)); background: var(--vscode-inputOption-activeBackground, var(--vscode-toolbar-hoverBackground, rgba(80, 150, 220, .13))); outline: 1px solid var(--vscode-inputOption-activeBorder, var(--accent)); outline-offset: -1px; }
     .search-filter-btn.word { text-decoration: underline; text-underline-offset: 2px; }
@@ -294,8 +301,8 @@ class SourceSearchViewProvider {
     .query-details.expanded .scope-row { display: flex; }
     .scope-row[hidden] { display: none !important; }
     .scope { flex: 1; min-width: 0; height: 24px; padding: 0 5px; border: 1px solid var(--input-border); border-radius: 3px; background: var(--input-bg); font-size: 12px; }
-    .summary { display: block; min-height: 22px; margin-top: -5px; padding: 0 22px 8px; color: var(--vscode-search-resultsInfoForeground, var(--muted)); font-size: 13px; line-height: 22px; }
-    .summary strong { color: var(--vscode-foreground); font-weight: 500; }
+    .summary { display: block; min-height: 22px; margin-top: -5px; padding: 0 22px 8px; color: var(--vscode-search-resultsInfoForeground, var(--result-muted)); font-size: var(--vscode-font-size, 13px); line-height: 22px; }
+    .summary strong { color: inherit; font-weight: 400; }
     .summary a { color: var(--accent); text-decoration: none; cursor: pointer; white-space: nowrap; margin-left: 4px; }
     .summary a::before { content: "- "; color: var(--vscode-search-resultsInfoForeground, var(--muted)); }
     .summary a:hover { text-decoration: underline; }
@@ -317,15 +324,15 @@ class SourceSearchViewProvider {
     .file.collapsed .twisty { transform: translateX(3px) rotate(-90deg); }
     .file-icon { display: inline-flex; width: 19px; height: 22px; align-items: center; color: #00add8; flex: 0 0 19px; }
     .file-icon svg { width: 16px; height: 16px; }
-    .file-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--vscode-sideBar-foreground, var(--vscode-foreground)); font-size: 13px; }
-    .file-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 13px; margin-left: 6px; }
+    .file-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--result-fg); font-size: var(--vscode-font-size, 13px); font-weight: 400; }
+    .file-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--result-muted); font-size: var(--vscode-font-size, 13px); font-weight: 400; margin-left: 6px; }
     .count { flex: 0 0 auto; min-width: 18px; min-height: 18px; height: 18px; padding: 3px 5px; margin-left: auto; margin-right: 12px; display: inline-flex; justify-content: center; align-items: center; border-radius: 11px; color: var(--badge-fg); background: var(--badge); font-size: 11px; line-height: 11px; font-weight: 400; }
     .matches { margin-left: 22px; border-left: 1px solid var(--vscode-tree-indentGuidesStroke, var(--border)); padding: 0 0 0 6px; }
     .file.collapsed .matches { display: none; }
-    .match { display: flex; gap: 0; min-width: 0; padding: 0; border-radius: 0; cursor: pointer; color: var(--vscode-foreground); line-height: 22px; }
-    .match:hover { background: var(--hover); color: var(--vscode-foreground); }
-    .line-number { flex: 0 0 auto; margin-left: 7px; margin-right: 4px; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 11px; user-select: none; opacity: .82; }
-    .match-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: pre; color: var(--code); font-family: var(--vscode-editor-font-family, var(--vscode-font-family, monospace)); font-size: 11px; }
+    .match { display: flex; gap: 0; min-width: 0; padding: 0; border-radius: 0; cursor: pointer; color: var(--result-fg); line-height: 22px; font-weight: 400; }
+    .match:hover { background: var(--hover); color: var(--result-fg); }
+    .line-number { flex: 0 0 auto; margin-left: 7px; margin-right: 4px; text-align: right; color: var(--result-muted); font-variant-numeric: tabular-nums; font-size: .9em; user-select: none; opacity: .7; }
+    .match-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: pre; color: inherit; font-family: inherit; font-size: inherit; }
     mark { color: var(--vscode-editor-findMatchHighlightForeground, var(--vscode-foreground)); background: var(--vscode-editor-findMatchHighlightBackground, rgba(234, 198, 67, .3)); border: 1px solid var(--vscode-editor-findMatchHighlightBorder, transparent); border-radius: 0; padding: 0 1px; }
     .result-ellipsis { padding: 3px 6px; color: var(--muted); font-size: 11px; }
   </style>

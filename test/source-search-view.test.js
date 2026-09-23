@@ -124,12 +124,14 @@ function createWebviewHarness() {
         acquireVsCodeApi: () => vscode,
         console,
     }, { filename: 'source-search-webview.js' });
-    return { elements, messages, window };
+    return { elements, messages, window, html };
 }
 
 console.log('== source search Webview interactions ==');
 const harness = createWebviewHarness();
 eq('Webview announces readiness', harness.messages[0] && harness.messages[0].type, 'ready');
+assert('native input clear button is hidden', /#query::\-webkit-search-cancel-button[\s\S]*display:\s*none/.test(harness.html));
+assert('native result font inherits the workbench font', /\.match-text\s*\{[^}]*font-family:\s*inherit/.test(harness.html));
 
 harness.elements.query.value = 'LoadComplete';
 const enter = {
