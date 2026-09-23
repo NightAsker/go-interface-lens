@@ -2,6 +2,16 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.1.0] - 2026-09-23
+
+### Added
+
+- Add an Activity Bar source search view with a native Search-style result tree.
+- Search workspace files, locked module dependencies, local replacements, and
+  the standard library with literal, regex, case-sensitive, and whole-word modes.
+- Support result highlighting, file grouping, cancellation, precise navigation,
+  unsaved editor content, and an Open in editor result document.
+
 ## [2.0.9] - 2026-09-07
 
 ### Changed
