@@ -270,10 +270,7 @@ class SourceSearchViewProvider {
     button { border: 0; background: transparent; cursor: pointer; }
     button:focus-visible, input:focus-visible, select:focus-visible { outline: 1px solid var(--vscode-focusBorder, #007fd4); outline-offset: -1px; }
     .shell { display: flex; flex-direction: column; height: 100%; min-width: 0; }
-    .header { padding: 12px 12px 10px; border-bottom: 1px solid var(--border); }
-    .brand { display: flex; align-items: center; gap: 8px; margin: 1px 2px 10px; color: var(--vscode-sideBarTitle-foreground, var(--vscode-foreground)); font-size: 12px; font-weight: 600; letter-spacing: .02em; }
-    .brand-mark { display: inline-flex; width: 19px; height: 19px; align-items: center; justify-content: center; color: var(--accent); }
-    .brand-mark svg { width: 18px; height: 18px; }
+    .header { padding: 10px 12px 9px; border-bottom: 1px solid var(--border); }
     .search-row { display: flex; gap: 6px; align-items: stretch; }
     .search-box { flex: 1; min-width: 0; display: flex; align-items: center; gap: 7px; height: 30px; padding: 0 8px; background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 4px; }
     .search-box:focus-within { border-color: var(--vscode-focusBorder, #007fd4); }
@@ -283,8 +280,8 @@ class SourceSearchViewProvider {
     #query::placeholder { color: var(--muted); }
     .action { width: 30px; height: 30px; border-radius: 4px; color: var(--muted); display: inline-flex; align-items: center; justify-content: center; }
     .action:hover { background: var(--hover); color: var(--vscode-foreground); }
-    .action.primary { background: var(--vscode-button-background, #0e639c); color: var(--vscode-button-foreground, #fff); }
-    .action.primary:hover { background: var(--vscode-button-hoverBackground, #1177bb); }
+    .action.primary { background: transparent; color: var(--muted); }
+    .action.primary:hover { background: var(--hover); color: var(--vscode-foreground); }
     .action svg { width: 15px; height: 15px; }
     .filters { display: flex; align-items: center; gap: 6px; margin-top: 8px; min-width: 0; }
     .scope { flex: 1; min-width: 0; height: 26px; padding: 0 5px; border: 1px solid var(--input-border); border-radius: 3px; background: var(--input-bg); font-size: 12px; }
@@ -303,6 +300,7 @@ class SourceSearchViewProvider {
     @keyframes slide { 0% { transform: translateX(-120%); } 55%, 100% { transform: translateX(290%); } }
     .results { flex: 1; min-height: 0; overflow: auto; padding: 1px 6px 18px; }
     .empty { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 7px; padding: 34px 18px; color: var(--muted); }
+    .empty[hidden] { display: none !important; }
     .empty svg { width: 28px; height: 28px; opacity: .75; }
     .empty-title { color: var(--vscode-foreground); font-weight: 500; }
     .empty-hint { font-size: 12px; max-width: 240px; }
@@ -319,9 +317,9 @@ class SourceSearchViewProvider {
     .count { flex: 0 0 auto; min-width: 20px; height: 20px; padding: 0 6px; display: inline-flex; justify-content: center; align-items: center; border-radius: 10px; color: var(--badge-fg); background: var(--badge); font-size: 11px; }
     .matches { margin-left: 22px; border-left: 1px solid var(--border); padding: 1px 0 3px 6px; }
     .file.collapsed .matches { display: none; }
-    .match { display: flex; gap: 7px; min-width: 0; padding: 3px 6px; border-radius: 3px; cursor: pointer; color: var(--vscode-descriptionForeground, var(--vscode-foreground)); }
+    .match { display: flex; gap: 0; min-width: 0; padding: 0 6px; border-radius: 3px; cursor: pointer; color: var(--vscode-descriptionForeground, var(--vscode-foreground)); line-height: 22px; }
     .match:hover { background: var(--hover); color: var(--vscode-foreground); }
-    .line-number { flex: 0 0 34px; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 11px; user-select: none; }
+    .line-number { flex: 0 0 auto; margin-left: 7px; margin-right: 4px; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 11px; user-select: none; opacity: .82; }
     .match-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: pre; color: var(--code); font-family: var(--vscode-editor-font-family, var(--vscode-font-family, monospace)); font-size: 11px; }
     mark { color: var(--vscode-editor-findMatchHighlightForeground, var(--vscode-foreground)); background: var(--vscode-editor-findMatchHighlightBackground, rgba(234, 198, 67, .3)); border-radius: 2px; padding: 0 1px; }
     .result-ellipsis { padding: 3px 6px; color: var(--muted); font-size: 11px; }
@@ -331,7 +329,6 @@ class SourceSearchViewProvider {
 <body>
   <div class="shell">
     <header class="header">
-      <div class="brand"><span class="brand-mark" aria-hidden="true">${iconSearchSvg()}</span><span>Go Source Search</span></div>
       <div class="search-row">
         <label class="search-box" aria-label="Search source">
           <span class="search-icon" aria-hidden="true">${iconSearchSvg()}</span>
@@ -439,7 +436,10 @@ class SourceSearchViewProvider {
       const line = Number(raw.line || raw.lineNumber || 1);
       const column = Number(raw.column || raw.columnNumber || 1);
       const text = raw.text == null ? (raw.preview == null ? '' : raw.preview) : raw.text;
-      return { file: String(file), line: Number.isFinite(line) ? line : 1, column: Number.isFinite(column) ? column : 1, text: String(text), scope: raw.scope || '', module: raw.module || '', version: raw.version || '', unsaved: !!raw.unsaved, ranges: raw.ranges || [] };
+      // ripgrep returns the complete source line. Native Search renders the
+      // matching line as a compact preview and removes its indentation.
+      const preview = String(text).trimStart();
+      return { file: String(file), line: Number.isFinite(line) ? line : 1, column: Number.isFinite(column) ? column : 1, text: String(text), preview, scope: raw.scope || '', module: raw.module || '', version: raw.version || '', unsaved: !!raw.unsaved, ranges: raw.ranges || [] };
     }
     function addMatches(batch) {
       if (!Array.isArray(batch)) batch = [batch];
@@ -479,7 +479,7 @@ class SourceSearchViewProvider {
         const shown = displayFile(file); const tag = file.scope && file.scope !== 'workspace' ? '<span class="scope-tag">' + esc(scopeLabel(file.scope)) + '</span>' : '';
         wrap.innerHTML = '<div class="file-head" tabindex="0"><span class="twisty">' + icon('down') + '</span><span class="file-icon">' + icon('file') + '</span><span class="file-name" title="' + esc(file.file) + '">' + esc(shown.name) + '</span><span class="file-path" title="' + esc(shown.parent) + '">' + esc(shown.parent) + '</span>' + tag + '<span class="count">' + file.matches.length + '</span></div><div class="matches"></div>';
         const head = wrap.querySelector('.file-head'); head.addEventListener('click', () => { file.collapsed = !file.collapsed; wrap.classList.toggle('collapsed', file.collapsed); }); head.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); file.collapsed = !file.collapsed; wrap.classList.toggle('collapsed', file.collapsed); } });
-        const list = wrap.querySelector('.matches'); file.matches.slice(0, 300).forEach((match) => { const row = document.createElement('div'); row.className = 'match'; row.setAttribute('role', 'treeitem'); row.title = 'Open ' + file.file + ':' + match.line; row.innerHTML = '<span class="line-number">' + esc(match.line) + '</span><span class="match-text">' + highlight(match.text) + '</span>'; row.addEventListener('click', () => vscode.postMessage({ type: 'openMatch', match })); list.appendChild(row); });
+        const list = wrap.querySelector('.matches'); file.matches.slice(0, 300).forEach((match) => { const row = document.createElement('div'); row.className = 'match'; row.setAttribute('role', 'treeitem'); row.title = 'Open ' + file.file + ':' + match.line; row.innerHTML = '<span class="line-number">' + esc(match.line) + ':</span><span class="match-text">' + highlight(match.preview) + '</span>'; row.addEventListener('click', () => vscode.postMessage({ type: 'openMatch', match })); list.appendChild(row); });
         if (file.matches.length > 300) { const more = document.createElement('div'); more.className = 'result-ellipsis'; more.textContent = '… ' + (file.matches.length - 300) + ' more matches'; list.appendChild(more); }
         results.appendChild(wrap);
       });

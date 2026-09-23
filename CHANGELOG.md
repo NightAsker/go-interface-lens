@@ -2,6 +2,15 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.1.1] - 2026-09-23
+
+### Fixed
+
+- Match the native Search result layout by removing leading indentation from
+  preview lines and showing the line number with its trailing colon.
+- Hide the empty state after results arrive, simplify the search header, and
+  refine the Activity Bar source-search icon.
+
 ## [2.1.0] - 2026-09-23
 
 ### Added
