@@ -279,12 +279,12 @@ class SourceSearchViewProvider {
     .search-toggle svg { width: 16px; height: 16px; }
     .search-box { flex: 1; min-width: 0; display: flex; align-items: center; gap: 0; height: 26px; margin-left: 18px; padding: 0 2px 0 0; background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 3px; }
     .search-box:focus-within { border-color: var(--vscode-focusBorder, #007fd4); }
-    #query { width: 100%; min-width: 0; height: 24px; padding: 3px 0 3px 6px; background: transparent; border: 0; outline: 0; }
+    #query { flex: 1 1 auto; width: auto; min-width: 0; height: 24px; padding: 3px 0 3px 6px; background: transparent; border: 0; outline: 0; }
     #query::placeholder { color: var(--muted); }
-    .search-filter-controls { display: inline-flex; align-items: center; gap: 1px; flex: 0 0 auto; }
-    .search-filter-btn { display: inline-flex; align-items: center; justify-content: center; min-width: 25px; height: 22px; padding: 0 3px; border-radius: 3px; color: var(--vscode-icon-foreground, var(--muted)); font-size: 13px; line-height: 1; }
+    .search-filter-controls { position: relative; z-index: 2; display: inline-flex; align-items: center; gap: 1px; flex: 0 0 auto; pointer-events: auto; }
+    .search-filter-btn { display: inline-flex; align-items: center; justify-content: center; min-width: 25px; height: 22px; padding: 0 3px; border-radius: 3px; color: var(--vscode-icon-foreground, var(--muted)); font-size: 13px; line-height: 1; user-select: none; }
     .search-filter-btn:hover { background: var(--hover); color: var(--vscode-foreground); }
-    .search-filter-btn.active { color: var(--vscode-inputOption-activeForeground, var(--accent)); background: var(--vscode-inputOption-activeBackground, var(--vscode-toolbar-hoverBackground, rgba(80, 150, 220, .13))); }
+    .search-filter-btn.active { color: var(--vscode-inputOption-activeForeground, var(--accent)); background: var(--vscode-inputOption-activeBackground, var(--vscode-toolbar-hoverBackground, rgba(80, 150, 220, .13))); outline: 1px solid var(--vscode-inputOption-activeBorder, var(--accent)); outline-offset: -1px; }
     .search-filter-btn.word { text-decoration: underline; text-underline-offset: 2px; }
     .search-filter-btn svg { width: 16px; height: 16px; }
     .query-details { min-height: 16px; position: relative; margin: 0 0 0 18px; }
@@ -426,6 +426,16 @@ class SourceSearchViewProvider {
       button.setAttribute('aria-pressed', String(filters[key]));
       if (query.value.trim()) sendSearch();
     }
+    function syncFilterButtons(options) {
+      filters.regex = !!(options && (options.useRegex || options.regex));
+      filters.matchCase = !!(options && (options.matchCase || options.caseSensitive));
+      filters.wholeWord = !!(options && options.wholeWord);
+      [['regex', 'regex'], ['case', 'matchCase'], ['word', 'wholeWord']].forEach(([id, key]) => {
+        const button = document.getElementById(id);
+        button.classList.toggle('active', filters[key]);
+        button.setAttribute('aria-pressed', String(filters[key]));
+      });
+    }
     function toggleDetails() {
       const expanded = !queryDetails.classList.contains('expanded');
       queryDetails.classList.toggle('expanded', expanded);
@@ -446,9 +456,9 @@ class SourceSearchViewProvider {
       }
     });
     scope.addEventListener('change', () => { if (query.value.trim()) sendSearch(); });
-    document.getElementById('regex').addEventListener('click', () => setFilter('regex', 'regex'));
-    document.getElementById('case').addEventListener('click', () => setFilter('case', 'matchCase'));
-    document.getElementById('word').addEventListener('click', () => setFilter('word', 'wholeWord'));
+    document.getElementById('regex').addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); setFilter('regex', 'regex'); });
+    document.getElementById('case').addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); setFilter('case', 'matchCase'); });
+    document.getElementById('word').addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); setFilter('word', 'wholeWord'); });
     openEditor.addEventListener('click', () => vscode.postMessage({ type: 'openInEditor', options: latestOptions, results: lastBatch }));
 
     function reset() {
@@ -517,7 +527,7 @@ class SourceSearchViewProvider {
     window.addEventListener('message', (event) => {
       const message = event.data || {};
       switch (message.type) {
-        case 'searchStarted': latestOptions = message.options || latestOptions; reset(); running = true; updateStatus(); break;
+        case 'searchStarted': latestOptions = message.options || latestOptions; syncFilterButtons(latestOptions); reset(); running = true; updateStatus(); break;
         case 'appendResults': addMatches(message.results || message.batch || []); break;
         case 'searchProgress':
           if (Number.isFinite(message.totalMatches)) resultCount = Math.max(resultCount, message.totalMatches);
