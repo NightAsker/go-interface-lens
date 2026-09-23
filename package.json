@@ -26,11 +26,35 @@
     "go to implementation"
   ],
   "activationEvents": [
-    "onLanguage:go"
+    "onLanguage:go",
+    "onCommand:go-interface-lens.searchSource"
   ],
   "main": "./extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "go-interface-lens",
+          "title": "Go Interface Lens",
+          "icon": "media/source-search.svg"
+        }
+      ]
+    },
+    "views": {
+      "go-interface-lens": [
+        {
+          "type": "webview",
+          "id": "go-interface-lens.sourceSearch",
+          "name": "Source Search"
+        }
+      ]
+    },
     "commands": [
+      {
+        "command": "go-interface-lens.searchSource",
+        "title": "Go: Search Source",
+        "category": "Go"
+      },
       {
         "command": "go-interface-lens.showImplementations",
         "title": "Go: Show Implementations",
@@ -105,7 +129,7 @@
         "goInterfaceLens.searchDependencies": {
           "type": "boolean",
           "default": true,
-          "description": "Search dependency packages for interfaces and concrete implementations during explicit navigation queries. Search is limited to go.mod-locked versions, or to the explicitly configured goModCache root when no lock is available, and results are verified with complete AST method sets."
+          "description": "Search dependency packages during interface navigation and source search. Search is limited to go.mod-locked versions, or to the explicitly configured goModCache root when no lock is available."
         },
         "goInterfaceLens.goModCache": {
           "type": "string",
@@ -118,12 +142,42 @@
           "minimum": 1,
           "maximum": 32,
           "description": "Maximum worker threads used to parse candidate Go packages. Actual concurrency adapts to the CPU and memory available to the extension host."
+        },
+        "goInterfaceLens.sourceSearchMaxResults": {
+          "type": "integer",
+          "default": 2000,
+          "minimum": 100,
+          "maximum": 10000,
+          "description": "Maximum number of source search matches returned by the Go source search view."
+        },
+        "goInterfaceLens.sourceSearchMaxFiles": {
+          "type": "integer",
+          "default": 1000,
+          "minimum": 20,
+          "maximum": 5000,
+          "description": "Maximum number of files displayed by the Go source search view."
+        },
+        "goInterfaceLens.sourceSearchExcludedFolders": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Directory path patterns excluded only from the source search view. Empty by default to match native Search behavior."
+        },
+        "goInterfaceLens.sourceSearchExcludedFilePatterns": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "File name patterns excluded only from the source search view. Empty by default to match native Search behavior."
         }
       }
     }
   },
   "scripts": {
-    "test": "node test/tree-sitter.test.js && node test/ast.test.js && node test/signatures.test.js && node test/function-body-mask.test.js && node test/go-arity.test.js && node test/ast-cache.test.js && node test/candidate-cache.test.js && node test/indexer.test.js && node test/lazy-index.test.js && node test/method-set-edgecases.test.js && node test/generics.test.js && node test/package-exclusions.test.js && node test/folder-exclusions.test.js && node test/lazy-deps.test.js && node test/performance.test.js && node test/build.test.js && node test/search.test.js && node test/multiroot.test.js && node test/deps.test.js && node test/gomod.test.js && node test/deps-version.test.js && node test/deps-crosspkg.test.js && node test/progress.test.js && node test/gotolens.test.js",
+    "test": "node test/tree-sitter.test.js && node test/ast.test.js && node test/signatures.test.js && node test/function-body-mask.test.js && node test/go-arity.test.js && node test/ast-cache.test.js && node test/candidate-cache.test.js && node test/indexer.test.js && node test/lazy-index.test.js && node test/method-set-edgecases.test.js && node test/generics.test.js && node test/package-exclusions.test.js && node test/folder-exclusions.test.js && node test/lazy-deps.test.js && node test/performance.test.js && node test/build.test.js && node test/search.test.js && node test/source-search.test.js && node test/multiroot.test.js && node test/deps.test.js && node test/gomod.test.js && node test/deps-version.test.js && node test/deps-crosspkg.test.js && node test/progress.test.js && node test/gotolens.test.js",
     "package": "vsce package --no-dependencies",
     "publish": "vsce publish --no-dependencies"
   },

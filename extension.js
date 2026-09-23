@@ -5,6 +5,11 @@ const path = require('path');
 
 const { WorkspaceIndex } = require('./src/indexer');
 const { resolveSearchRoots } = require('./src/search');
+const { SourceSearchService } = require('./src/source-search');
+const {
+    SourceSearchViewProvider,
+    SOURCE_SEARCH_VIEW_TYPE,
+} = require('./src/source-search-view');
 const { parseGoDeclarations } = require('./src/ast');
 const { DEFAULT_AST_CONCURRENCY } = require('./src/ast-cache');
 const { normalizeWildcardPatterns, createFolderMatcher } = require('./src/path-filter');
@@ -30,6 +35,10 @@ function getConfiguration() {
         searchDependencies: config.get('searchDependencies', true),
         goModCache: config.get('goModCache', ''),
         astConcurrency: config.get('astConcurrency', DEFAULT_AST_CONCURRENCY),
+        sourceSearchMaxResults: config.get('sourceSearchMaxResults', 2000),
+        sourceSearchMaxFiles: config.get('sourceSearchMaxFiles', 1000),
+        sourceSearchExcludedFolders: config.get('sourceSearchExcludedFolders', []),
+        sourceSearchExcludedFilePatterns: config.get('sourceSearchExcludedFilePatterns', []),
     };
 }
 
@@ -59,6 +68,8 @@ function shouldExclude(filePath, receiverType) {
 
 // Shared index instance.
 let workspaceIndex = null;
+let sourceSearchService = null;
+let sourceSearchView = null;
 const overlayTimers = new Map();
 const documentAstCache = new WeakMap();
 const OVERLAY_DELAY_MS = 150;
@@ -170,10 +181,10 @@ class GoCodeLensProvider {
 // ---------------------------------------------------------------------------
 // Navigation helpers
 // ---------------------------------------------------------------------------
-async function navigateTo(filePath, line) {
+async function navigateTo(filePath, line, column) {
     try {
         const document = await vscode.workspace.openTextDocument(filePath);
-        const position = new vscode.Position(Math.max(0, line), 0);
+        const position = new vscode.Position(Math.max(0, line), Math.max(0, column || 0));
         const selection = new vscode.Selection(position, position);
         // Pass the target selection to showTextDocument so the file opens with the
         // cursor already on the target line. Setting editor.selection afterwards would
@@ -192,6 +203,28 @@ async function pickAndNavigate(items, placeHolder) {
         matchOnDetail: true,
     });
     if (selected) await navigateTo(selected.filePath, selected.line);
+}
+
+async function openSourceSearchResultsInEditor(message) {
+    const options = message && message.options ? message.options : {};
+    const entries = Array.isArray(message && message.results) ? message.results : [];
+    const lines = [
+        `Search results for ${JSON.stringify(options.query || '')}`,
+        '',
+    ];
+    for (const entry of entries) {
+        if (!entry || !entry.file) continue;
+        const matches = Array.isArray(entry.matches) ? entry.matches : [entry];
+        for (const match of matches) {
+            lines.push(`${entry.file}:${match.line || 1}:${match.column || 1}`);
+            lines.push(`  ${match.text || ''}`);
+        }
+    }
+    const document = await vscode.workspace.openTextDocument({
+        content: lines.join('\n'),
+        language: 'text',
+    });
+    await vscode.window.showTextDocument(document, { preview: false });
 }
 
 // Delay before a slow search shows its progress notification (ms). Searches
@@ -338,6 +371,36 @@ function activate(context) {
     });
     context.subscriptions.push({ dispose: () => workspaceIndex.dispose() });
 
+    sourceSearchService = new SourceSearchService({
+        getConfig: getConfiguration,
+        getWorkspaceRoots: () =>
+            (vscode.workspace.workspaceFolders || [])
+                .map((folder) => folder && folder.uri && folder.uri.fsPath)
+                .filter(Boolean),
+        getOpenDocuments: () => vscode.workspace.textDocuments || [],
+        log,
+    });
+    sourceSearchView = new SourceSearchViewProvider({
+        searchService: sourceSearchService,
+        logger: log,
+        onOpenMatch: async (match) => {
+            await navigateTo(
+                match.file,
+                Math.max(0, Number(match.line || 1) - 1),
+                Math.max(0, Number(match.column || 1) - 1)
+            );
+        },
+        onOpenInEditor: openSourceSearchResultsInEditor,
+        onSearch: (options) => log(`source search: ${options.scope || 'all'} ${options.query || ''}`),
+    });
+    context.subscriptions.push({
+        dispose: () => {
+            if (sourceSearchView) sourceSearchView.dispose();
+            sourceSearchView = null;
+            sourceSearchService = null;
+        },
+    });
+
     const provider = new GoCodeLensProvider();
     // Match Go documents regardless of URI scheme. Restricting to `scheme: 'file'`
     // meant the CodeLens providers were never invoked in remote environments
@@ -365,6 +428,23 @@ function activate(context) {
 
     context.subscriptions.push(
         vscode.languages.registerCodeLensProvider(selector, provider),
+        vscode.commands.registerCommand('go-interface-lens.searchSource', async () => {
+            try {
+                await vscode.commands.executeCommand('workbench.view.extension.go-interface-lens');
+            } catch (_) {
+                // The Activity Bar view is still available when the workbench
+                // command is not exposed by a compatible editor.
+            }
+        }),
+        ...(vscode.window.registerWebviewViewProvider
+            ? [
+                  vscode.window.registerWebviewViewProvider(
+                      SOURCE_SEARCH_VIEW_TYPE,
+                      sourceSearchView,
+                      { webviewOptions: { retainContextWhenHidden: true } }
+                  ),
+              ]
+            : []),
         vscode.commands.registerCommand('go-interface-lens.showImplementations', showImplementations),
         vscode.commands.registerCommand(
             'go-interface-lens.showMethodImplementations',

@@ -109,6 +109,12 @@ WASM、Go grammar WASM 和 MIT 许可证；依赖包里的其他语言 grammar �
 
 查找结果会自动排除配置中的 mock、测试、生成文件和其他不需要的类型。
 
+### 搜索工程和依赖源码
+
+点击 Activity Bar 中的 Go Source Search 图标，或执行 `Go: Search Source`。搜索面板会按文件分组显示匹配行，支持普通文本、正则表达式、区分大小写、整词匹配，以及工程、依赖包和标准库范围切换。点击匹配行会打开对应源码并定位到列位置。
+
+搜索默认覆盖 `.go`、`go.mod`、`go.sum`、`go.work` 和 `go.work.sum`。依赖搜索只访问当前项目 `go.mod` 锁定的 module 版本和本地 `replace` 目录，不会把 module cache 中的旧版本混入结果。
+
 查询完成后会释放依赖源码文本；多余 AST Worker 在空闲超时后收缩到一个，供后续查询复用。
 
 ## 环境要求
@@ -130,6 +136,10 @@ WASM、Go grammar WASM 和 MIT 许可证；依赖包里的其他语言 grammar �
 | `goInterfaceLens.excludedPackagePatterns` | 空 | 按 Go import path 排除工作区候选包和依赖解析；`*` 匹配任意字符（包括 `/`），`?` 匹配单个字符 |
 | `goInterfaceLens.searchDependencies` | `true` | 正反向导航时按需搜索 `go.mod` 锁定依赖中的接口与具体实现；无锁信息时仅搜索显式配置的依赖根 |
 | `goInterfaceLens.goModCache` | 空 | 手动指定 Go module cache；为空时自动探测 |
+| `goInterfaceLens.sourceSearchMaxResults` | `2000` | 源码搜索最多返回的匹配条数 |
+| `goInterfaceLens.sourceSearchMaxFiles` | `1000` | 源码搜索最多展示的文件数 |
+| `goInterfaceLens.sourceSearchExcludedFolders` | 空 | 仅对源码搜索生效的目录排除规则；为空时保持原生 Search 的完整范围 |
+| `goInterfaceLens.sourceSearchExcludedFilePatterns` | 空 | 仅对源码搜索生效的文件名排除规则；为空时保持原生 Search 的完整范围 |
 
 修改目录、文件名或包路径排除规则后，插件会自动清理查询缓存；下一次导航查询会按新规则重新搜索，无需重启扩展。
 

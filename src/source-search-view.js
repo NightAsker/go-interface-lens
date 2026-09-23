@@ -1,0 +1,563 @@
+'use strict';
+
+/**
+ * A native-looking source search view for the activity bar.
+ *
+ * The provider deliberately knows nothing about how sources are found.  An
+ * engine can be supplied with setEngine() (or in the constructor) and only
+ * needs to expose search(options, { onBatch, signal }).  Batches may be an
+ * array of match objects or an object containing `results`/`matches`.
+ */
+const vscode = require('vscode');
+
+const VIEW_TYPE = 'go-interface-lens.sourceSearch';
+
+function randomNonce() {
+    return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+}
+
+function isPromise(value) {
+    return value && typeof value.then === 'function';
+}
+
+class SourceSearchViewProvider {
+    static viewType = VIEW_TYPE;
+
+    /**
+     * @param {{engine?: object, searchService?: object, onOpenMatch?: function,
+     *   onOpenInEditor?: function, onSearch?: function, logger?: function}} [options]
+     */
+    constructor(options = {}) {
+        this.engine = options.engine || options.searchService || null;
+        this.onOpenMatch = options.onOpenMatch;
+        this.onOpenInEditor = options.onOpenInEditor;
+        this.onSearch = options.onSearch;
+        this.logger = typeof options.logger === 'function' ? options.logger : () => {};
+        this._view = null;
+        this._disposables = [];
+        this._searchAbort = null;
+        this._searchId = 0;
+    }
+
+    setEngine(engine) {
+        this.engine = engine;
+        return this;
+    }
+
+    setHandlers({ onOpenMatch, onOpenInEditor, onSearch } = {}) {
+        if (typeof onOpenMatch === 'function') this.onOpenMatch = onOpenMatch;
+        if (typeof onOpenInEditor === 'function') this.onOpenInEditor = onOpenInEditor;
+        if (typeof onSearch === 'function') this.onSearch = onSearch;
+        return this;
+    }
+
+    resolveWebviewView(webviewView) {
+        this._view = webviewView;
+        webviewView.webview.options = { enableScripts: true, retainContextWhenHidden: true };
+        webviewView.webview.html = this._getHtml(webviewView.webview);
+
+        if (typeof webviewView.webview.onDidReceiveMessage === 'function') {
+            const receiver = webviewView.webview.onDidReceiveMessage((message) => {
+                this._handleMessage(message).catch((error) => {
+                    this.logger(`source search view: ${error && error.stack ? error.stack : error}`);
+                    this._post({ type: 'searchError', message: error.message || String(error) });
+                });
+            });
+            if (receiver && typeof receiver.dispose === 'function') this._disposables.push(receiver);
+        }
+
+        if (typeof webviewView.onDidChangeVisibility === 'function') {
+            const visibility = webviewView.onDidChangeVisibility(() => {
+                if (webviewView.visible) this._post({ type: 'viewVisible' });
+            });
+            if (visibility && typeof visibility.dispose === 'function') this._disposables.push(visibility);
+        }
+
+        if (typeof webviewView.onDidDispose === 'function') {
+            const dispose = webviewView.onDidDispose(() => this.dispose());
+            if (dispose && typeof dispose.dispose === 'function') this._disposables.push(dispose);
+        }
+    }
+
+    async _handleMessage(message) {
+        if (!message || typeof message.type !== 'string') return;
+        switch (message.type) {
+            case 'ready':
+                this._post({ type: 'viewVisible' });
+                return;
+            case 'search':
+                await this._startSearch(message.options || {});
+                return;
+            case 'cancel':
+                this._cancelSearch();
+                return;
+            case 'clearResults':
+                this._cancelSearch();
+                this._post({ type: 'clearResults' });
+                return;
+            case 'openMatch':
+                await this._openMatch(message.match || message);
+                return;
+            case 'openInEditor':
+                await this._openInEditor(message);
+                return;
+            case 'changeScope':
+                if (typeof this.onSearch === 'function') await this.onSearch(message);
+                return;
+            default:
+                return;
+        }
+    }
+
+    async _startSearch(options) {
+        this._cancelSearch();
+        const searchId = ++this._searchId;
+        const controller = new AbortController();
+        this._searchAbort = controller;
+        const normalized = {
+            query: String(options.query || '').trim(),
+            scope: options.scope || 'all',
+            useRegex: !!(options.useRegex || options.regex),
+            regex: !!(options.useRegex || options.regex),
+            matchCase: !!options.matchCase,
+            caseSensitive: !!(options.matchCase || options.caseSensitive),
+            wholeWord: !!options.wholeWord,
+            includePattern: options.includePattern || options.include || '',
+            includeGlobs: Array.isArray(options.includeGlobs)
+                ? options.includeGlobs
+                : (options.includePattern || options.include
+                    ? String(options.includePattern || options.include).split(',').map((value) => value.trim()).filter(Boolean)
+                    : undefined),
+            maxResults: Number.isInteger(options.maxResults) ? options.maxResults : undefined,
+        };
+
+        this._post({ type: 'searchStarted', options: normalized });
+        if (!normalized.query) {
+            this._post({ type: 'searchFinished', resultCount: 0, fileCount: 0 });
+            return;
+        }
+
+        try {
+            if (typeof this.onSearch === 'function') {
+                await this.onSearch(normalized);
+            }
+
+            if (!this.engine || typeof this.engine.search !== 'function') {
+                this._post({ type: 'searchFinished', resultCount: 0, fileCount: 0 });
+                return;
+            }
+
+            let result;
+            let receivedBatch = false;
+            const callback = (batch) => {
+                if (searchId !== this._searchId || controller.signal.aborted) return;
+                receivedBatch = true;
+                this._post({ type: 'appendResults', results: normalizeBatch(batch) });
+            };
+            const progress = (info) => {
+                if (searchId !== this._searchId || controller.signal.aborted) return;
+                this._post({ type: 'searchProgress', ...(info || {}) });
+            };
+
+            // SourceSearchService uses search(options, { onBatch, signal }). Keep
+            // the fallback for simple engines returning a complete result array.
+            result = this.engine.search(normalized, {
+                onBatch: callback,
+                onProgress: progress,
+                signal: controller.signal,
+            });
+            if (isPromise(result)) result = await result;
+            if (searchId !== this._searchId || controller.signal.aborted) return;
+            if (!receivedBatch && result !== undefined && result !== null) {
+                const batch = normalizeBatch(result);
+                if (batch.length > 0) this._post({ type: 'appendResults', results: batch });
+            }
+            this._post({
+                type: 'searchFinished',
+                resultCount: result && Number.isFinite(result.totalMatches) ? result.totalMatches : undefined,
+                fileCount: result && Number.isFinite(result.totalFiles) ? result.totalFiles : undefined,
+                truncated: !!(result && result.truncated),
+            });
+        } catch (error) {
+            if (searchId !== this._searchId || controller.signal.aborted || isAbortError(error)) {
+                this._post({ type: 'searchFinished', cancelled: true });
+                return;
+            }
+            this.logger(`source search failed: ${error && error.stack ? error.stack : error}`);
+            this._post({ type: 'searchError', message: error && error.message ? error.message : String(error) });
+        } finally {
+            if (this._searchAbort === controller) this._searchAbort = null;
+        }
+    }
+
+    _cancelSearch() {
+        if (this._searchAbort) {
+            try {
+                this._searchAbort.abort();
+            } catch (_) {}
+            this._searchAbort = null;
+            this._post({ type: 'searchFinished', cancelled: true });
+        }
+        this._searchId++;
+    }
+
+    async _openMatch(match) {
+        if (typeof this.onOpenMatch === 'function') {
+            await this.onOpenMatch(match);
+            return;
+        }
+        if (!match || !match.file) return;
+        const document = await vscode.workspace.openTextDocument(match.file);
+        const line = Math.max(0, Number(match.line || 1) - 1);
+        const column = Math.max(0, Number(match.column || 1) - 1);
+        const position = new vscode.Position(line, column);
+        await vscode.window.showTextDocument(document, { selection: new vscode.Selection(position, position) });
+    }
+
+    async _openInEditor(message) {
+        if (typeof this.onOpenInEditor === 'function') {
+            await this.onOpenInEditor(message);
+            return;
+        }
+        // The extension may provide an editor result view later. Silently
+        // ignore this action when no host handler has been wired yet.
+    }
+
+    _post(message) {
+        if (!this._view || !this._view.webview || typeof this._view.webview.postMessage !== 'function') return;
+        try {
+            this._view.webview.postMessage(message);
+        } catch (error) {
+            this.logger(`source search view message failed: ${error.message || error}`);
+        }
+    }
+
+    _getHtml(webview) {
+        const nonce = randomNonce();
+        const cspSource = webview && webview.cspSource ? webview.cspSource : 'https:';
+        return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
+  <title>Go Source Search</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --muted: var(--vscode-descriptionForeground, #8b949e);
+      --border: var(--vscode-panel-border, rgba(127, 127, 127, .24));
+      --input-bg: var(--vscode-input-background, rgba(127,127,127,.12));
+      --input-border: var(--vscode-input-border, transparent);
+      --hover: var(--vscode-list-hoverBackground, rgba(127,127,127,.12));
+      --active: var(--vscode-list-activeSelectionBackground, rgba(38,79,120,.55));
+      --active-fg: var(--vscode-list-activeSelectionForeground, #fff);
+      --accent: var(--vscode-textLink-foreground, #4daafc);
+      --badge: var(--vscode-badge-background, #4d4d4d);
+      --badge-fg: var(--vscode-badge-foreground, #fff);
+      --code: var(--vscode-textPreformat-foreground, var(--vscode-foreground));
+    }
+    * { box-sizing: border-box; }
+    html, body { padding: 0; margin: 0; width: 100%; height: 100%; overflow: hidden; }
+    body {
+      color: var(--vscode-foreground);
+      background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+      font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, sans-serif);
+      font-size: var(--vscode-font-size, 13px);
+      line-height: 1.45;
+    }
+    button, input, select { font: inherit; color: inherit; }
+    button { border: 0; background: transparent; cursor: pointer; }
+    button:focus-visible, input:focus-visible, select:focus-visible { outline: 1px solid var(--vscode-focusBorder, #007fd4); outline-offset: -1px; }
+    .shell { display: flex; flex-direction: column; height: 100%; min-width: 0; }
+    .header { padding: 12px 12px 10px; border-bottom: 1px solid var(--border); }
+    .brand { display: flex; align-items: center; gap: 8px; margin: 1px 2px 10px; color: var(--vscode-sideBarTitle-foreground, var(--vscode-foreground)); font-size: 12px; font-weight: 600; letter-spacing: .02em; }
+    .brand-mark { display: inline-flex; width: 19px; height: 19px; align-items: center; justify-content: center; color: var(--accent); }
+    .brand-mark svg { width: 18px; height: 18px; }
+    .search-row { display: flex; gap: 6px; align-items: stretch; }
+    .search-box { flex: 1; min-width: 0; display: flex; align-items: center; gap: 7px; height: 30px; padding: 0 8px; background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 4px; }
+    .search-box:focus-within { border-color: var(--vscode-focusBorder, #007fd4); }
+    .search-icon { display: inline-flex; color: var(--muted); flex: 0 0 auto; }
+    .search-icon svg { width: 15px; height: 15px; }
+    #query { width: 100%; min-width: 0; height: 28px; padding: 0; background: transparent; border: 0; outline: 0; }
+    #query::placeholder { color: var(--muted); }
+    .action { width: 30px; height: 30px; border-radius: 4px; color: var(--muted); display: inline-flex; align-items: center; justify-content: center; }
+    .action:hover { background: var(--hover); color: var(--vscode-foreground); }
+    .action.primary { background: var(--vscode-button-background, #0e639c); color: var(--vscode-button-foreground, #fff); }
+    .action.primary:hover { background: var(--vscode-button-hoverBackground, #1177bb); }
+    .action svg { width: 15px; height: 15px; }
+    .filters { display: flex; align-items: center; gap: 6px; margin-top: 8px; min-width: 0; }
+    .scope { flex: 1; min-width: 0; height: 26px; padding: 0 5px; border: 1px solid var(--input-border); border-radius: 3px; background: var(--input-bg); font-size: 12px; }
+    .filter-btn { display: inline-flex; align-items: center; justify-content: center; gap: 4px; min-width: 27px; height: 26px; padding: 0 5px; border-radius: 3px; color: var(--muted); font-size: 11px; }
+    .filter-btn:hover { background: var(--hover); color: var(--vscode-foreground); }
+    .filter-btn.active { color: var(--accent); background: var(--vscode-toolbar-hoverBackground, rgba(80, 150, 220, .13)); }
+    .filter-btn .label { display: none; }
+    .filter-btn svg { width: 14px; height: 14px; }
+    .summary { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 36px; padding: 8px 12px 6px; color: var(--muted); font-size: 12px; }
+    .summary strong { color: var(--vscode-foreground); font-weight: 500; }
+    .summary a { color: var(--accent); text-decoration: none; cursor: pointer; white-space: nowrap; }
+    .summary a:hover { text-decoration: underline; }
+    #status { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .progress { height: 2px; margin: 0 12px; overflow: hidden; background: transparent; }
+    .progress.busy::after { content: ""; display: block; height: 100%; width: 38%; background: var(--accent); animation: slide 1.05s ease-in-out infinite; }
+    @keyframes slide { 0% { transform: translateX(-120%); } 55%, 100% { transform: translateX(290%); } }
+    .results { flex: 1; min-height: 0; overflow: auto; padding: 1px 6px 18px; }
+    .empty { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 7px; padding: 34px 18px; color: var(--muted); }
+    .empty svg { width: 28px; height: 28px; opacity: .75; }
+    .empty-title { color: var(--vscode-foreground); font-weight: 500; }
+    .empty-hint { font-size: 12px; max-width: 240px; }
+    .file { border-radius: 4px; margin: 1px 0; overflow: hidden; }
+    .file-head { display: flex; align-items: center; min-width: 0; gap: 4px; padding: 4px 7px; min-height: 29px; border-radius: 4px; cursor: pointer; }
+    .file-head:hover { background: var(--hover); }
+    .twisty { width: 14px; height: 14px; flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; color: var(--muted); transition: transform .12s ease; }
+    .file.collapsed .twisty { transform: rotate(-90deg); }
+    .file-icon { display: inline-flex; width: 16px; height: 16px; align-items: center; color: #53b6de; flex: 0 0 auto; }
+    .file-icon svg { width: 15px; height: 15px; }
+    .file-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--vscode-sideBar-foreground, var(--vscode-foreground)); font-size: 12px; }
+    .file-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 11px; margin-left: 2px; }
+    .scope-tag { color: var(--muted); font-size: 10px; border: 1px solid var(--border); border-radius: 8px; padding: 0 5px; margin-left: auto; white-space: nowrap; }
+    .count { flex: 0 0 auto; min-width: 20px; height: 20px; padding: 0 6px; display: inline-flex; justify-content: center; align-items: center; border-radius: 10px; color: var(--badge-fg); background: var(--badge); font-size: 11px; }
+    .matches { margin-left: 22px; border-left: 1px solid var(--border); padding: 1px 0 3px 6px; }
+    .file.collapsed .matches { display: none; }
+    .match { display: flex; gap: 7px; min-width: 0; padding: 3px 6px; border-radius: 3px; cursor: pointer; color: var(--vscode-descriptionForeground, var(--vscode-foreground)); }
+    .match:hover { background: var(--hover); color: var(--vscode-foreground); }
+    .line-number { flex: 0 0 34px; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 11px; user-select: none; }
+    .match-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: pre; color: var(--code); font-family: var(--vscode-editor-font-family, var(--vscode-font-family, monospace)); font-size: 11px; }
+    mark { color: var(--vscode-editor-findMatchHighlightForeground, var(--vscode-foreground)); background: var(--vscode-editor-findMatchHighlightBackground, rgba(234, 198, 67, .3)); border-radius: 2px; padding: 0 1px; }
+    .result-ellipsis { padding: 3px 6px; color: var(--muted); font-size: 11px; }
+    @media (min-width: 360px) { .filter-btn .label { display: inline; } .filter-btn { min-width: auto; } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="header">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">${iconSearchSvg()}</span><span>Go Source Search</span></div>
+      <div class="search-row">
+        <label class="search-box" aria-label="Search source">
+          <span class="search-icon" aria-hidden="true">${iconSearchSvg()}</span>
+          <input id="query" type="search" autocomplete="off" spellcheck="false" placeholder="Search workspace and dependencies" />
+        </label>
+        <button class="action primary" id="search" title="Search (Enter)" aria-label="Search">${iconArrowSvg()}</button>
+        <button class="action" id="cancel" title="Cancel search" aria-label="Cancel search" hidden>${iconStopSvg()}</button>
+      </div>
+      <div class="filters">
+        <select class="scope" id="scope" aria-label="Search scope">
+          <option value="all">All sources</option>
+          <option value="workspace">Workspace</option>
+          <option value="dependency">Dependencies</option>
+          <option value="stdlib">Standard library</option>
+        </select>
+        <button class="filter-btn" id="regex" title="Use regular expression" aria-label="Use regular expression">.*</button>
+        <button class="filter-btn" id="case" title="Match case" aria-label="Match case">Aa</button>
+        <button class="filter-btn" id="word" title="Match whole word" aria-label="Match whole word">${iconWordSvg()}</button>
+      </div>
+    </header>
+    <div class="summary"><span id="status">Type to search source</span><a id="open-editor" hidden>Open in editor</a></div>
+    <div class="progress" id="progress"></div>
+    <main class="results" id="results" role="tree" aria-label="Search results">
+      <div class="empty" id="empty">${iconCompassSvg()}<div class="empty-title">Search Go source</div><div class="empty-hint">Search your workspace, module cache, and standard library.</div></div>
+    </main>
+  </div>
+  <script nonce="${nonce}">
+    const vscode = acquireVsCodeApi();
+    const query = document.getElementById('query');
+    const scope = document.getElementById('scope');
+    const results = document.getElementById('results');
+    const status = document.getElementById('status');
+    const progress = document.getElementById('progress');
+    const searchButton = document.getElementById('search');
+    const cancelButton = document.getElementById('cancel');
+    const openEditor = document.getElementById('open-editor');
+    const empty = document.getElementById('empty');
+    const filters = { regex: false, matchCase: false, wholeWord: false };
+    const files = new Map();
+    let running = false;
+    let latestOptions = {};
+    let resultCount = 0;
+    let fileCount = 0;
+    let lastBatch = [];
+    let truncated = false;
+
+    function esc(value) {
+      return String(value == null ? '' : value).replace(/[&<>"']/g, (ch) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[ch]));
+    }
+    function icon(name) {
+      const paths = { down: '<path d="m4 6 4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>', file: '<path d="M4 1.75h5l3 3V14H4z" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M9 1.75v3h3" fill="none" stroke="currentColor" stroke-width="1.2"/>', search:'<circle cx="6.5" cy="6.5" r="4.25" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="m9.7 9.7 3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>' };
+      return '<svg viewBox="0 0 14 14" aria-hidden="true">' + (paths[name] || paths.file) + '</svg>';
+    }
+    function highlight(text) {
+      const value = String(text == null ? '' : text);
+      const q = String(latestOptions.query || '');
+      if (!q) return esc(value);
+      let source = q;
+      if (!latestOptions.useRegex) {
+        let escaped = '';
+        for (const character of source) {
+          if ('^$.*+?()[]{}|'.includes(character) || character.charCodeAt(0) === 92) escaped += '\\\\' + character;
+          else escaped += character;
+        }
+        source = escaped;
+      }
+      if (latestOptions.wholeWord) source = '\\\\b' + source + '\\\\b';
+      let re;
+      try { re = new RegExp(source, latestOptions.matchCase ? 'g' : 'gi'); } catch (_) { return esc(value); }
+      let output = '', last = 0, match;
+      while ((match = re.exec(value))) {
+        output += esc(value.slice(last, match.index)) + '<mark>' + esc(match[0]) + '</mark>';
+        last = match.index + match[0].length;
+        if (!match[0].length) re.lastIndex++;
+      }
+      return output + esc(value.slice(last));
+    }
+    function sendSearch() {
+      const value = query.value.trim();
+      latestOptions = { query: value, scope: scope.value, useRegex: filters.regex, regex: filters.regex, matchCase: filters.matchCase, caseSensitive: filters.matchCase, wholeWord: filters.wholeWord };
+      vscode.postMessage({ type: 'search', options: latestOptions });
+    }
+    function setFilter(id, key) {
+      filters[key] = !filters[key];
+      document.getElementById(id).classList.toggle('active', filters[key]);
+      if (query.value.trim()) sendSearch();
+    }
+    searchButton.addEventListener('click', sendSearch);
+    cancelButton.addEventListener('click', () => vscode.postMessage({ type: 'cancel' }));
+    query.addEventListener('keydown', (event) => { if (event.key === 'Enter') sendSearch(); else if (event.key === 'Escape') { query.value = ''; vscode.postMessage({ type: 'clearResults' }); } });
+    scope.addEventListener('change', () => { if (query.value.trim()) sendSearch(); });
+    document.getElementById('regex').addEventListener('click', () => setFilter('regex', 'regex'));
+    document.getElementById('case').addEventListener('click', () => setFilter('case', 'matchCase'));
+    document.getElementById('word').addEventListener('click', () => setFilter('word', 'wholeWord'));
+    openEditor.addEventListener('click', () => vscode.postMessage({ type: 'openInEditor', options: latestOptions, results: lastBatch }));
+
+    function reset() {
+      files.clear(); resultCount = 0; fileCount = 0; lastBatch = []; truncated = false;
+      results.innerHTML = ''; results.appendChild(empty); empty.hidden = false; openEditor.hidden = true;
+    }
+    function normaliseMatch(raw) {
+      if (!raw || typeof raw !== 'object') return null;
+      const file = raw.file || raw.path || raw.filePath || (raw.uri && raw.uri.fsPath);
+      if (!file) return null;
+      const line = Number(raw.line || raw.lineNumber || 1);
+      const column = Number(raw.column || raw.columnNumber || 1);
+      const text = raw.text == null ? (raw.preview == null ? '' : raw.preview) : raw.text;
+      return { file: String(file), line: Number.isFinite(line) ? line : 1, column: Number.isFinite(column) ? column : 1, text: String(text), scope: raw.scope || '', module: raw.module || '', version: raw.version || '', unsaved: !!raw.unsaved, ranges: raw.ranges || [] };
+    }
+    function addMatches(batch) {
+      if (!Array.isArray(batch)) batch = [batch];
+      const flat = [];
+      batch.forEach((entry) => {
+        if (!entry) return;
+        if (entry.matches && Array.isArray(entry.matches)) {
+          entry.matches.forEach((item) => flat.push({ ...item, file: item.file || item.path || entry.file, scope: item.scope || entry.scope, module: item.module || entry.module, version: item.version || entry.version }));
+        } else flat.push(entry);
+      });
+      flat.map(normaliseMatch).filter(Boolean).forEach((match) => {
+        let file = files.get(match.file);
+        if (!file) { file = { file: match.file, scope: match.scope, module: match.module, version: match.version, unsaved: match.unsaved, matches: [], collapsed: false }; files.set(match.file, file); }
+        file.scope = file.scope || match.scope; file.module = file.module || match.module; file.version = file.version || match.version; file.unsaved = file.unsaved || match.unsaved;
+        const duplicate = file.matches.some((item) => item.line === match.line && item.column === match.column && item.text === match.text);
+        if (!duplicate) { file.matches.push(match); resultCount++; lastBatch.push(match); }
+      });
+      fileCount = files.size;
+      render();
+    }
+    function displayFile(file) {
+      const slash = file.file.replace(/\\\\/g, '/');
+      const pieces = slash.split('/');
+      const name = pieces.pop() || slash;
+      let parent = pieces.slice(-2).join('/');
+      if (file.module) parent = file.module + (file.version ? '@' + file.version : '');
+      return { name: name + (file.unsaved ? ' •' : ''), parent };
+    }
+    function scopeLabel(value) {
+      return ({ dependency: 'Dependency', dependencies: 'Dependencies', stdlib: 'Stdlib', workspace: 'Workspace' }[value] || value || 'Source');
+    }
+    function render() {
+      if (fileCount === 0) { empty.hidden = false; return; }
+      empty.hidden = true; results.querySelectorAll('.file').forEach((node) => node.remove());
+      files.forEach((file) => {
+        const wrap = document.createElement('section'); wrap.className = 'file' + (file.collapsed ? ' collapsed' : ''); wrap.setAttribute('role', 'treeitem');
+        const shown = displayFile(file); const tag = file.scope && file.scope !== 'workspace' ? '<span class="scope-tag">' + esc(scopeLabel(file.scope)) + '</span>' : '';
+        wrap.innerHTML = '<div class="file-head" tabindex="0"><span class="twisty">' + icon('down') + '</span><span class="file-icon">' + icon('file') + '</span><span class="file-name" title="' + esc(file.file) + '">' + esc(shown.name) + '</span><span class="file-path" title="' + esc(shown.parent) + '">' + esc(shown.parent) + '</span>' + tag + '<span class="count">' + file.matches.length + '</span></div><div class="matches"></div>';
+        const head = wrap.querySelector('.file-head'); head.addEventListener('click', () => { file.collapsed = !file.collapsed; wrap.classList.toggle('collapsed', file.collapsed); }); head.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); file.collapsed = !file.collapsed; wrap.classList.toggle('collapsed', file.collapsed); } });
+        const list = wrap.querySelector('.matches'); file.matches.slice(0, 300).forEach((match) => { const row = document.createElement('div'); row.className = 'match'; row.setAttribute('role', 'treeitem'); row.title = 'Open ' + file.file + ':' + match.line; row.innerHTML = '<span class="line-number">' + esc(match.line) + '</span><span class="match-text">' + highlight(match.text) + '</span>'; row.addEventListener('click', () => vscode.postMessage({ type: 'openMatch', match })); list.appendChild(row); });
+        if (file.matches.length > 300) { const more = document.createElement('div'); more.className = 'result-ellipsis'; more.textContent = '… ' + (file.matches.length - 300) + ' more matches'; list.appendChild(more); }
+        results.appendChild(wrap);
+      });
+    }
+    function updateStatus(cancelled) {
+      progress.classList.toggle('busy', running);
+      searchButton.hidden = running; cancelButton.hidden = !running;
+      if (running) { status.textContent = resultCount ? 'Searching… ' + resultCount + ' result' + (resultCount === 1 ? '' : 's') : 'Searching…'; return; }
+      if (!latestOptions.query) { status.textContent = 'Type to search source'; return; }
+      if (cancelled) { status.textContent = resultCount ? resultCount + ' result' + (resultCount === 1 ? '' : 's') + ' (cancelled)' : 'Search cancelled'; return; }
+      status.innerHTML = '<strong>' + resultCount + '</strong> result' + (resultCount === 1 ? '' : 's') + ' in <strong>' + fileCount + '</strong> file' + (fileCount === 1 ? '' : 's') + (truncated ? ' <span title="Result limit reached">(truncated)</span>' : '');
+      openEditor.hidden = resultCount === 0;
+    }
+    window.addEventListener('message', (event) => {
+      const message = event.data || {};
+      switch (message.type) {
+        case 'searchStarted': latestOptions = message.options || latestOptions; reset(); running = true; updateStatus(); break;
+        case 'appendResults': addMatches(message.results || message.batch || []); break;
+        case 'searchProgress':
+          if (Number.isFinite(message.totalMatches)) resultCount = Math.max(resultCount, message.totalMatches);
+          if (Number.isFinite(message.totalFiles)) fileCount = Math.max(fileCount, message.totalFiles);
+          truncated = truncated || !!message.truncated; updateStatus(); break;
+        case 'searchFinished':
+          if (Number.isFinite(message.resultCount)) resultCount = Math.max(resultCount, message.resultCount);
+          if (Number.isFinite(message.fileCount)) fileCount = Math.max(fileCount, message.fileCount);
+          truncated = truncated || !!message.truncated; running = false; updateStatus(!!message.cancelled); break;
+        case 'searchError': running = false; updateStatus(); status.textContent = message.message || 'Search failed'; break;
+        case 'clearResults': running = false; reset(); updateStatus(); break;
+      }
+    });
+    vscode.postMessage({ type: 'ready' });
+  </script>
+</body>
+</html>`;
+    }
+
+    dispose() {
+        this._cancelSearch();
+        this._view = null;
+        for (const item of this._disposables.splice(0)) {
+            try { item.dispose(); } catch (_) {}
+        }
+    }
+}
+
+function isAbortError(error) {
+    return !!error && (error.name === 'AbortError' || error.code === 'ABORT_ERR');
+}
+
+function normalizeBatch(batch) {
+    if (!batch) return [];
+    if (Array.isArray(batch)) return batch;
+    if (Array.isArray(batch.results)) return batch.results;
+    if (Array.isArray(batch.matches)) {
+        if (batch.file || batch.path || batch.filePath) return [batch];
+        return batch.matches;
+    }
+    return [batch];
+}
+
+function iconSearchSvg() {
+    return '<svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m12.5 12.5 4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
+}
+function iconArrowSvg() {
+    return '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h10M10 5l5 5-5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+}
+function iconStopSvg() {
+    return '<svg viewBox="0 0 20 20" aria-hidden="true"><rect x="5" y="5" width="10" height="10" rx="1.5" fill="currentColor"/></svg>';
+}
+function iconWordSvg() {
+    return '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 6h10M3 10h7M3 14h11" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="m14 10 2 5 2-5M15 13h2" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+}
+function iconCompassSvg() {
+    return '<svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="11" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="m20.4 11.6-2.8 6.1-6 2.7 2.8-6.1z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>';
+}
+
+module.exports = {
+    SourceSearchViewProvider,
+    SOURCE_SEARCH_VIEW_TYPE: VIEW_TYPE,
+    normalizeBatch,
+};
