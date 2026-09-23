@@ -497,7 +497,7 @@ class SourceSearchViewProvider {
       render();
     }
     function displayFile(file) {
-      const slash = String(file.relativePath || file.file).replace(/\\/g, '/');
+      const slash = String(file.relativePath || file.file).replace(/\\\\/g, '/');
       const pieces = slash.split('/');
       const name = pieces.pop() || slash;
       const parent = pieces.join('/');

@@ -2,6 +2,15 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.1.5] - 2026-09-23
+
+### Fixed
+
+- Fix the generated source-search Webview script so Enter and filter controls
+  work again after packaging.
+- Add a Webview interaction regression test covering Enter and all three
+  search filters.
+
 ## [2.1.4] - 2026-09-23
 
 ### Fixed
