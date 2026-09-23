@@ -2,6 +2,16 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.1.3] - 2026-09-23
+
+### Changed
+
+- Align the source-search panel with VS Code's native SearchView spacing,
+  controls, result rows, and collapsed search-details interaction.
+- Use relative result paths and compact, indentation-free previews so matches
+  read like native Search results.
+- Replace the Activity Bar search mark with a compact native-style icon.
+
 ## [2.1.2] - 2026-09-23
 
 ### Changed

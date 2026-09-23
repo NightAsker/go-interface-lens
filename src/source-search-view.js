@@ -270,52 +270,62 @@ class SourceSearchViewProvider {
     button { border: 0; background: transparent; cursor: pointer; }
     button:focus-visible, input:focus-visible, select:focus-visible { outline: 1px solid var(--vscode-focusBorder, #007fd4); outline-offset: -1px; }
     .shell { display: flex; flex-direction: column; height: 100%; min-width: 0; }
-    .header { padding: 8px 10px 7px; border-bottom: 1px solid var(--border); }
-    .search-row { display: flex; align-items: stretch; }
-    .search-box { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; height: 26px; padding: 0 5px 0 7px; background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 3px; }
+    /* These offsets mirror VS Code's SearchView: the replace toggle is 16px
+       wide and the input starts 18px after the widget edge. */
+    .header { margin: 0 12px 0 2px; padding: 6px 0; }
+    .search-row { position: relative; display: flex; align-items: stretch; min-height: 26px; }
+    .search-toggle { position: absolute; left: 0; top: 0; width: 16px; height: 26px; padding: 0; color: var(--muted); display: inline-flex; align-items: center; justify-content: center; border-radius: 3px; z-index: 1; }
+    .search-toggle:hover { background: var(--hover); color: var(--vscode-foreground); }
+    .search-toggle svg { width: 16px; height: 16px; }
+    .search-box { flex: 1; min-width: 0; display: flex; align-items: center; gap: 0; height: 26px; margin-left: 18px; padding: 0 2px 0 0; background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 3px; }
     .search-box:focus-within { border-color: var(--vscode-focusBorder, #007fd4); }
-    .search-icon { display: inline-flex; color: var(--muted); flex: 0 0 auto; }
-    .search-icon svg { width: 14px; height: 14px; }
-    #query { width: 100%; min-width: 0; height: 24px; padding: 0; background: transparent; border: 0; outline: 0; }
+    #query { width: 100%; min-width: 0; height: 24px; padding: 3px 0 3px 6px; background: transparent; border: 0; outline: 0; }
     #query::placeholder { color: var(--muted); }
     .search-filter-controls { display: inline-flex; align-items: center; gap: 1px; flex: 0 0 auto; }
-    .search-filter-btn { display: inline-flex; align-items: center; justify-content: center; min-width: 24px; height: 22px; padding: 0 3px; border-radius: 3px; color: var(--muted); font-size: 11px; line-height: 1; }
+    .search-filter-btn { display: inline-flex; align-items: center; justify-content: center; min-width: 25px; height: 22px; padding: 0 3px; border-radius: 3px; color: var(--vscode-icon-foreground, var(--muted)); font-size: 13px; line-height: 1; }
     .search-filter-btn:hover { background: var(--hover); color: var(--vscode-foreground); }
-    .search-filter-btn.active { color: var(--accent); background: var(--vscode-toolbar-hoverBackground, rgba(80, 150, 220, .13)); }
-    .filters { display: flex; align-items: center; gap: 5px; margin-top: 6px; min-width: 0; }
+    .search-filter-btn.active { color: var(--vscode-inputOption-activeForeground, var(--accent)); background: var(--vscode-inputOption-activeBackground, var(--vscode-toolbar-hoverBackground, rgba(80, 150, 220, .13))); }
+    .search-filter-btn.word { text-decoration: underline; text-underline-offset: 2px; }
+    .search-filter-btn svg { width: 16px; height: 16px; }
+    .query-details { min-height: 16px; position: relative; margin: 0 0 0 18px; }
+    .details-toggle { position: absolute; right: -2px; top: 0; width: 25px; height: 16px; padding: 0; color: var(--muted); font-size: 16px; line-height: 12px; border-radius: 3px; }
+    .details-toggle:hover { background: var(--hover); color: var(--vscode-foreground); }
+    .scope-row { display: none; align-items: center; gap: 6px; padding: 4px 0; }
+    .query-details.expanded .scope-row { display: flex; }
+    .scope-row[hidden] { display: none !important; }
     .scope { flex: 1; min-width: 0; height: 24px; padding: 0 5px; border: 1px solid var(--input-border); border-radius: 3px; background: var(--input-bg); font-size: 12px; }
-    .summary { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 32px; padding: 6px 10px 4px; color: var(--muted); font-size: 12px; }
+    .summary { display: block; min-height: 22px; margin-top: -5px; padding: 0 22px 8px; color: var(--vscode-search-resultsInfoForeground, var(--muted)); font-size: 13px; line-height: 22px; }
     .summary strong { color: var(--vscode-foreground); font-weight: 500; }
-    .summary a { color: var(--accent); text-decoration: none; cursor: pointer; white-space: nowrap; }
+    .summary a { color: var(--accent); text-decoration: none; cursor: pointer; white-space: nowrap; margin-left: 4px; }
+    .summary a::before { content: "- "; color: var(--vscode-search-resultsInfoForeground, var(--muted)); }
     .summary a:hover { text-decoration: underline; }
-    #status { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #status { white-space: normal; }
     .progress { height: 2px; margin: 0 12px; overflow: hidden; background: transparent; }
     .progress.busy::after { content: ""; display: block; height: 100%; width: 38%; background: var(--accent); animation: slide 1.05s ease-in-out infinite; }
     @keyframes slide { 0% { transform: translateX(-120%); } 55%, 100% { transform: translateX(290%); } }
-    .results { flex: 1; min-height: 0; overflow: auto; padding: 1px 6px 18px; }
+    .results { flex: 1; min-height: 0; overflow: auto; padding: 0 0 18px; }
     .empty { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 7px; padding: 34px 18px; color: var(--muted); }
     .empty[hidden] { display: none !important; }
     .empty svg { width: 28px; height: 28px; opacity: .75; }
     .empty-title { color: var(--vscode-foreground); font-weight: 500; }
     .empty-hint { font-size: 12px; max-width: 240px; }
-    .file { border-radius: 4px; margin: 1px 0; overflow: hidden; }
-    .file-head { display: flex; align-items: center; min-width: 0; gap: 4px; padding: 4px 7px; min-height: 29px; border-radius: 4px; cursor: pointer; }
+    .file { border-radius: 0; margin: 0; overflow: hidden; }
+    .file-head { display: flex; align-items: center; min-width: 0; gap: 0; height: 22px; min-height: 22px; line-height: 22px; padding: 0; border-radius: 0; cursor: pointer; }
     .file-head:hover { background: var(--hover); }
-    .twisty { width: 14px; height: 14px; flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; color: var(--muted); transition: transform .12s ease; }
+    .twisty { width: 22px; height: 22px; flex: 0 0 22px; display: inline-flex; align-items: center; justify-content: center; color: var(--muted); transition: transform .12s ease; }
     .file.collapsed .twisty { transform: rotate(-90deg); }
-    .file-icon { display: inline-flex; width: 16px; height: 16px; align-items: center; color: #53b6de; flex: 0 0 auto; }
-    .file-icon svg { width: 15px; height: 15px; }
-    .file-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--vscode-sideBar-foreground, var(--vscode-foreground)); font-size: 12px; }
-    .file-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 11px; margin-left: 2px; }
-    .scope-tag { color: var(--muted); font-size: 10px; border: 1px solid var(--border); border-radius: 8px; padding: 0 5px; margin-left: auto; white-space: nowrap; }
-    .count { flex: 0 0 auto; min-width: 20px; height: 20px; padding: 0 6px; display: inline-flex; justify-content: center; align-items: center; border-radius: 10px; color: var(--badge-fg); background: var(--badge); font-size: 11px; }
-    .matches { margin-left: 22px; border-left: 1px solid var(--border); padding: 1px 0 3px 6px; }
+    .file-icon { display: inline-flex; width: 19px; height: 22px; align-items: center; color: var(--vscode-symbolIcon-fileForeground, var(--vscode-icon-foreground, var(--muted))); flex: 0 0 19px; }
+    .file-icon svg { width: 16px; height: 16px; }
+    .file-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--vscode-sideBar-foreground, var(--vscode-foreground)); font-size: 13px; }
+    .file-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 13px; margin-left: 6px; }
+    .count { flex: 0 0 auto; min-width: 18px; min-height: 18px; height: 18px; padding: 3px 5px; margin-left: auto; margin-right: 12px; display: inline-flex; justify-content: center; align-items: center; border-radius: 11px; color: var(--badge-fg); background: var(--badge); font-size: 11px; line-height: 11px; font-weight: 400; }
+    .matches { margin-left: 22px; border-left: 1px solid var(--vscode-tree-indentGuidesStroke, var(--border)); padding: 0 0 0 6px; }
     .file.collapsed .matches { display: none; }
-    .match { display: flex; gap: 0; min-width: 0; padding: 0 6px; border-radius: 3px; cursor: pointer; color: var(--vscode-descriptionForeground, var(--vscode-foreground)); line-height: 22px; }
+    .match { display: flex; gap: 0; min-width: 0; padding: 0; border-radius: 0; cursor: pointer; color: var(--vscode-foreground); line-height: 22px; }
     .match:hover { background: var(--hover); color: var(--vscode-foreground); }
     .line-number { flex: 0 0 auto; margin-left: 7px; margin-right: 4px; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 11px; user-select: none; opacity: .82; }
     .match-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: pre; color: var(--code); font-family: var(--vscode-editor-font-family, var(--vscode-font-family, monospace)); font-size: 11px; }
-    mark { color: var(--vscode-editor-findMatchHighlightForeground, var(--vscode-foreground)); background: var(--vscode-editor-findMatchHighlightBackground, rgba(234, 198, 67, .3)); border-radius: 2px; padding: 0 1px; }
+    mark { color: var(--vscode-editor-findMatchHighlightForeground, var(--vscode-foreground)); background: var(--vscode-editor-findMatchHighlightBackground, rgba(234, 198, 67, .3)); border: 1px solid var(--vscode-editor-findMatchHighlightBorder, transparent); border-radius: 0; padding: 0 1px; }
     .result-ellipsis { padding: 3px 6px; color: var(--muted); font-size: 11px; }
   </style>
 </head>
@@ -323,23 +333,26 @@ class SourceSearchViewProvider {
   <div class="shell">
     <header class="header">
       <div class="search-row">
+        <button class="search-toggle" id="search-toggle" type="button" title="Search options" aria-label="Search options" aria-expanded="false">${iconChevronSvg()}</button>
         <div class="search-box" role="search">
-          <span class="search-icon" aria-hidden="true">${iconSearchSvg()}</span>
           <input id="query" type="search" aria-label="Search source" autocomplete="off" spellcheck="false" placeholder="Search workspace and dependencies" />
           <span class="search-filter-controls" aria-label="Search filters">
             <button class="search-filter-btn" id="case" title="Match case" aria-label="Match case" aria-pressed="false">Aa</button>
-            <button class="search-filter-btn" id="word" title="Match whole word" aria-label="Match whole word" aria-pressed="false">ab</button>
-            <button class="search-filter-btn" id="regex" title="Use regular expression" aria-label="Use regular expression" aria-pressed="false">.*</button>
+            <button class="search-filter-btn word" id="word" title="Match whole word" aria-label="Match whole word" aria-pressed="false">ab</button>
+            <button class="search-filter-btn" id="regex" title="Use regular expression" aria-label="Use regular expression" aria-pressed="false">${iconRegexSvg()}</button>
           </span>
         </div>
       </div>
-      <div class="filters">
-        <select class="scope" id="scope" aria-label="Search scope">
-          <option value="all">All sources</option>
-          <option value="workspace">Workspace</option>
-          <option value="dependency">Dependencies</option>
-          <option value="stdlib">Standard library</option>
-        </select>
+      <div class="query-details" id="query-details">
+        <button class="details-toggle" id="details-toggle" type="button" title="Search options" aria-label="Search options" aria-expanded="false">…</button>
+        <div class="scope-row" id="scope-row" hidden>
+          <select class="scope" id="scope" aria-label="Search scope">
+            <option value="all">All sources</option>
+            <option value="workspace">Workspace</option>
+            <option value="dependency">Dependencies</option>
+            <option value="stdlib">Standard library</option>
+          </select>
+        </div>
       </div>
     </header>
     <div class="summary"><span id="status">Type to search source</span><a id="open-editor" hidden>Open in editor</a></div>
@@ -352,6 +365,10 @@ class SourceSearchViewProvider {
     const vscode = acquireVsCodeApi();
     const query = document.getElementById('query');
     const scope = document.getElementById('scope');
+    const searchToggle = document.getElementById('search-toggle');
+    const queryDetails = document.getElementById('query-details');
+    const detailsToggle = document.getElementById('details-toggle');
+    const scopeRow = document.getElementById('scope-row');
     const results = document.getElementById('results');
     const status = document.getElementById('status');
     const progress = document.getElementById('progress');
@@ -409,6 +426,15 @@ class SourceSearchViewProvider {
       button.setAttribute('aria-pressed', String(filters[key]));
       if (query.value.trim()) sendSearch();
     }
+    function toggleDetails() {
+      const expanded = !queryDetails.classList.contains('expanded');
+      queryDetails.classList.toggle('expanded', expanded);
+      scopeRow.hidden = !expanded;
+      detailsToggle.setAttribute('aria-expanded', String(expanded));
+      searchToggle.setAttribute('aria-expanded', String(expanded));
+    }
+    searchToggle.addEventListener('click', toggleDetails);
+    detailsToggle.addEventListener('click', toggleDetails);
     query.addEventListener('keydown', (event) => {
       if (event.key === 'Enter') {
         event.preventDefault();
@@ -439,7 +465,7 @@ class SourceSearchViewProvider {
       // ripgrep returns the complete source line. Native Search renders the
       // matching line as a compact preview and removes its indentation.
       const preview = String(text).trimStart();
-      return { file: String(file), line: Number.isFinite(line) ? line : 1, column: Number.isFinite(column) ? column : 1, text: String(text), preview, scope: raw.scope || '', module: raw.module || '', version: raw.version || '', unsaved: !!raw.unsaved, ranges: raw.ranges || [] };
+      return { file: String(file), relativePath: raw.relativePath || '', line: Number.isFinite(line) ? line : 1, column: Number.isFinite(column) ? column : 1, text: String(text), preview, scope: raw.scope || '', scopeLabel: raw.scopeLabel || '', rootLabel: raw.rootLabel || '', module: raw.module || '', version: raw.version || '', unsaved: !!raw.unsaved, ranges: raw.ranges || [] };
     }
     function addMatches(batch) {
       if (!Array.isArray(batch)) batch = [batch];
@@ -447,13 +473,13 @@ class SourceSearchViewProvider {
       batch.forEach((entry) => {
         if (!entry) return;
         if (entry.matches && Array.isArray(entry.matches)) {
-          entry.matches.forEach((item) => flat.push({ ...item, file: item.file || item.path || entry.file, scope: item.scope || entry.scope, module: item.module || entry.module, version: item.version || entry.version }));
+          entry.matches.forEach((item) => flat.push({ ...item, file: item.file || item.path || entry.file, relativePath: item.relativePath || entry.relativePath, scope: item.scope || entry.scope, scopeLabel: item.scopeLabel || entry.scopeLabel, rootLabel: item.rootLabel || entry.rootLabel, module: item.module || entry.module, version: item.version || entry.version }));
         } else flat.push(entry);
       });
       flat.map(normaliseMatch).filter(Boolean).forEach((match) => {
         let file = files.get(match.file);
-        if (!file) { file = { file: match.file, scope: match.scope, module: match.module, version: match.version, unsaved: match.unsaved, matches: [], collapsed: false }; files.set(match.file, file); }
-        file.scope = file.scope || match.scope; file.module = file.module || match.module; file.version = file.version || match.version; file.unsaved = file.unsaved || match.unsaved;
+        if (!file) { file = { file: match.file, relativePath: match.relativePath, scope: match.scope, scopeLabel: match.scopeLabel, rootLabel: match.rootLabel, module: match.module, version: match.version, unsaved: match.unsaved, matches: [], collapsed: false }; files.set(match.file, file); }
+        file.relativePath = file.relativePath || match.relativePath; file.scope = file.scope || match.scope; file.scopeLabel = file.scopeLabel || match.scopeLabel; file.rootLabel = file.rootLabel || match.rootLabel; file.module = file.module || match.module; file.version = file.version || match.version; file.unsaved = file.unsaved || match.unsaved;
         const duplicate = file.matches.some((item) => item.line === match.line && item.column === match.column && item.text === match.text);
         if (!duplicate) { file.matches.push(match); resultCount++; lastBatch.push(match); }
       });
@@ -461,23 +487,19 @@ class SourceSearchViewProvider {
       render();
     }
     function displayFile(file) {
-      const slash = file.file.replace(/\\\\/g, '/');
+      const slash = String(file.relativePath || file.file).replace(/\\/g, '/');
       const pieces = slash.split('/');
       const name = pieces.pop() || slash;
-      let parent = pieces.slice(-2).join('/');
-      if (file.module) parent = file.module + (file.version ? '@' + file.version : '');
+      const parent = pieces.join('/');
       return { name: name + (file.unsaved ? ' •' : ''), parent };
-    }
-    function scopeLabel(value) {
-      return ({ dependency: 'Dependency', dependencies: 'Dependencies', stdlib: 'Stdlib', workspace: 'Workspace' }[value] || value || 'Source');
     }
     function render() {
       if (fileCount === 0) { empty.hidden = false; return; }
       empty.hidden = true; results.querySelectorAll('.file').forEach((node) => node.remove());
       files.forEach((file) => {
         const wrap = document.createElement('section'); wrap.className = 'file' + (file.collapsed ? ' collapsed' : ''); wrap.setAttribute('role', 'treeitem');
-        const shown = displayFile(file); const tag = file.scope && file.scope !== 'workspace' ? '<span class="scope-tag">' + esc(scopeLabel(file.scope)) + '</span>' : '';
-        wrap.innerHTML = '<div class="file-head" tabindex="0"><span class="twisty">' + icon('down') + '</span><span class="file-icon">' + icon('file') + '</span><span class="file-name" title="' + esc(file.file) + '">' + esc(shown.name) + '</span><span class="file-path" title="' + esc(shown.parent) + '">' + esc(shown.parent) + '</span>' + tag + '<span class="count">' + file.matches.length + '</span></div><div class="matches"></div>';
+        const shown = displayFile(file);
+        wrap.innerHTML = '<div class="file-head" tabindex="0"><span class="twisty">' + icon('down') + '</span><span class="file-icon" aria-hidden="true">' + icon('file') + '</span><span class="file-name" title="' + esc(file.file) + '">' + esc(shown.name) + '</span><span class="file-path" title="' + esc(shown.parent) + '">' + esc(shown.parent) + '</span><span class="count">' + file.matches.length + '</span></div><div class="matches"></div>';
         const head = wrap.querySelector('.file-head'); head.addEventListener('click', () => { file.collapsed = !file.collapsed; wrap.classList.toggle('collapsed', file.collapsed); }); head.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); file.collapsed = !file.collapsed; wrap.classList.toggle('collapsed', file.collapsed); } });
         const list = wrap.querySelector('.matches'); file.matches.slice(0, 300).forEach((match) => { const row = document.createElement('div'); row.className = 'match'; row.setAttribute('role', 'treeitem'); row.title = 'Open ' + file.file + ':' + match.line; row.innerHTML = '<span class="line-number">' + esc(match.line) + ':</span><span class="match-text">' + highlight(match.preview) + '</span>'; row.addEventListener('click', () => vscode.postMessage({ type: 'openMatch', match })); list.appendChild(row); });
         if (file.matches.length > 300) { const more = document.createElement('div'); more.className = 'result-ellipsis'; more.textContent = '… ' + (file.matches.length - 300) + ' more matches'; list.appendChild(more); }
@@ -539,8 +561,11 @@ function normalizeBatch(batch) {
     return [batch];
 }
 
-function iconSearchSvg() {
-    return '<svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m12.5 12.5 4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
+function iconChevronSvg() {
+    return '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="m5.5 3.5 4.5 4.5-4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+}
+function iconRegexSvg() {
+    return '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5v13M2.5 4.2l11 7.6M13.5 4.2l-11 7.6" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round"/><circle cx="8" cy="8" r="1" fill="currentColor"/></svg>';
 }
 function iconCompassSvg() {
     return '<svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="11" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="m20.4 11.6-2.8 6.1-6 2.7 2.8-6.1z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>';
