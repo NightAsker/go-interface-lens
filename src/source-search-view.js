@@ -270,27 +270,21 @@ class SourceSearchViewProvider {
     button { border: 0; background: transparent; cursor: pointer; }
     button:focus-visible, input:focus-visible, select:focus-visible { outline: 1px solid var(--vscode-focusBorder, #007fd4); outline-offset: -1px; }
     .shell { display: flex; flex-direction: column; height: 100%; min-width: 0; }
-    .header { padding: 10px 12px 9px; border-bottom: 1px solid var(--border); }
-    .search-row { display: flex; gap: 6px; align-items: stretch; }
-    .search-box { flex: 1; min-width: 0; display: flex; align-items: center; gap: 7px; height: 30px; padding: 0 8px; background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 4px; }
+    .header { padding: 8px 10px 7px; border-bottom: 1px solid var(--border); }
+    .search-row { display: flex; align-items: stretch; }
+    .search-box { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; height: 26px; padding: 0 5px 0 7px; background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 3px; }
     .search-box:focus-within { border-color: var(--vscode-focusBorder, #007fd4); }
     .search-icon { display: inline-flex; color: var(--muted); flex: 0 0 auto; }
-    .search-icon svg { width: 15px; height: 15px; }
-    #query { width: 100%; min-width: 0; height: 28px; padding: 0; background: transparent; border: 0; outline: 0; }
+    .search-icon svg { width: 14px; height: 14px; }
+    #query { width: 100%; min-width: 0; height: 24px; padding: 0; background: transparent; border: 0; outline: 0; }
     #query::placeholder { color: var(--muted); }
-    .action { width: 30px; height: 30px; border-radius: 4px; color: var(--muted); display: inline-flex; align-items: center; justify-content: center; }
-    .action:hover { background: var(--hover); color: var(--vscode-foreground); }
-    .action.primary { background: transparent; color: var(--muted); }
-    .action.primary:hover { background: var(--hover); color: var(--vscode-foreground); }
-    .action svg { width: 15px; height: 15px; }
-    .filters { display: flex; align-items: center; gap: 6px; margin-top: 8px; min-width: 0; }
-    .scope { flex: 1; min-width: 0; height: 26px; padding: 0 5px; border: 1px solid var(--input-border); border-radius: 3px; background: var(--input-bg); font-size: 12px; }
-    .filter-btn { display: inline-flex; align-items: center; justify-content: center; gap: 4px; min-width: 27px; height: 26px; padding: 0 5px; border-radius: 3px; color: var(--muted); font-size: 11px; }
-    .filter-btn:hover { background: var(--hover); color: var(--vscode-foreground); }
-    .filter-btn.active { color: var(--accent); background: var(--vscode-toolbar-hoverBackground, rgba(80, 150, 220, .13)); }
-    .filter-btn .label { display: none; }
-    .filter-btn svg { width: 14px; height: 14px; }
-    .summary { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 36px; padding: 8px 12px 6px; color: var(--muted); font-size: 12px; }
+    .search-filter-controls { display: inline-flex; align-items: center; gap: 1px; flex: 0 0 auto; }
+    .search-filter-btn { display: inline-flex; align-items: center; justify-content: center; min-width: 24px; height: 22px; padding: 0 3px; border-radius: 3px; color: var(--muted); font-size: 11px; line-height: 1; }
+    .search-filter-btn:hover { background: var(--hover); color: var(--vscode-foreground); }
+    .search-filter-btn.active { color: var(--accent); background: var(--vscode-toolbar-hoverBackground, rgba(80, 150, 220, .13)); }
+    .filters { display: flex; align-items: center; gap: 5px; margin-top: 6px; min-width: 0; }
+    .scope { flex: 1; min-width: 0; height: 24px; padding: 0 5px; border: 1px solid var(--input-border); border-radius: 3px; background: var(--input-bg); font-size: 12px; }
+    .summary { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 32px; padding: 6px 10px 4px; color: var(--muted); font-size: 12px; }
     .summary strong { color: var(--vscode-foreground); font-weight: 500; }
     .summary a { color: var(--accent); text-decoration: none; cursor: pointer; white-space: nowrap; }
     .summary a:hover { text-decoration: underline; }
@@ -323,19 +317,21 @@ class SourceSearchViewProvider {
     .match-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: pre; color: var(--code); font-family: var(--vscode-editor-font-family, var(--vscode-font-family, monospace)); font-size: 11px; }
     mark { color: var(--vscode-editor-findMatchHighlightForeground, var(--vscode-foreground)); background: var(--vscode-editor-findMatchHighlightBackground, rgba(234, 198, 67, .3)); border-radius: 2px; padding: 0 1px; }
     .result-ellipsis { padding: 3px 6px; color: var(--muted); font-size: 11px; }
-    @media (min-width: 360px) { .filter-btn .label { display: inline; } .filter-btn { min-width: auto; } }
   </style>
 </head>
 <body>
   <div class="shell">
     <header class="header">
       <div class="search-row">
-        <label class="search-box" aria-label="Search source">
+        <div class="search-box" role="search">
           <span class="search-icon" aria-hidden="true">${iconSearchSvg()}</span>
-          <input id="query" type="search" autocomplete="off" spellcheck="false" placeholder="Search workspace and dependencies" />
-        </label>
-        <button class="action primary" id="search" title="Search (Enter)" aria-label="Search">${iconArrowSvg()}</button>
-        <button class="action" id="cancel" title="Cancel search" aria-label="Cancel search" hidden>${iconStopSvg()}</button>
+          <input id="query" type="search" aria-label="Search source" autocomplete="off" spellcheck="false" placeholder="Search workspace and dependencies" />
+          <span class="search-filter-controls" aria-label="Search filters">
+            <button class="search-filter-btn" id="case" title="Match case" aria-label="Match case" aria-pressed="false">Aa</button>
+            <button class="search-filter-btn" id="word" title="Match whole word" aria-label="Match whole word" aria-pressed="false">ab</button>
+            <button class="search-filter-btn" id="regex" title="Use regular expression" aria-label="Use regular expression" aria-pressed="false">.*</button>
+          </span>
+        </div>
       </div>
       <div class="filters">
         <select class="scope" id="scope" aria-label="Search scope">
@@ -344,9 +340,6 @@ class SourceSearchViewProvider {
           <option value="dependency">Dependencies</option>
           <option value="stdlib">Standard library</option>
         </select>
-        <button class="filter-btn" id="regex" title="Use regular expression" aria-label="Use regular expression">.*</button>
-        <button class="filter-btn" id="case" title="Match case" aria-label="Match case">Aa</button>
-        <button class="filter-btn" id="word" title="Match whole word" aria-label="Match whole word">${iconWordSvg()}</button>
       </div>
     </header>
     <div class="summary"><span id="status">Type to search source</span><a id="open-editor" hidden>Open in editor</a></div>
@@ -362,8 +355,6 @@ class SourceSearchViewProvider {
     const results = document.getElementById('results');
     const status = document.getElementById('status');
     const progress = document.getElementById('progress');
-    const searchButton = document.getElementById('search');
-    const cancelButton = document.getElementById('cancel');
     const openEditor = document.getElementById('open-editor');
     const empty = document.getElementById('empty');
     const filters = { regex: false, matchCase: false, wholeWord: false };
@@ -413,12 +404,21 @@ class SourceSearchViewProvider {
     }
     function setFilter(id, key) {
       filters[key] = !filters[key];
-      document.getElementById(id).classList.toggle('active', filters[key]);
+      const button = document.getElementById(id);
+      button.classList.toggle('active', filters[key]);
+      button.setAttribute('aria-pressed', String(filters[key]));
       if (query.value.trim()) sendSearch();
     }
-    searchButton.addEventListener('click', sendSearch);
-    cancelButton.addEventListener('click', () => vscode.postMessage({ type: 'cancel' }));
-    query.addEventListener('keydown', (event) => { if (event.key === 'Enter') sendSearch(); else if (event.key === 'Escape') { query.value = ''; vscode.postMessage({ type: 'clearResults' }); } });
+    query.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        sendSearch();
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        if (running) vscode.postMessage({ type: 'cancel' });
+        else { query.value = ''; vscode.postMessage({ type: 'clearResults' }); }
+      }
+    });
     scope.addEventListener('change', () => { if (query.value.trim()) sendSearch(); });
     document.getElementById('regex').addEventListener('click', () => setFilter('regex', 'regex'));
     document.getElementById('case').addEventListener('click', () => setFilter('case', 'matchCase'));
@@ -486,7 +486,6 @@ class SourceSearchViewProvider {
     }
     function updateStatus(cancelled) {
       progress.classList.toggle('busy', running);
-      searchButton.hidden = running; cancelButton.hidden = !running;
       if (running) { status.textContent = resultCount ? 'Searching… ' + resultCount + ' result' + (resultCount === 1 ? '' : 's') : 'Searching…'; return; }
       if (!latestOptions.query) { status.textContent = 'Type to search source'; return; }
       if (cancelled) { status.textContent = resultCount ? resultCount + ' result' + (resultCount === 1 ? '' : 's') + ' (cancelled)' : 'Search cancelled'; return; }
@@ -542,15 +541,6 @@ function normalizeBatch(batch) {
 
 function iconSearchSvg() {
     return '<svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m12.5 12.5 4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
-}
-function iconArrowSvg() {
-    return '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h10M10 5l5 5-5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-}
-function iconStopSvg() {
-    return '<svg viewBox="0 0 20 20" aria-hidden="true"><rect x="5" y="5" width="10" height="10" rx="1.5" fill="currentColor"/></svg>';
-}
-function iconWordSvg() {
-    return '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 6h10M3 10h7M3 14h11" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="m14 10 2 5 2-5M15 13h2" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 }
 function iconCompassSvg() {
     return '<svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="11" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="m20.4 11.6-2.8 6.1-6 2.7 2.8-6.1z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>';

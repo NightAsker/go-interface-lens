@@ -2,6 +2,17 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.1.2] - 2026-09-23
+
+### Changed
+
+- Match the native Search controls by placing `Aa`, `ab`, and regular
+  expression filters inside the search field.
+- Replace the custom whole-word icon with the native-style `ab` control and
+  keep the scope selector below the field.
+- Enlarge the Activity Bar source-search icon to use the available canvas more
+  fully.
+
 ## [2.1.1] - 2026-09-23
 
 ### Fixed
