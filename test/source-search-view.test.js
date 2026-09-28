@@ -131,7 +131,9 @@ console.log('== source search Webview interactions ==');
 const harness = createWebviewHarness();
 eq('Webview announces readiness', harness.messages[0] && harness.messages[0].type, 'ready');
 assert('native input clear button is hidden', /#query::\-webkit-search-cancel-button[\s\S]*display:\s*none/.test(harness.html));
-assert('native result font inherits the workbench font', /\.match-text\s*\{[^}]*font-family:\s*inherit/.test(harness.html));
+assert('result tree uses the workbench font', /\.results\s*\{[^}]*font-family:\s*var\(--workbench-font-family\)/.test(harness.html));
+assert('workbench font maps to the VS Code UI font', /--workbench-font-family:\s*var\(--vscode-font-family\b/.test(harness.html));
+assert('result styles do not opt into the editor font', !/--vscode-editor-font-family/.test(harness.html));
 
 harness.elements.query.value = 'LoadComplete';
 const enter = {

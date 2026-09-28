@@ -25,10 +25,12 @@ class SourceSearchViewProvider {
 
     /**
      * @param {{engine?: object, searchService?: object, onOpenMatch?: function,
-     *   onOpenInEditor?: function, onSearch?: function, logger?: function}} [options]
+     *   onOpenInEditor?: function, onSearch?: function, logger?: function,
+     *   extensionUri?: object}} [options]
      */
     constructor(options = {}) {
         this.engine = options.engine || options.searchService || null;
+        this.extensionUri = options.extensionUri || null;
         this.onOpenMatch = options.onOpenMatch;
         this.onOpenInEditor = options.onOpenInEditor;
         this.onSearch = options.onSearch;
@@ -235,14 +237,20 @@ class SourceSearchViewProvider {
     _getHtml(webview) {
         const nonce = randomNonce();
         const cspSource = webview && webview.cspSource ? webview.cspSource : 'https:';
+        const codiconUri = codiconWebviewUri(webview, this.extensionUri);
+        const codiconFont = codiconUri
+            ? `@font-face { font-family: codicon; font-display: block; src: url("${codiconUri}") format("truetype"); }`
+            : '';
+        const fontSource = codiconUri ? `font-src ${cspSource};` : '';
         return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'unsafe-inline'; ${fontSource} script-src 'nonce-${nonce}';">
   <title>Go Source Search</title>
   <style>
+    ${codiconFont}
     :root {
       color-scheme: light dark;
       --muted: var(--vscode-descriptionForeground, #8b949e);
@@ -259,13 +267,14 @@ class SourceSearchViewProvider {
       --placeholder: var(--vscode-input-placeholderForeground, var(--vscode-descriptionForeground, #8b949e));
       --result-fg: var(--vscode-list-foreground, var(--vscode-foreground));
       --result-muted: var(--vscode-descriptionForeground, var(--muted));
+      --workbench-font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
     }
     * { box-sizing: border-box; }
     html, body { padding: 0; margin: 0; width: 100%; height: 100%; overflow: hidden; }
     body {
       color: var(--result-fg);
       background: var(--vscode-sideBar-background, var(--vscode-editor-background));
-      font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, sans-serif);
+      font-family: var(--workbench-font-family);
       font-size: var(--vscode-font-size, 13px);
       font-weight: 400;
       line-height: 1.45;
@@ -273,6 +282,14 @@ class SourceSearchViewProvider {
     button, input, select { font: inherit; color: inherit; }
     button { border: 0; background: transparent; cursor: pointer; }
     button:focus-visible, input:focus-visible, select:focus-visible { outline: 1px solid var(--vscode-focusBorder, #007fd4); outline-offset: -1px; }
+    .codicon { display: inline-block; font-family: codicon; font-size: 16px; font-style: normal; font-weight: normal; line-height: 1; speak: never; }
+    .codicon::before { text-decoration: inherit; }
+    /* These codepoints are the native VS Code @vscode/codicons glyphs. */
+    .codicon-case-sensitive::before { content: "\\eab1"; }
+    .codicon-chevron-right::before { content: "\\eab6"; }
+    .codicon-more::before { content: "\\ea7c"; }
+    .codicon-regex::before { content: "\\eb38"; }
+    .codicon-whole-word::before { content: "\\eb7e"; }
     .shell { display: flex; flex-direction: column; height: 100%; min-width: 0; }
     /* These offsets mirror VS Code's SearchView: the replace toggle is 16px
        wide and the input starts 18px after the widget edge. */
@@ -280,20 +297,19 @@ class SourceSearchViewProvider {
     .search-row { position: relative; display: flex; align-items: stretch; min-height: 26px; }
     .search-toggle { position: absolute; left: 0; top: 0; width: 16px; height: 26px; padding: 0; color: var(--muted); display: inline-flex; align-items: center; justify-content: center; border-radius: 3px; z-index: 1; }
     .search-toggle:hover { background: var(--hover); color: var(--vscode-foreground); }
-    .search-toggle svg { width: 16px; height: 16px; }
-    .search-box { flex: 1; min-width: 0; display: flex; align-items: center; gap: 0; height: 26px; margin-left: 18px; padding: 0 2px 0 0; background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 3px; }
+    .search-toggle .codicon { font-size: 16px; }
+    .search-box { position: relative; flex: 1; min-width: 0; display: block; height: 26px; margin-left: 18px; padding: 0 2px 0 0; background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 3px; }
     .search-box:focus-within { border-color: var(--vscode-focusBorder, #007fd4); }
-    #query { flex: 1 1 auto; width: auto; min-width: 0; height: 24px; padding: 3px 0 3px 6px; background: transparent; border: 0; outline: 0; color: var(--input-fg); font-size: var(--vscode-font-size, 13px); line-height: 18px; }
+    #query { display: block; width: 100%; min-width: 0; height: 24px; padding: 3px 68px 3px 6px; background: transparent; border: 0; outline: 0; color: var(--input-fg); font-size: var(--vscode-font-size, 13px); line-height: 18px; text-overflow: ellipsis; }
     #query::placeholder { color: var(--placeholder); opacity: 1; }
     #query::-webkit-search-cancel-button,
     #query::-webkit-search-decoration { -webkit-appearance: none; appearance: none; display: none; }
     #query::-ms-clear { display: none; }
-    .search-filter-controls { position: relative; z-index: 2; display: inline-flex; align-items: center; gap: 1px; flex: 0 0 auto; pointer-events: auto; }
-    .search-filter-btn { display: inline-flex; align-items: center; justify-content: center; min-width: 25px; height: 22px; padding: 0 3px; border-radius: 3px; color: var(--vscode-icon-foreground, var(--result-muted)); font-size: var(--vscode-font-size, 13px); font-weight: 400; line-height: 1; user-select: none; }
+    .search-filter-controls { position: absolute; top: 3px; right: 2px; z-index: 2; display: flex; align-items: center; height: 20px; gap: 0; pointer-events: auto; }
+    .search-filter-btn { display: inline-flex; align-items: center; justify-content: center; width: 20px; min-width: 20px; height: 20px; margin-left: 2px; padding: 1px; border: 1px solid transparent; border-radius: 3px; color: var(--vscode-icon-foreground, var(--result-muted)); font-size: 16px; font-weight: 400; line-height: 1; user-select: none; }
     .search-filter-btn:hover { background: var(--hover); color: var(--vscode-foreground); }
-    .search-filter-btn.active { color: var(--vscode-inputOption-activeForeground, var(--accent)); background: var(--vscode-inputOption-activeBackground, var(--vscode-toolbar-hoverBackground, rgba(80, 150, 220, .13))); outline: 1px solid var(--vscode-inputOption-activeBorder, var(--accent)); outline-offset: -1px; }
-    .search-filter-btn.word { text-decoration: underline; text-underline-offset: 2px; }
-    .search-filter-btn svg { width: 16px; height: 16px; }
+    .search-filter-btn.active { color: var(--vscode-inputOption-activeForeground, var(--accent)); background: var(--vscode-inputOption-activeBackground, var(--vscode-toolbar-hoverBackground, rgba(80, 150, 220, .13))); border-color: var(--vscode-inputOption-activeBorder, var(--accent)); }
+    .search-filter-btn .codicon { font-size: 16px; }
     .query-details { min-height: 16px; position: relative; margin: 0 0 0 18px; }
     .details-toggle { position: absolute; right: -2px; top: 0; width: 25px; height: 16px; padding: 0; color: var(--muted); font-size: 16px; line-height: 12px; border-radius: 3px; }
     .details-toggle:hover { background: var(--hover); color: var(--vscode-foreground); }
@@ -310,49 +326,49 @@ class SourceSearchViewProvider {
     .progress { height: 2px; margin: 0 12px; overflow: hidden; background: transparent; }
     .progress.busy::after { content: ""; display: block; height: 100%; width: 38%; background: var(--accent); animation: slide 1.05s ease-in-out infinite; }
     @keyframes slide { 0% { transform: translateX(-120%); } 55%, 100% { transform: translateX(290%); } }
-    .results { flex: 1; min-height: 0; overflow: auto; padding: 0 0 18px; }
+    .results { flex: 1; min-height: 0; overflow: auto; padding: 0 0 18px; font-family: var(--workbench-font-family); }
     .empty { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 7px; padding: 34px 18px; color: var(--muted); }
     .empty[hidden] { display: none !important; }
     .empty svg { width: 28px; height: 28px; opacity: .75; }
     .empty-title { color: var(--vscode-foreground); font-weight: 500; }
     .empty-hint { font-size: 12px; max-width: 240px; }
     .file { border-radius: 0; margin: 0; overflow: hidden; }
-    .file-head { display: flex; align-items: center; min-width: 0; gap: 0; height: 22px; min-height: 22px; line-height: 22px; padding: 0; border-radius: 0; cursor: pointer; }
+    .file-head { display: flex; align-items: center; min-width: 0; gap: 0; height: 22px; min-height: 22px; line-height: 22px; padding: 0; border-radius: 0; cursor: pointer; font-family: var(--workbench-font-family); }
     .file-head:hover { background: var(--hover); }
     .twisty { width: 16px; height: 22px; flex: 0 0 16px; display: inline-flex; align-items: center; justify-content: center; color: var(--muted); transition: transform .12s ease; transform: translateX(3px); }
     .twisty svg { width: 12px; height: 12px; }
     .file.collapsed .twisty { transform: translateX(3px) rotate(-90deg); }
     .file-icon { display: inline-flex; width: 19px; height: 22px; align-items: center; color: #00add8; flex: 0 0 19px; }
     .file-icon svg { width: 16px; height: 16px; }
-    .file-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--result-fg); font-size: var(--vscode-font-size, 13px); font-weight: 400; }
-    .file-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--result-muted); font-size: var(--vscode-font-size, 13px); font-weight: 400; margin-left: 6px; }
-    .count { flex: 0 0 auto; min-width: 18px; min-height: 18px; height: 18px; padding: 3px 5px; margin-left: auto; margin-right: 12px; display: inline-flex; justify-content: center; align-items: center; border-radius: 11px; color: var(--badge-fg); background: var(--badge); font-size: 11px; line-height: 11px; font-weight: 400; }
+    .file-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--result-fg); font-family: var(--workbench-font-family); font-size: var(--vscode-font-size, 13px); font-weight: 400; }
+    .file-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--result-muted); font-family: var(--workbench-font-family); font-size: var(--vscode-font-size, 13px); font-weight: 400; margin-left: 6px; }
+    .count { flex: 0 0 auto; min-width: 18px; min-height: 18px; height: 18px; padding: 3px 5px; margin-left: auto; margin-right: 12px; display: inline-flex; justify-content: center; align-items: center; border-radius: 11px; color: var(--badge-fg); background: var(--badge); font-family: var(--workbench-font-family); font-size: 11px; line-height: 11px; font-weight: 400; }
     .matches { margin-left: 22px; border-left: 1px solid var(--vscode-tree-indentGuidesStroke, var(--border)); padding: 0 0 0 6px; }
     .file.collapsed .matches { display: none; }
-    .match { display: flex; gap: 0; min-width: 0; padding: 0; border-radius: 0; cursor: pointer; color: var(--result-fg); line-height: 22px; font-weight: 400; }
+    .match { display: flex; gap: 0; min-width: 0; padding: 0; border-radius: 0; cursor: pointer; color: var(--result-fg); font-family: var(--workbench-font-family); line-height: 22px; font-weight: 400; }
     .match:hover { background: var(--hover); color: var(--result-fg); }
-    .line-number { flex: 0 0 auto; margin-left: 7px; margin-right: 4px; text-align: right; color: var(--result-muted); font-variant-numeric: tabular-nums; font-size: .9em; user-select: none; opacity: .7; }
-    .match-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: pre; color: inherit; font-family: inherit; font-size: inherit; }
+    .line-number { flex: 0 0 auto; margin-left: 7px; margin-right: 4px; text-align: right; color: var(--result-muted); font-family: var(--workbench-font-family); font-variant-numeric: tabular-nums; font-size: .9em; user-select: none; opacity: .7; }
+    .match-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: pre; color: inherit; font-family: var(--workbench-font-family); font-size: inherit; }
     mark { color: var(--vscode-editor-findMatchHighlightForeground, var(--vscode-foreground)); background: var(--vscode-editor-findMatchHighlightBackground, rgba(234, 198, 67, .3)); border: 1px solid var(--vscode-editor-findMatchHighlightBorder, transparent); border-radius: 0; padding: 0 1px; }
-    .result-ellipsis { padding: 3px 6px; color: var(--muted); font-size: 11px; }
+    .result-ellipsis { padding: 3px 6px; color: var(--muted); font-family: var(--workbench-font-family); font-size: 11px; }
   </style>
 </head>
 <body>
   <div class="shell">
     <header class="header">
       <div class="search-row">
-        <button class="search-toggle" id="search-toggle" type="button" title="Search options" aria-label="Search options" aria-expanded="false">${iconChevronSvg()}</button>
+        <button class="search-toggle" id="search-toggle" type="button" title="Search options" aria-label="Search options" aria-expanded="false"><span class="codicon codicon-chevron-right" aria-hidden="true"></span></button>
         <div class="search-box" role="search">
-          <input id="query" type="search" aria-label="Search source" autocomplete="off" spellcheck="false" placeholder="Search workspace and dependencies" />
+          <input id="query" type="search" aria-label="Search source" autocomplete="off" spellcheck="false" placeholder="Search" />
           <span class="search-filter-controls" aria-label="Search filters">
-            <button class="search-filter-btn" id="case" title="Match case" aria-label="Match case" aria-pressed="false">Aa</button>
-            <button class="search-filter-btn word" id="word" title="Match whole word" aria-label="Match whole word" aria-pressed="false">ab</button>
-            <button class="search-filter-btn" id="regex" title="Use regular expression" aria-label="Use regular expression" aria-pressed="false">${iconRegexSvg()}</button>
+            <button class="search-filter-btn" id="case" title="Match case" aria-label="Match case" aria-pressed="false"><span class="codicon codicon-case-sensitive" aria-hidden="true"></span></button>
+            <button class="search-filter-btn" id="word" title="Match whole word" aria-label="Match whole word" aria-pressed="false"><span class="codicon codicon-whole-word" aria-hidden="true"></span></button>
+            <button class="search-filter-btn" id="regex" title="Use regular expression" aria-label="Use regular expression" aria-pressed="false"><span class="codicon codicon-regex" aria-hidden="true"></span></button>
           </span>
         </div>
       </div>
       <div class="query-details" id="query-details">
-        <button class="details-toggle" id="details-toggle" type="button" title="Search options" aria-label="Search options" aria-expanded="false">…</button>
+        <button class="details-toggle" id="details-toggle" type="button" title="Search options" aria-label="Search options" aria-expanded="false"><span class="codicon codicon-more" aria-hidden="true"></span></button>
         <div class="scope-row" id="scope-row" hidden>
           <select class="scope" id="scope" aria-label="Search scope">
             <option value="all">All sources</option>
@@ -580,11 +596,14 @@ function normalizeBatch(batch) {
     return [batch];
 }
 
-function iconChevronSvg() {
-    return '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="m5.5 3.5 4.5 4.5-4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-}
-function iconRegexSvg() {
-    return '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5v13M2.5 4.2l11 7.6M13.5 4.2l-11 7.6" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round"/><circle cx="8" cy="8" r="1" fill="currentColor"/></svg>';
+function codiconWebviewUri(webview, extensionUri) {
+    if (!webview || !extensionUri || typeof webview.asWebviewUri !== 'function') return '';
+    if (!vscode.Uri || typeof vscode.Uri.joinPath !== 'function') return '';
+    try {
+        return String(webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'media', 'codicon.ttf')));
+    } catch (_) {
+        return '';
+    }
 }
 function iconCompassSvg() {
     return '<svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="11" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="m20.4 11.6-2.8 6.1-6 2.7 2.8-6.1z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>';

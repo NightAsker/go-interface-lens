@@ -382,6 +382,7 @@ function activate(context) {
     });
     sourceSearchView = new SourceSearchViewProvider({
         searchService: sourceSearchService,
+        extensionUri: context.extensionUri,
         logger: log,
         onOpenMatch: async (match) => {
             await navigateTo(
