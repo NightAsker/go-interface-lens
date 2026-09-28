@@ -116,6 +116,13 @@ function scopeLabel(scope) {
     return 'Workspace';
 }
 
+function scopeRank(scope) {
+    if (scope === 'workspace') return 0;
+    if (scope === 'dependency') return 1;
+    if (scope === 'stdlib') return 2;
+    return 3;
+}
+
 function dependencyLabel(directory) {
     const base = path.basename(directory);
     return base || directory;
@@ -478,7 +485,8 @@ class SourceSearchService {
 
         const results = [...byFile.values()]
             .filter((entry) => entry.matches.length > 0)
-            .sort((left, right) => left.file.localeCompare(right.file));
+            .sort((left, right) => scopeRank(left.scope) - scopeRank(right.scope)
+                || left.file.localeCompare(right.file));
         const batches = [];
         for (let index = 0; index < results.length; index += 50) batches.push(results.slice(index, index + 50));
         if (typeof progress.onBatch === 'function') {

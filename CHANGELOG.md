@@ -2,6 +2,17 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.1.9] - 2026-09-28
+
+### Changed
+
+- Use muted search-result text colors, preserve them inside match highlights,
+  and dim file paths and line numbers to match the native Search appearance.
+- Label dependency and standard-library results, with dependency package details
+  available on hover.
+- Show workspace results before dependency results in both search batches and
+  the result tree.
+
 ## [2.1.8] - 2026-09-28
 
 ### Changed

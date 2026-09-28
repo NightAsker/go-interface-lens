@@ -76,6 +76,9 @@ service
         assert('workspace source result is tagged as workspace', result.results.some((item) => item.scope === 'workspace'));
         assert('dependency source result is tagged as dependency', result.results.some((item) => item.scope === 'dependency'));
         assert('result includes one-based line information', result.results.every((item) => item.matches[0].line >= 1));
+        const firstWorkspace = result.results.findIndex((item) => item.scope === 'workspace');
+        const firstDependency = result.results.findIndex((item) => item.scope === 'dependency');
+        assert('workspace results are listed before dependency results', firstWorkspace >= 0 && firstDependency >= 0 && firstWorkspace < firstDependency);
 
         return service.search({
             query: 'CALL',

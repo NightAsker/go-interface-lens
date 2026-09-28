@@ -265,8 +265,9 @@ class SourceSearchViewProvider {
       --badge-fg: var(--vscode-badge-foreground, #fff);
       --input-fg: var(--vscode-input-foreground, var(--vscode-foreground));
       --placeholder: var(--vscode-input-placeholderForeground, var(--vscode-descriptionForeground, #8b949e));
-      --result-fg: var(--vscode-list-foreground, var(--vscode-foreground));
-      --result-muted: var(--vscode-descriptionForeground, var(--muted));
+      /* Native SearchView result rows use list.deemphasizedForeground. */
+      --result-fg: var(--vscode-list-deemphasizedForeground, var(--vscode-descriptionForeground, var(--vscode-foreground)));
+      --result-muted: var(--vscode-list-deemphasizedForeground, var(--vscode-descriptionForeground, var(--muted)));
       --workbench-font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
     }
     * { box-sizing: border-box; }
@@ -341,15 +342,18 @@ class SourceSearchViewProvider {
     .file-icon { display: inline-flex; width: 19px; height: 22px; align-items: center; color: #00add8; flex: 0 0 19px; }
     .file-icon svg { width: 16px; height: 16px; }
     .file-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--result-fg); font-family: var(--workbench-font-family); font-size: var(--vscode-font-size, 13px); font-weight: 400; }
-    .file-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--result-muted); font-family: var(--workbench-font-family); font-size: var(--vscode-font-size, 13px); font-weight: 400; margin-left: 6px; }
+    .file-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--result-fg); opacity: .7; font-family: var(--workbench-font-family); font-size: .9em; font-weight: 400; margin-left: .5em; }
+    .scope-label { flex: 0 0 auto; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-left: 8px; padding: 0 4px; border: 1px solid var(--vscode-panel-border, var(--border)); border-radius: 2px; color: var(--result-muted); background: transparent; font-family: var(--workbench-font-family); font-size: 11px; line-height: 16px; }
+    .scope-label.dependency { border-color: var(--vscode-textLink-foreground, var(--vscode-panel-border, var(--border))); }
+    .scope-label.stdlib { border-color: var(--vscode-textLink-foreground, var(--vscode-panel-border, var(--border))); }
     .count { flex: 0 0 auto; min-width: 18px; min-height: 18px; height: 18px; padding: 3px 5px; margin-left: auto; margin-right: 12px; display: inline-flex; justify-content: center; align-items: center; border-radius: 11px; color: var(--badge-fg); background: var(--badge); font-family: var(--workbench-font-family); font-size: 11px; line-height: 11px; font-weight: 400; }
     .matches { margin-left: 22px; border-left: 1px solid var(--vscode-tree-indentGuidesStroke, var(--border)); padding: 0 0 0 6px; }
     .file.collapsed .matches { display: none; }
     .match { display: flex; gap: 0; min-width: 0; padding: 0; border-radius: 0; cursor: pointer; color: var(--result-fg); font-family: var(--workbench-font-family); line-height: 22px; font-weight: 400; }
     .match:hover { background: var(--hover); color: var(--result-fg); }
-    .line-number { flex: 0 0 auto; margin-left: 7px; margin-right: 4px; text-align: right; color: var(--result-muted); font-family: var(--workbench-font-family); font-variant-numeric: tabular-nums; font-size: .9em; user-select: none; opacity: .7; }
+    .line-number { flex: 0 0 auto; margin-left: 7px; margin-right: 4px; text-align: right; color: var(--result-fg); font-family: var(--workbench-font-family); font-variant-numeric: tabular-nums; font-size: .9em; user-select: none; opacity: .7; }
     .match-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: pre; color: inherit; font-family: var(--workbench-font-family); font-size: inherit; }
-    mark { color: var(--vscode-editor-findMatchHighlightForeground, var(--vscode-foreground)); background: var(--vscode-editor-findMatchHighlightBackground, rgba(234, 198, 67, .3)); border: 1px solid var(--vscode-editor-findMatchHighlightBorder, transparent); border-radius: 0; padding: 0 1px; }
+    mark { color: inherit; background: var(--vscode-editor-findMatchHighlightBackground, rgba(234, 198, 67, .3)); border: 1px solid var(--vscode-editor-findMatchHighlightBorder, transparent); border-radius: 0; padding: 0 1px; }
     .result-ellipsis { padding: 3px 6px; color: var(--muted); font-family: var(--workbench-font-family); font-size: 11px; }
   </style>
 </head>
@@ -502,6 +506,17 @@ class SourceSearchViewProvider {
       const preview = String(text).trimStart();
       return { file: String(file), relativePath: raw.relativePath || '', line: Number.isFinite(line) ? line : 1, column: Number.isFinite(column) ? column : 1, text: String(text), preview, scope: raw.scope || '', scopeLabel: raw.scopeLabel || '', rootLabel: raw.rootLabel || '', module: raw.module || '', version: raw.version || '', unsaved: !!raw.unsaved, ranges: raw.ranges || [] };
     }
+    function scopeRank(scope) {
+      if (scope === 'workspace') return 0;
+      if (scope === 'dependency') return 1;
+      if (scope === 'stdlib') return 2;
+      return 3;
+    }
+    function sourceBadge(file) {
+      if (file.scope === 'dependency') return { className: 'dependency', text: 'Dependency', title: 'Dependency package' + (file.rootLabel ? ': ' + file.rootLabel : '') };
+      if (file.scope === 'stdlib') return { className: 'stdlib', text: 'Standard library', title: 'Go standard library' };
+      return null;
+    }
     function addMatches(batch) {
       if (!Array.isArray(batch)) batch = [batch];
       const flat = [];
@@ -531,10 +546,12 @@ class SourceSearchViewProvider {
     function render() {
       if (fileCount === 0) { empty.hidden = false; return; }
       empty.hidden = true; results.querySelectorAll('.file').forEach((node) => node.remove());
-      files.forEach((file) => {
+      [...files.values()].sort((left, right) => scopeRank(left.scope) - scopeRank(right.scope) || left.file.localeCompare(right.file)).forEach((file) => {
         const wrap = document.createElement('section'); wrap.className = 'file' + (file.collapsed ? ' collapsed' : ''); wrap.setAttribute('role', 'treeitem');
         const shown = displayFile(file);
-        wrap.innerHTML = '<div class="file-head" tabindex="0"><span class="twisty">' + icon('down') + '</span><span class="file-icon" aria-hidden="true">' + icon('go') + '</span><span class="file-name" title="' + esc(file.file) + '">' + esc(shown.name) + '</span><span class="file-path" title="' + esc(shown.parent) + '">' + esc(shown.parent) + '</span><span class="count">' + file.matches.length + '</span></div><div class="matches"></div>';
+        const badge = sourceBadge(file);
+        const badgeHtml = badge ? '<span class="scope-label ' + badge.className + '" title="' + esc(badge.title) + '">' + esc(badge.text) + '</span>' : '';
+        wrap.innerHTML = '<div class="file-head" tabindex="0"><span class="twisty">' + icon('down') + '</span><span class="file-icon" aria-hidden="true">' + icon('go') + '</span><span class="file-name" title="' + esc(file.file) + '">' + esc(shown.name) + '</span><span class="file-path" title="' + esc(shown.parent) + '">' + esc(shown.parent) + '</span>' + badgeHtml + '<span class="count">' + file.matches.length + '</span></div><div class="matches"></div>';
         const head = wrap.querySelector('.file-head'); head.addEventListener('click', () => { file.collapsed = !file.collapsed; wrap.classList.toggle('collapsed', file.collapsed); }); head.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); file.collapsed = !file.collapsed; wrap.classList.toggle('collapsed', file.collapsed); } });
         const list = wrap.querySelector('.matches'); file.matches.slice(0, 300).forEach((match) => { const row = document.createElement('div'); row.className = 'match'; row.setAttribute('role', 'treeitem'); row.title = 'Open ' + file.file + ':' + match.line; row.innerHTML = '<span class="line-number">' + esc(match.line) + ':</span><span class="match-text">' + highlight(match.preview) + '</span>'; row.addEventListener('click', () => vscode.postMessage({ type: 'openMatch', match })); list.appendChild(row); });
         if (file.matches.length > 300) { const more = document.createElement('div'); more.className = 'result-ellipsis'; more.textContent = '… ' + (file.matches.length - 300) + ' more matches'; list.appendChild(more); }
