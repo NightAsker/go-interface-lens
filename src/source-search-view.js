@@ -313,9 +313,10 @@ class SourceSearchViewProvider {
       --badge-fg: var(--vscode-badge-foreground, #fff);
       --input-fg: var(--vscode-input-foreground, var(--vscode-foreground));
       --placeholder: var(--vscode-input-placeholderForeground, var(--vscode-descriptionForeground, #8b949e));
-      /* Native SearchView result rows use list.deemphasizedForeground. */
-      --result-fg: var(--vscode-list-deemphasizedForeground, var(--vscode-descriptionForeground, var(--vscode-foreground)));
-      --result-muted: var(--vscode-list-deemphasizedForeground, var(--vscode-descriptionForeground, var(--muted)));
+      /* Native SearchView rows inherit the sidebar foreground. The list's
+         deemphasized foreground is for excluded items, not search results. */
+      --result-fg: var(--vscode-sideBar-foreground, var(--vscode-foreground));
+      --result-muted: var(--result-fg);
       --workbench-font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
     }
     * { box-sizing: border-box; }
@@ -470,10 +471,15 @@ class SourceSearchViewProvider {
       if (name === 'go') return '<svg viewBox="0 0 16 16" aria-hidden="true">' + paths.go + '/></svg>';
       return '<svg viewBox="0 0 14 14" aria-hidden="true">' + (paths[name] || paths.file) + '</svg>';
     }
-    function highlight(text) {
-      const value = String(text == null ? '' : text);
+    function findMatchRanges(text, ranges) {
+      // Search engines report offsets in the original line, before preview
+      // trimming. Using those offsets also preserves anchored regex matches.
+      if (Array.isArray(ranges) && ranges.length) {
+        return ranges.filter((range) => Number.isInteger(range.start) && Number.isInteger(range.end) && range.start >= 0 && range.end >= range.start && range.end <= text.length)
+          .sort((left, right) => left.start - right.start);
+      }
       const q = String(latestOptions.query || '');
-      if (!q) return esc(value);
+      if (!q) return [];
       let source = q;
       if (!latestOptions.useRegex) {
         let escaped = '';
@@ -483,14 +489,48 @@ class SourceSearchViewProvider {
         }
         source = escaped;
       }
-      if (latestOptions.wholeWord) source = '\\\\b' + source + '\\\\b';
+      if (latestOptions.wholeWord) source = '\\\\b(?:' + source + ')\\\\b';
       let re;
-      try { re = new RegExp(source, latestOptions.matchCase ? 'g' : 'gi'); } catch (_) { return esc(value); }
-      let output = '', last = 0, match;
-      while ((match = re.exec(value))) {
-        output += esc(value.slice(last, match.index)) + '<mark>' + esc(match[0]) + '</mark>';
-        last = match.index + match[0].length;
+      try { re = new RegExp(source, latestOptions.matchCase ? 'g' : 'gi'); } catch (_) { return []; }
+      const found = [];
+      let match;
+      while ((match = re.exec(text))) {
+        found.push({ start: match.index, end: match.index + match[0].length });
         if (!match[0].length) re.lastIndex++;
+      }
+      return found;
+    }
+    function shortenMatchPrefix(text) {
+      // VS Code's Match.preview() uses lcut(before, 26, '…'): keep nearby
+      // context at a word boundary instead of hiding the match off-screen.
+      const value = text.trimStart();
+      if (value.length < 26) return value;
+      const boundary = /\\b/g;
+      let start = 0;
+      while (boundary.test(value) && value.length - boundary.lastIndex >= 26) {
+        start = boundary.lastIndex;
+        boundary.lastIndex++;
+      }
+      return start === 0 ? value : '…' + value.slice(start).trimStart();
+    }
+    function matchPreview(text, ranges) {
+      const start = ranges.length ? ranges[0].start : text.length;
+      const before = ranges.length ? shortenMatchPrefix(text.slice(0, start)) : text.trimStart();
+      const value = (before + text.slice(start)).slice(0, 250);
+      const offset = before.length - start;
+      return {
+        text: value,
+        ranges: ranges.map((range) => ({ start: range.start + offset, end: Math.min(range.end + offset, value.length) }))
+          .filter((range) => range.start >= 0 && range.start < value.length),
+      };
+    }
+    function highlight(preview) {
+      const value = preview.text;
+      let output = '', last = 0;
+      for (const range of preview.ranges) {
+        if (range.start < last) continue;
+        output += esc(value.slice(last, range.start)) + '<mark>' + esc(value.slice(range.start, range.end)) + '</mark>';
+        last = range.end;
       }
       return output + esc(value.slice(last));
     }
@@ -573,11 +613,10 @@ class SourceSearchViewProvider {
       if (!file) return null;
       const line = Number(raw.line || raw.lineNumber || 1);
       const column = Number(raw.column || raw.columnNumber || 1);
-      const text = raw.text == null ? (raw.preview == null ? '' : raw.preview) : raw.text;
-      // ripgrep returns the complete source line. Native Search renders the
-      // matching line as a compact preview and removes its indentation.
-      const preview = String(text).trimStart();
-      return { file: String(file), relativePath: raw.relativePath || '', line: Number.isFinite(line) ? line : 1, column: Number.isFinite(column) ? column : 1, text: String(text), preview, scope: raw.scope || '', scopeLabel: raw.scopeLabel || '', rootLabel: raw.rootLabel || '', module: raw.module || '', version: raw.version || '', unsaved: !!raw.unsaved, ranges: raw.ranges || [] };
+      const text = String(raw.text == null ? (raw.preview == null ? '' : raw.preview) : raw.text);
+      const ranges = findMatchRanges(text, raw.ranges);
+      const preview = matchPreview(text, ranges);
+      return { file: String(file), relativePath: raw.relativePath || '', line: Number.isFinite(line) ? line : 1, column: Number.isFinite(column) ? column : 1, text, preview, scope: raw.scope || '', scopeLabel: raw.scopeLabel || '', rootLabel: raw.rootLabel || '', module: raw.module || '', version: raw.version || '', unsaved: !!raw.unsaved, ranges };
     }
     function scopeRank(scope) {
       if (scope === 'workspace') return 0;

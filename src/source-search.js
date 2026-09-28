@@ -241,8 +241,8 @@ function parseMatchRecord(record, rootInfo) {
             : 1,
         text: line,
         ranges: (data.submatches || []).map((submatch) => ({
-            start: Number(submatch.start) || 0,
-            end: Number(submatch.end) || Number(submatch.start) || 0,
+            start: byteOffsetToColumn(sourceLine, Number(submatch.start) || 0) - 1,
+            end: byteOffsetToColumn(sourceLine, Number(submatch.end) || Number(submatch.start) || 0) - 1,
             text: submatch.match && submatch.match.text ? submatch.match.text : '',
         })),
         root: rootInfo,

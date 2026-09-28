@@ -89,6 +89,17 @@ service
     })
     .then((result) => {
         eq('case-sensitive workspace search can return no match', result.totalMatches, 0);
+        const text = '\t// 中文😀: CheckLocalLifeUpgrade + CheckLocalLifeUpgrade';
+        fs.writeFileSync(path.join(workspace, 'pkg', 'unicode.go'), 'package pkg\n' + text + '\n');
+        return service.search({ query: 'CheckLocalLifeUpgrade', scope: 'workspace' }).then((unicodeResult) => {
+            const match = unicodeResult.results[0].matches[0];
+            const expected = matchTextLines(text, createMatcher('CheckLocalLifeUpgrade', {}))[0];
+            eq('ripgrep Unicode ranges use the same character offsets as in-memory search', match.ranges, expected.ranges);
+            eq('Unicode navigation uses the original one-based column', match.column, expected.column);
+            assert('every Unicode range slices the actual matched text', match.ranges.every((range) => match.text.slice(range.start, range.end) === range.text));
+        });
+    })
+    .then(() => {
         fs.rmSync(tmp, { recursive: true, force: true });
         done();
     })

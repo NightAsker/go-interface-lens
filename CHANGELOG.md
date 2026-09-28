@@ -2,6 +2,17 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.1.12] - 2026-09-28
+
+### Fixed
+
+- Inherit the sidebar foreground for source-search results, matching native
+  Search colors instead of using the gray reserved for deemphasized items.
+- Shorten long match previews at word boundaries with a leading ellipsis,
+  keeping nearby context and the matched text visible like native Search.
+- Preserve match highlights and original navigation positions after preview
+  trimming, including anchored regexes and source lines containing Unicode.
+
 ## [2.1.11] - 2026-09-28
 
 ### Changed

@@ -67,12 +67,38 @@ class Element {
         return this.attributes.get(name);
     }
 
+    set innerHTML(value) {
+        this.html = value;
+        this.children = [];
+    }
+
+    get innerHTML() {
+        return this.html;
+    }
+
     appendChild(child) {
+        this.children.push(child);
+        child.parent = this;
         return child;
     }
 
-    querySelectorAll() {
-        return [];
+    remove() {
+        this.parent.children = this.parent.children.filter((child) => child !== this);
+    }
+
+    querySelector(selector) {
+        const existing = this.querySelectorAll(selector)[0];
+        if (existing) return existing;
+        const child = new Element(selector);
+        child.className = selector.slice(1);
+        return this.appendChild(child);
+    }
+
+    querySelectorAll(selector) {
+        return this.children.flatMap((child) => [
+            ...((child.className || '').split(' ').includes(selector.slice(1)) ? [child] : []),
+            ...child.querySelectorAll(selector),
+        ]);
     }
 }
 
@@ -159,7 +185,8 @@ assert('native input clear button is hidden', /#query::\-webkit-search-cancel-bu
 assert('result tree uses the workbench font', /\.results\s*\{[^}]*font-family:\s*var\(--workbench-font-family\)/.test(harness.html));
 assert('workbench font maps to the VS Code UI font', /--workbench-font-family:\s*var\(--vscode-font-family\b/.test(harness.html));
 assert('result styles do not opt into the editor font', !/--vscode-editor-font-family/.test(harness.html));
-assert('result rows use native deemphasized foreground', /--result-fg:\s*var\(--vscode-list-deemphasizedForeground\b/.test(harness.html));
+assert('result rows inherit the native sidebar foreground', /--result-fg:\s*var\(--vscode-sideBar-foreground,\s*var\(--vscode-foreground\)\)/.test(harness.html));
+assert('regular search results do not use excluded-item gray', !/--vscode-list-deemphasizedForeground/.test(harness.html));
 assert('match highlights keep the native result text color', /mark\s*\{[^}]*color:\s*inherit/.test(harness.html));
 assert('file paths use native deemphasized opacity', /\.file-path\s*\{[^}]*color:\s*var\(--result-fg\)[^}]*opacity:\s*\.7[^}]*font-size:\s*\.9em/.test(harness.html));
 assert('line numbers use native deemphasized opacity', /\.line-number\s*\{[^}]*color:\s*var\(--result-fg\)[^}]*font-size:\s*\.9em[^}]*[^}]*opacity:\s*\.7/.test(harness.html));
@@ -189,6 +216,59 @@ for (const [id, option] of [['case', 'matchCase'], ['word', 'wholeWord'], ['rege
     const message = harness.messages[harness.messages.length - 1];
     eq(`${id} sends its search option`, message.options[option], true);
 }
+
+console.log('\n== native match previews ==');
+const previews = createWebviewHarness();
+const searchTerm = 'CheckLocalLifeUpgrade';
+function renderMatch(text, options = {}, ranges) {
+    const column = Math.max(0, text.indexOf(searchTerm)) + 1;
+    previews.window.dispatch('message', { data: {
+        type: 'searchStarted', options: { query: searchTerm, ...options },
+    } });
+    previews.window.dispatch('message', { data: { type: 'appendResults', results: [{
+        file: '/workspace/core/conversation/handler.go', line: 660, column, text, ranges,
+        scope: 'workspace',
+    }] } });
+    return previews.elements.results.querySelectorAll('.match')[0];
+}
+const longLine = '\tvar skipNotify = !strings.IsBlank(r.Extra[define.CORE_INFO_FROM_SYNC]) && localLifeBcMainStore && !paasTcc.CheckLocalLifeUpgrade(ctx, shopId)';
+const longRow = renderMatch(longLine);
+assert('long handler preview starts near the match at a word boundary', longRow.innerHTML.includes('…localLifeBcMainStore &amp;&amp; !paasTcc.<mark>CheckLocalLifeUpgrade</mark>'));
+assert('long handler preview omits the unrelated prefix', !longRow.innerHTML.includes('skipNotify'));
+longRow.dispatch('click');
+const opened = previews.messages.at(-1);
+eq('cropped result opens the original file and line', [opened.type, opened.match.file, opened.match.line], ['openMatch', '/workspace/core/conversation/handler.go', 660]);
+eq('cropped result opens the original column', opened.match.column, longLine.indexOf(searchTerm) + 1);
+eq('cropping preserves the full source for opening and export', opened.match.text, longLine);
+previews.elements['open-editor'].dispatch('click');
+eq('export keeps the full original source line', previews.messages.at(-1).results[0].text, longLine);
+
+const shortRow = renderMatch('\tmainStoreGray = paasTcc.CheckLocalLifeUpgrade(ctx, shopId)');
+assert('short context stays intact without an ellipsis', shortRow.innerHTML.includes('mainStoreGray = paasTcc.<mark>CheckLocalLifeUpgrade</mark>'));
+assert('short context only removes indentation', !shortRow.innerHTML.includes('…') && !shortRow.innerHTML.includes('\t'));
+const wholeWordRow = renderMatch('CheckLocalLifeUpgradeBuyer CheckLocalLifeUpgrade', { wholeWord: true });
+assert('whole-word preview centers on the actual match', wholeWordRow.innerHTML.includes('CheckLocalLifeUpgradeBuyer <mark>CheckLocalLifeUpgrade</mark>'));
+eq('whole-word preview does not highlight a larger identifier', (wholeWordRow.innerHTML.match(/<mark>/g) || []).length, 1);
+
+const anchoredText = '\t\tCheckLocalLifeUpgrade';
+const anchoredRow = renderMatch(anchoredText, { query: '^\\s+CheckLocalLifeUpgrade', useRegex: true }, [{ start: 0, end: anchoredText.length }]);
+assert('anchored regex keeps whitespace inside the actual match', anchoredRow.innerHTML.includes('<mark>' + anchoredText + '</mark>'));
+const repeatedRow = renderMatch('CheckLocalLifeUpgrade + CheckLocalLifeUpgrade');
+eq('multiple visible matches retain their highlights', (repeatedRow.innerHTML.match(/<mark>/g) || []).length, 2);
+const unicodeText = '\t// 中文😀 检查: CheckLocalLifeUpgrade';
+const unicodeStart = unicodeText.indexOf(searchTerm);
+const unicodeRow = renderMatch(unicodeText, {}, [{ start: unicodeStart, end: unicodeStart + searchTerm.length }]);
+assert('Unicode context keeps the match highlight aligned', unicodeRow.innerHTML.includes('中文😀 检查: <mark>CheckLocalLifeUpgrade</mark>'));
+const escapedRow = renderMatch('<tag>& CheckLocalLifeUpgrade("<script>")');
+assert('preview escapes source markup', escapedRow.innerHTML.includes('&lt;tag&gt;&amp; <mark>CheckLocalLifeUpgrade</mark>(&quot;&lt;script&gt;&quot;)'));
+
+renderMatch(longLine + ' + trailingContext'.repeat(40)).dispatch('click');
+eq('preview is bounded to the native 250 characters', previews.messages.at(-1).match.preview.text.length, 250);
+assert('bounded preview still shows the searched identifier', previews.messages.at(-1).match.preview.text.includes(searchTerm));
+const noMatch = renderMatch('plain source', { query: '[' , useRegex: true });
+assert('invalid fallback regex still renders the source safely', noMatch.innerHTML.includes('plain source'));
+const zeroLength = renderMatch('abc', { query: '^', useRegex: true });
+assert('zero-length regex preview terminates and preserves the line', zeroLength.innerHTML.includes('<mark></mark>abc'));
 
 console.log('\n== search after typing pauses ==');
 const typing = createWebviewHarness();
