@@ -20,6 +20,15 @@ function isPromise(value) {
     return value && typeof value.then === 'function';
 }
 
+function searchConfiguration() {
+    const config = vscode.workspace.getConfiguration?.('search');
+    const delay = config?.get('searchOnTypeDebouncePeriod', 300);
+    return {
+        searchOnType: config?.get('searchOnType', true) !== false,
+        searchOnTypeDebouncePeriod: Number.isFinite(delay) ? Math.max(0, delay) : 300,
+    };
+}
+
 class SourceSearchViewProvider {
     static viewType = VIEW_TYPE;
 
@@ -100,6 +109,14 @@ class SourceSearchViewProvider {
             if (visibility && typeof visibility.dispose === 'function') this._disposables.push(visibility);
         }
 
+        if (typeof vscode.workspace.onDidChangeConfiguration === 'function') {
+            this._disposables.push(vscode.workspace.onDidChangeConfiguration((event) => {
+                if (event.affectsConfiguration('search.searchOnType') || event.affectsConfiguration('search.searchOnTypeDebouncePeriod')) {
+                    this._post({ type: 'searchConfiguration', ...searchConfiguration() });
+                }
+            }));
+        }
+
         if (typeof webviewView.onDidDispose === 'function') {
             const dispose = webviewView.onDidDispose(() => this.dispose());
             if (dispose && typeof dispose.dispose === 'function') this._disposables.push(dispose);
@@ -111,6 +128,7 @@ class SourceSearchViewProvider {
         switch (message.type) {
             case 'ready':
                 this._webviewReady = true;
+                this._post({ type: 'searchConfiguration', ...searchConfiguration() });
                 this._focusInputIfRequested();
                 return;
             case 'search':
@@ -161,6 +179,7 @@ class SourceSearchViewProvider {
 
         this._post({ type: 'searchStarted', options: normalized });
         if (!normalized.query) {
+            this._searchAbort = null;
             this._post({ type: 'searchFinished', resultCount: 0, fileCount: 0 });
             return;
         }
@@ -169,6 +188,7 @@ class SourceSearchViewProvider {
             if (typeof this.onSearch === 'function') {
                 await this.onSearch(normalized);
             }
+            if (searchId !== this._searchId || controller.signal.aborted) return;
 
             if (!this.engine || typeof this.engine.search !== 'function') {
                 this._post({ type: 'searchFinished', resultCount: 0, fileCount: 0 });
@@ -207,7 +227,9 @@ class SourceSearchViewProvider {
                 truncated: !!(result && result.truncated),
             });
         } catch (error) {
-            if (searchId !== this._searchId || controller.signal.aborted || isAbortError(error)) {
+            // A superseded search must not stop the newer search's progress UI.
+            if (searchId !== this._searchId || controller.signal.aborted) return;
+            if (isAbortError(error)) {
                 this._post({ type: 'searchFinished', cancelled: true });
                 return;
             }
@@ -436,6 +458,9 @@ class SourceSearchViewProvider {
     let fileCount = 0;
     let lastBatch = [];
     let truncated = false;
+    let searchSettings = ${JSON.stringify(searchConfiguration())};
+    let searchTimer = null;
+    let composing = false;
 
     function esc(value) {
       return String(value == null ? '' : value).replace(/[&<>"']/g, (ch) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[ch]));
@@ -469,8 +494,22 @@ class SourceSearchViewProvider {
       }
       return output + esc(value.slice(last));
     }
+    function cancelScheduledSearch() {
+      if (searchTimer !== null) clearTimeout(searchTimer);
+      searchTimer = null;
+    }
+    function scheduleSearch() {
+      cancelScheduledSearch();
+      if (composing) return;
+      if (!query.value.trim()) { vscode.postMessage({ type: 'clearResults' }); return; }
+      if (!searchSettings.searchOnType) return;
+      searchTimer = setTimeout(sendSearch, searchSettings.searchOnTypeDebouncePeriod);
+    }
     function sendSearch() {
+      cancelScheduledSearch();
+      if (composing) return;
       const value = query.value.trim();
+      if (!value) { vscode.postMessage({ type: 'clearResults' }); return; }
       latestOptions = { query: value, scope: scope.value, useRegex: filters.regex, regex: filters.regex, matchCase: filters.matchCase, caseSensitive: filters.matchCase, wholeWord: filters.wholeWord };
       vscode.postMessage({ type: 'search', options: latestOptions });
     }
@@ -500,12 +539,20 @@ class SourceSearchViewProvider {
     }
     searchToggle.addEventListener('click', toggleDetails);
     detailsToggle.addEventListener('click', toggleDetails);
+    query.addEventListener('input', (event) => {
+      if (event.isComposing) { cancelScheduledSearch(); return; }
+      scheduleSearch();
+    });
+    query.addEventListener('compositionstart', () => { composing = true; cancelScheduledSearch(); });
+    query.addEventListener('compositionend', () => { composing = false; scheduleSearch(); });
     query.addEventListener('keydown', (event) => {
+      if (composing || event.isComposing || event.keyCode === 229) return;
       if (event.key === 'Enter') {
         event.preventDefault();
         sendSearch();
       } else if (event.key === 'Escape') {
         event.preventDefault();
+        cancelScheduledSearch();
         if (running) vscode.postMessage({ type: 'cancel' });
         else { query.value = ''; vscode.postMessage({ type: 'clearResults' }); }
       }
@@ -595,6 +642,12 @@ class SourceSearchViewProvider {
     window.addEventListener('message', (event) => {
       const message = event.data || {};
       switch (message.type) {
+        case 'searchConfiguration': {
+          const changed = searchSettings.searchOnType !== message.searchOnType || searchSettings.searchOnTypeDebouncePeriod !== message.searchOnTypeDebouncePeriod;
+          searchSettings = message;
+          if (changed && searchTimer !== null) scheduleSearch();
+          break;
+        }
         case 'focusQuery': query.focus(); break;
         case 'searchStarted': latestOptions = message.options || latestOptions; syncFilterButtons(latestOptions); reset(); running = true; updateStatus(); break;
         case 'appendResults': addMatches(message.results || message.batch || []); break;
@@ -607,7 +660,7 @@ class SourceSearchViewProvider {
           if (Number.isFinite(message.fileCount)) fileCount = Math.max(fileCount, message.fileCount);
           truncated = truncated || !!message.truncated; running = false; updateStatus(!!message.cancelled); break;
         case 'searchError': running = false; updateStatus(); status.textContent = message.message || 'Search failed'; break;
-        case 'clearResults': running = false; reset(); updateStatus(); break;
+        case 'clearResults': running = false; latestOptions = {}; reset(); updateStatus(); break;
       }
     });
     vscode.postMessage({ type: 'ready' });

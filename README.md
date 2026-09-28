@@ -1,6 +1,6 @@
 # Go Interface Lens
 
-[![Version](https://img.shields.io/badge/version-2.1.10-blue.svg)](https://github.com/NightAsker/go-interface-lens)
+[![Version](https://img.shields.io/badge/version-2.1.11-blue.svg)](https://github.com/NightAsker/go-interface-lens)
 [![VSCode](https://img.shields.io/badge/VSCode-1.76+-green.svg)](https://code.visualstudio.com/)
 
 一个面向大型 Go 工程的 VS Code / Cursor 接口导航扩展。它在接口、接口方法和具体实现之间提供双向 CodeLens，同时使用按查询的声明搜索和按需 AST 校验兼顾响应速度与查找准确性。
@@ -112,6 +112,8 @@ WASM、Go grammar WASM 和 MIT 许可证；依赖包里的其他语言 grammar �
 ### 搜索工程和依赖源码
 
 点击 Activity Bar 中的 Go Source Search 图标，或执行 `Go: Search Source`。搜索面板会按文件分组显示匹配行，支持普通文本、正则表达式、区分大小写、整词匹配，以及工程、依赖包和标准库范围切换。点击匹配行会打开对应源码并定位到列位置。
+
+默认停止输入 300 毫秒后自动搜索，按 Enter 可立即搜索。该行为跟随 VS Code 的 `search.searchOnType` 和 `search.searchOnTypeDebouncePeriod` 设置；中文输入法选字期间不会触发搜索。
 
 搜索默认覆盖 `.go`、`go.mod`、`go.sum`、`go.work` 和 `go.work.sum`。依赖搜索只访问当前项目 `go.mod` 锁定的 module 版本和本地 `replace` 目录，不会把 module cache 中的旧版本混入结果。
 

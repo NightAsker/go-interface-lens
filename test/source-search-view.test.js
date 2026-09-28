@@ -114,6 +114,20 @@ function createWebviewHarness() {
             messages.push(message);
         },
     };
+    let now = 0;
+    let nextTimer = 0;
+    const timers = new Map();
+    function tick(ms) {
+        const end = now + ms;
+        while (true) {
+            const next = [...timers.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+            if (!next || next[1].at > end) break;
+            now = next[1].at;
+            timers.delete(next[0]);
+            next[1].callback();
+        }
+        now = end;
+    }
 
     try {
         new Function('acquireVsCodeApi', 'document', 'window', script);
@@ -127,9 +141,15 @@ function createWebviewHarness() {
         document,
         window,
         acquireVsCodeApi: () => vscode,
+        setTimeout(callback, delay) {
+            const id = ++nextTimer;
+            timers.set(id, { callback, at: now + delay });
+            return id;
+        },
+        clearTimeout(id) { timers.delete(id); },
         console,
     }, { filename: 'source-search-webview.js' });
-    return { elements, messages, window, html };
+    return { elements, messages, window, html, tick };
 }
 
 console.log('== source search Webview interactions ==');
@@ -169,6 +189,121 @@ for (const [id, option] of [['case', 'matchCase'], ['word', 'wholeWord'], ['rege
     const message = harness.messages[harness.messages.length - 1];
     eq(`${id} sends its search option`, message.options[option], true);
 }
+
+console.log('\n== search after typing pauses ==');
+const typing = createWebviewHarness();
+const query = typing.elements.query;
+const searches = () => typing.messages.filter((message) => message.type === 'search');
+const key = (key, extra = {}) => query.dispatch('keydown', { key, preventDefault() {}, ...extra });
+function input(value, event = {}) {
+    query.value = value;
+    query.dispatch('input', event);
+}
+function configure(searchOnType, searchOnTypeDebouncePeriod) {
+    typing.window.dispatch('message', { data: { type: 'searchConfiguration', searchOnType, searchOnTypeDebouncePeriod } });
+}
+
+input('Load');
+typing.tick(299);
+eq('typing waits for the default debounce period', searches().length, 0);
+input('LoadComplete');
+typing.tick(299);
+eq('further typing restarts the delay', searches().length, 0);
+typing.tick(1);
+eq('pause searches the latest query once', searches().map((message) => message.options.query), ['LoadComplete']);
+typing.tick(1000);
+eq('an unchanged query does not repeatedly search', searches().length, 1);
+
+input('Pasted text', { inputType: 'insertFromPaste' });
+typing.tick(300);
+eq('pasting also triggers automatic search', searches().at(-1).options.query, 'Pasted text');
+input('Immediate');
+const beforeEnter = searches().length;
+key('Enter');
+eq('Enter submits before the timer expires', searches().length, beforeEnter + 1);
+typing.tick(500);
+eq('Enter cancels the duplicate delayed search', searches().length, beforeEnter + 1);
+
+for (const [id, option] of [['case', 'matchCase'], ['word', 'wholeWord'], ['regex', 'regex']]) {
+    input('filtered ' + id);
+    const before = searches().length;
+    typing.elements[id].dispatch('click', { preventDefault() {}, stopPropagation() {} });
+    eq(`${id} immediately searches while typing is pending`, searches().length, before + 1);
+    eq(`${id} includes the new option`, searches().at(-1).options[option], true);
+    typing.tick(500);
+    eq(`${id} cancels the delayed duplicate`, searches().length, before + 1);
+}
+input('scoped');
+const beforeScope = searches().length;
+typing.elements.scope.value = 'workspace';
+typing.elements.scope.dispatch('change');
+eq('scope immediately searches the selected scope', searches().at(-1).options.scope, 'workspace');
+typing.tick(500);
+eq('scope cancels the delayed duplicate', searches().length, beforeScope + 1);
+
+input('pending');
+const beforeClear = searches().length;
+input('');
+eq('clearing input immediately clears results', typing.messages.at(-1).type, 'clearResults');
+typing.tick(500);
+eq('clearing input cancels queued searches', searches().length, beforeClear);
+key('Enter');
+eq('empty Enter clears instead of searching', typing.messages.at(-1).type, 'clearResults');
+typing.window.dispatch('message', { data: { type: 'clearResults' } });
+eq('clearing restores the initial prompt', typing.elements.status.textContent, 'Type to search source');
+
+input('cancel pending');
+key('Escape');
+eq('Escape clears an idle query', query.value, '');
+typing.tick(500);
+eq('Escape cancels a queued search', searches().length, beforeClear);
+typing.window.dispatch('message', { data: { type: 'searchStarted', options: { query: 'running' } } });
+input('next query');
+key('Escape');
+eq('Escape cancels an active search', typing.messages.at(-1).type, 'cancel');
+typing.tick(500);
+eq('Escape does not restart an active search from its queued timer', searches().length, beforeClear);
+
+input('zhong');
+query.dispatch('compositionstart');
+typing.tick(500);
+eq('starting composition cancels an earlier timer', searches().length, beforeClear);
+input('中文', { isComposing: true });
+key('Enter', { isComposing: true });
+key('Escape', { isComposing: true });
+typing.tick(500);
+eq('composition input and confirmation do not search', searches().length, beforeClear);
+eq('composition Escape does not clear the input', query.value, '中文');
+query.dispatch('compositionend');
+key('Enter', { keyCode: 229 });
+input('中文');
+typing.tick(299);
+eq('committed composition waits for the debounce', searches().length, beforeClear);
+typing.tick(1);
+eq('committed composition searches once', searches().length, beforeClear + 1);
+eq('composition searches the committed characters', searches().at(-1).options.query, '中文');
+
+configure(true, 650);
+input('custom delay');
+const beforeSettings = searches().length;
+typing.tick(649);
+eq('native custom debounce period is respected', searches().length, beforeSettings);
+typing.tick(1);
+eq('custom debounce eventually submits', searches().length, beforeSettings + 1);
+input('disabled pending');
+configure(false, 650);
+typing.tick(1000);
+eq('disabling native search-on-type cancels its queued search', searches().length, beforeSettings + 1);
+input('manual');
+typing.tick(1000);
+eq('disabled native search-on-type waits for Enter', searches().length, beforeSettings + 1);
+key('Enter');
+eq('Enter still works with automatic searching disabled', searches().at(-1).options.query, 'manual');
+configure(true, 300);
+input('updated delay');
+configure(true, 100);
+typing.tick(100);
+eq('updating the native delay reschedules pending input', searches().at(-1).options.query, 'updated delay');
 
 async function testSearchFocus() {
     console.log('\n== source search shortcut focus ==');
@@ -218,7 +353,7 @@ async function testSearchFocus() {
         const first = createView();
         eq('focus message waits for Webview readiness', outgoing.length, 0);
         first.ready();
-        eq('ready Webview receives the pending focus request', outgoing, [{ type: 'focusQuery' }]);
+        eq('ready Webview receives the pending focus request', outgoing.at(-1), { type: 'focusQuery' });
         eq('first shortcut focuses the query input', harness.elements.query.focusCalls, 1);
         eq('focusing preserves the existing query', harness.elements.query.value, 'LoadComplete');
 
@@ -263,7 +398,100 @@ async function testSearchFocus() {
     }
 }
 
-testSearchFocus().then(done).catch((error) => {
+async function testNativeSearchConfiguration() {
+    console.log('\n== native search settings ==');
+    const vscode = require(stubPath);
+    const originalWorkspace = vscode.workspace;
+    const settings = { searchOnType: false, searchOnTypeDebouncePeriod: 450 };
+    let changed;
+    let disposed = false;
+    vscode.workspace = {
+        ...originalWorkspace,
+        getConfiguration(section) {
+            eq('reads VS Code native search configuration', section, 'search');
+            return { get: (key, fallback) => settings[key] ?? fallback };
+        },
+        onDidChangeConfiguration(listener) {
+            changed = listener;
+            return { dispose() { disposed = true; } };
+        },
+    };
+    const provider = new SourceSearchViewProvider();
+    try {
+        const configured = createWebviewHarness();
+        configured.elements.query.value = 'manual setting';
+        configured.elements.query.dispatch('input');
+        configured.tick(1000);
+        eq('initial Webview respects a disabled native setting', configured.messages.filter((message) => message.type === 'search').length, 0);
+        const outgoing = [];
+        provider.resolveWebviewView({ webview: {
+            postMessage(message) {
+                outgoing.push(message);
+                configured.window.dispatch('message', { data: message });
+            },
+        } });
+        await provider._handleMessage({ type: 'ready' });
+        eq('ready Webview receives current native settings', outgoing.at(-1), { type: 'searchConfiguration', ...settings });
+        const before = outgoing.length;
+        changed({ affectsConfiguration: () => false });
+        eq('unrelated setting updates do not affect search', outgoing.length, before);
+        settings.searchOnType = true;
+        changed({ affectsConfiguration: (key) => key === 'search.searchOnType' });
+        configured.elements.query.dispatch('input');
+        configured.tick(449);
+        eq('host setting update preserves the custom delay', configured.messages.filter((message) => message.type === 'search').length, 0);
+        configured.tick(1);
+        eq('host setting updates enable automatic search without reload', configured.messages.at(-1).type, 'search');
+    } finally {
+        provider.dispose();
+        vscode.workspace = originalWorkspace;
+    }
+    assert('disposing the view removes its settings listener', disposed);
+}
+
+async function testOverlappingSearches() {
+    console.log('\n== overlapping automatic searches ==');
+    for (const ending of ['AbortError', 'Error', 'success']) {
+        const requests = [];
+        const provider = new SourceSearchViewProvider({ engine: {
+            search(options, callbacks) {
+                return new Promise((resolve, reject) => requests.push({ options, ...callbacks, resolve, reject }));
+            },
+        } });
+        const outgoing = [];
+        provider._view = { webview: { postMessage: (message) => outgoing.push(message) } };
+        const first = provider._startSearch({ query: 'old' });
+        const second = provider._startSearch({ query: 'new' });
+        assert(`${ending}: the newer search aborts the previous one`, requests[0].signal.aborted);
+        const before = outgoing.length;
+        requests[0].onBatch([{ file: 'old.go', text: 'old' }]);
+        requests[0].onProgress({ totalMatches: 999 });
+        if (ending === 'success') requests[0].resolve([{ file: 'old.go', text: 'old' }]);
+        else requests[0].reject(Object.assign(new Error('old search ended'), { name: ending }));
+        await first;
+        eq(`${ending}: stale search callbacks and completion do not change the new search`, outgoing.length, before);
+        requests[1].resolve({ totalMatches: 2, totalFiles: 1 });
+        await second;
+        eq(`${ending}: the latest search reports its own totals`, outgoing.at(-1), {
+            type: 'searchFinished', resultCount: 2, fileCount: 1, truncated: false,
+        });
+        provider.dispose();
+    }
+    let resume;
+    let searchesStarted = 0;
+    const provider = new SourceSearchViewProvider({
+        onSearch: () => new Promise((resolve) => { resume = resolve; }),
+        engine: { search() { searchesStarted++; } },
+    });
+    const pending = provider._startSearch({ query: 'cancel before engine starts' });
+    await provider._handleMessage({ type: 'clearResults' });
+    resume();
+    await pending;
+    eq('clearing during search setup prevents the cancelled engine from starting', searchesStarted, 0);
+    provider.dispose();
+}
+
+testSearchFocus().then(testNativeSearchConfiguration).then(testOverlappingSearches).then(done).catch((error) => {
     console.error(error);
     process.exitCode = 1;
 });

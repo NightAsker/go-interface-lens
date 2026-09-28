@@ -2,6 +2,21 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.1.11] - 2026-09-28
+
+### Changed
+
+- Search automatically after typing pauses, following VS Code's
+  `search.searchOnType` and `search.searchOnTypeDebouncePeriod` settings
+  (enabled by default with a 300 ms delay).
+- Keep Enter and filter changes immediate, cancel pending searches when
+  clearing the input or pressing Escape, and wait for IME composition to finish.
+
+### Fixed
+
+- Prevent superseded searches from affecting the latest search's progress
+  or results when their completion or cancellation arrives late.
+
 ## [2.1.10] - 2026-09-28
 
 ### Fixed
