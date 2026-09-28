@@ -36,6 +36,8 @@ class SourceSearchViewProvider {
         this.onSearch = options.onSearch;
         this.logger = typeof options.logger === 'function' ? options.logger : () => {};
         this._view = null;
+        this._webviewReady = false;
+        this._focusRequested = false;
         this._disposables = [];
         this._searchAbort = null;
         this._searchId = 0;
@@ -53,8 +55,31 @@ class SourceSearchViewProvider {
         return this;
     }
 
+    async focusSearch() {
+        // Remember the request before opening: the Webview may still need to load.
+        this._focusRequested = true;
+        try {
+            await vscode.commands.executeCommand(`${VIEW_TYPE}.focus`);
+        } catch (_) {
+            try {
+                await vscode.commands.executeCommand('workbench.view.extension.go-interface-lens');
+            } catch (error) {
+                this.logger(`source search view could not be opened: ${error.message || error}`);
+            }
+        }
+        if (this._view && typeof this._view.show === 'function') this._view.show(false);
+        this._focusInputIfRequested();
+    }
+
+    _focusInputIfRequested() {
+        if (!this._focusRequested || !this._webviewReady || !this._view || !this._view.visible) return;
+        this._focusRequested = false;
+        this._post({ type: 'focusQuery' });
+    }
+
     resolveWebviewView(webviewView) {
         this._view = webviewView;
+        this._webviewReady = false;
         webviewView.webview.options = { enableScripts: true, retainContextWhenHidden: true };
         webviewView.webview.html = this._getHtml(webviewView.webview);
 
@@ -70,7 +95,7 @@ class SourceSearchViewProvider {
 
         if (typeof webviewView.onDidChangeVisibility === 'function') {
             const visibility = webviewView.onDidChangeVisibility(() => {
-                if (webviewView.visible) this._post({ type: 'viewVisible' });
+                this._focusInputIfRequested();
             });
             if (visibility && typeof visibility.dispose === 'function') this._disposables.push(visibility);
         }
@@ -85,7 +110,8 @@ class SourceSearchViewProvider {
         if (!message || typeof message.type !== 'string') return;
         switch (message.type) {
             case 'ready':
-                this._post({ type: 'viewVisible' });
+                this._webviewReady = true;
+                this._focusInputIfRequested();
                 return;
             case 'search':
                 await this._startSearch(message.options || {});
@@ -569,6 +595,7 @@ class SourceSearchViewProvider {
     window.addEventListener('message', (event) => {
       const message = event.data || {};
       switch (message.type) {
+        case 'focusQuery': query.focus(); break;
         case 'searchStarted': latestOptions = message.options || latestOptions; syncFilterButtons(latestOptions); reset(); running = true; updateStatus(); break;
         case 'appendResults': addMatches(message.results || message.batch || []); break;
         case 'searchProgress':
@@ -592,6 +619,8 @@ class SourceSearchViewProvider {
     dispose() {
         this._cancelSearch();
         this._view = null;
+        this._webviewReady = false;
+        this._focusRequested = false;
         for (const item of this._disposables.splice(0)) {
             try { item.dispose(); } catch (_) {}
         }

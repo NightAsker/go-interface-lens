@@ -42,6 +42,11 @@ class Element {
         this.listeners = new Map();
         this.classList = new ClassList();
         this.attributes = new Map();
+        this.focusCalls = 0;
+    }
+
+    focus() {
+        this.focusCalls++;
     }
 
     addEventListener(type, listener) {
@@ -165,4 +170,100 @@ for (const [id, option] of [['case', 'matchCase'], ['word', 'wholeWord'], ['rege
     eq(`${id} sends its search option`, message.options[option], true);
 }
 
-done();
+async function testSearchFocus() {
+    console.log('\n== source search shortcut focus ==');
+    const vscode = require(stubPath);
+    const originalCommands = vscode.commands;
+    const commands = [];
+    vscode.commands = { async executeCommand(command) { commands.push(command); } };
+    const provider = new SourceSearchViewProvider();
+    const outgoing = [];
+    const showCalls = [];
+
+    function createView(visible = true) {
+        let receive;
+        let visibilityChanged;
+        const view = {
+            visible,
+            webview: {
+                cspSource: 'https:',
+                postMessage(message) {
+                    outgoing.push(message);
+                    harness.window.dispatch('message', { data: message });
+                    return Promise.resolve(true);
+                },
+                onDidReceiveMessage(listener) {
+                    receive = listener;
+                    return { dispose() {} };
+                },
+            },
+            onDidChangeVisibility(listener) {
+                visibilityChanged = listener;
+                return { dispose() {} };
+            },
+            show(preserveFocus) {
+                showCalls.push(preserveFocus);
+                view.visible = true;
+                visibilityChanged();
+            },
+        };
+        provider.resolveWebviewView(view);
+        return { view, ready: () => receive({ type: 'ready' }), visibilityChanged: () => visibilityChanged() };
+    }
+
+    try {
+        await provider.focusSearch();
+        eq('shortcut opens the specific search view', commands, ['go-interface-lens.sourceSearch.focus']);
+        eq('first shortcut waits for the view to be created', outgoing.length, 0);
+        const first = createView();
+        eq('focus message waits for Webview readiness', outgoing.length, 0);
+        first.ready();
+        eq('ready Webview receives the pending focus request', outgoing, [{ type: 'focusQuery' }]);
+        eq('first shortcut focuses the query input', harness.elements.query.focusCalls, 1);
+        eq('focusing preserves the existing query', harness.elements.query.value, 'LoadComplete');
+
+        await provider.focusSearch();
+        eq('repeating shortcut focuses an already visible input', harness.elements.query.focusCalls, 2);
+        eq('show transfers focus to the Webview', showCalls, [false]);
+
+        first.view.visible = false;
+        first.visibilityChanged();
+        await provider.focusSearch();
+        eq('shortcut refocuses a retained hidden Webview', harness.elements.query.focusCalls, 3);
+        first.visibilityChanged();
+        eq('unrequested visibility events do not steal focus', harness.elements.query.focusCalls, 3);
+
+        provider.dispose();
+        await provider.focusSearch();
+        const reloaded = createView(false);
+        reloaded.ready();
+        eq('recreated hidden Webview defers input focus', harness.elements.query.focusCalls, 3);
+        reloaded.view.visible = true;
+        reloaded.visibilityChanged();
+        eq('pending focus is delivered once the reloaded view is visible', harness.elements.query.focusCalls, 4);
+
+        commands.length = 0;
+        vscode.commands.executeCommand = async (command) => {
+            commands.push(command);
+            if (command === 'go-interface-lens.sourceSearch.focus') throw new Error('Unknown command');
+        };
+        await provider.focusSearch();
+        eq('compatible editors can fall back to opening the container', commands, [
+            'go-interface-lens.sourceSearch.focus', 'workbench.view.extension.go-interface-lens',
+        ]);
+        eq('fallback also focuses the query input', harness.elements.query.focusCalls, 5);
+
+        provider.dispose();
+        const passive = createView();
+        passive.ready();
+        eq('loading without a shortcut request does not steal focus', harness.elements.query.focusCalls, 5);
+    } finally {
+        provider.dispose();
+        vscode.commands = originalCommands;
+    }
+}
+
+testSearchFocus().then(done).catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+});

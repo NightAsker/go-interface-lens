@@ -430,12 +430,7 @@ function activate(context) {
     context.subscriptions.push(
         vscode.languages.registerCodeLensProvider(selector, provider),
         vscode.commands.registerCommand('go-interface-lens.searchSource', async () => {
-            try {
-                await vscode.commands.executeCommand('workbench.view.extension.go-interface-lens');
-            } catch (_) {
-                // The Activity Bar view is still available when the workbench
-                // command is not exposed by a compatible editor.
-            }
+            await sourceSearchView.focusSearch();
         }),
         ...(vscode.window.registerWebviewViewProvider
             ? [

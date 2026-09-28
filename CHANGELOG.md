@@ -2,6 +2,15 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.1.10] - 2026-09-28
+
+### Fixed
+
+- Focus the source-search input when its command or keyboard shortcut is invoked,
+  including first load, reopening a hidden view, and repeated invocations.
+- Preserve the existing query and wait for the search view to be ready before
+  applying a pending focus request.
+
 ## [2.1.9] - 2026-09-28
 
 ### Changed
