@@ -1,6 +1,6 @@
 # Go Interface Lens
 
-[![Version](https://img.shields.io/badge/version-2.1.12-blue.svg)](https://github.com/NightAsker/go-interface-lens)
+[![Version](https://img.shields.io/badge/version-2.1.13-blue.svg)](https://github.com/NightAsker/go-interface-lens)
 [![VSCode](https://img.shields.io/badge/VSCode-1.76+-green.svg)](https://code.visualstudio.com/)
 
 一个面向大型 Go 工程的 VS Code / Cursor 接口导航扩展。它在接口、接口方法和具体实现之间提供双向 CodeLens，同时使用按查询的声明搜索和按需 AST 校验兼顾响应速度与查找准确性。
@@ -114,6 +114,12 @@ WASM、Go grammar WASM 和 MIT 许可证；依赖包里的其他语言 grammar �
 点击 Activity Bar 中的 Go Source Search 图标，或执行 `Go: Search Source`。搜索面板会按文件分组显示匹配行，支持普通文本、正则表达式、区分大小写、整词匹配，以及工程、依赖包和标准库范围切换。点击匹配行会打开对应源码并定位到列位置。
 
 默认停止输入 300 毫秒后自动搜索，按 Enter 可立即搜索。该行为跟随 VS Code 的 `search.searchOnType` 和 `search.searchOnTypeDebouncePeriod` 设置；中文输入法选字期间不会触发搜索。
+
+搜索按可用 CPU 分配最多 8 个 ripgrep 扫描线程，同一查询最多启动 4 个搜索进程。首次搜索就会按当前过滤规则列出文件、读取文件大小，并按包目录汇总文件数量和总字节数。调度权重同时考虑字节数与逐文件打开成本，大任务优先；大包按文件拆分到多个任务，小包合并执行，再通过动态队列分配给空闲进程。
+
+统计阶段只读取目录和文件元数据，不预读源码内容，并支持随时取消。每次查询都会重新统计，以反映文件新增、删除、大小变化和过滤规则变化；这会增加搜索开始前的准备时间。日志会分别记录统计、首批结果和总搜索耗时。
+
+工程结果会先于依赖结果分批展示，达到结果或文件数量限制后停止扫描。工程达到上限时不再统计和搜索依赖。列表仅更新新增匹配涉及的文件。
 
 搜索默认覆盖 `.go`、`go.mod`、`go.sum`、`go.work` 和 `go.work.sum`。依赖搜索只访问当前项目 `go.mod` 锁定的 module 版本和本地 `replace` 目录，不会把 module cache 中的旧版本混入结果。
 

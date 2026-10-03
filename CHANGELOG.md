@@ -2,6 +2,19 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.1.13] - 2026-10-03
+
+### Changed
+
+- Count eligible files and their actual sizes before each source search, including
+  the first query, and use these measurements to schedule heavier tasks first.
+- Split large packages and combine small packages into bounded search tasks,
+  using a CPU-aware queue with up to four ripgrep processes and eight scan threads.
+- Search workspace files before dependencies, stream results as they arrive, and
+  stop outstanding work when searches are cancelled or result limits are reached.
+- Update only affected result nodes as batches arrive, preserving collapsed files
+  and stable workspace-first ordering.
+
 ## [2.1.12] - 2026-09-28
 
 ### Fixed

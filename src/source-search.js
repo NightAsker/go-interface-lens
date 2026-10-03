@@ -7,14 +7,16 @@ const { execFile, spawn } = require('child_process');
 const {
     findRipgrep,
     resolveGoModCache,
-    splitSearchTargets,
     resolveRipgrepProcessConcurrency,
 } = require('./search');
 const { resolveLockedModuleDirs } = require('./gomod');
+const { collectSearchFiles, planSearchJobs, rootBatches } = require('./source-search-plan');
 
 const DEFAULT_MAX_RESULTS = 2000;
 const DEFAULT_MAX_FILES = 1000;
-const DEFAULT_SEARCH_CONCURRENCY = Math.min(8, resolveRipgrepProcessConcurrency());
+const MAX_SEARCH_PROCESSES = 4;
+const RESULT_BATCH_DELAY = 50;
+const RESULT_BATCH_SIZE = 100;
 const DEFAULT_GLOBS = ['*.go', 'go.mod', 'go.sum', 'go.work', 'go.work.sum'];
 let goRootPromise;
 
@@ -51,7 +53,7 @@ function createMatcher(query, options) {
     }
 }
 
-function matchTextLines(text, matcher) {
+function matchTextLines(text, matcher, maxMatches = Infinity) {
     const lines = text.split(/\r?\n/);
     const matches = [];
     for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
@@ -74,6 +76,7 @@ function matchTextLines(text, matcher) {
                 text: line,
                 ranges: submatches,
             });
+            if (matches.length >= maxMatches) break;
         }
     }
     return matches;
@@ -257,82 +260,80 @@ function createCancellationError() {
 
 function runRipgrepJson(command, args, rootInfo, handlers = {}) {
     return new Promise((resolve, reject) => {
-        let settled = false;
-        let buffer = '';
-        let child;
         const signal = handlers.signal;
-        const finish = (error, value) => {
-            if (settled) return;
-            settled = true;
-            if (signal && signal.removeEventListener) signal.removeEventListener('abort', abort);
-            if (error) reject(error);
-            else resolve(value);
-        };
+        if (signal && signal.aborted) return reject(createCancellationError());
+        let buffer = '';
+        let stderr = '';
+        let failure;
+        let stats;
+        const child = spawn(command, args, { cwd: rootInfo.root, stdio: ['ignore', 'pipe', 'pipe'] });
         const abort = () => {
-            if (child && !child.killed) child.kill();
-            finish(createCancellationError());
+            if (!child.killed) child.kill();
         };
-        if (signal && signal.aborted) return abort();
-        try {
-            child = spawn(command, args, { cwd: rootInfo.root, stdio: ['ignore', 'pipe', 'pipe'] });
-        } catch (error) {
-            return finish(error);
-        }
-        if (signal && signal.addEventListener) signal.addEventListener('abort', abort, { once: true });
+        // Wait for close even on cancellation, so completion means the child
+        // has actually exited and cannot deliver late results.
+        if (signal) signal.addEventListener('abort', abort, { once: true });
+        const consume = (line) => {
+            if (!line || failure || (signal && signal.aborted)) return;
+            let json;
+            try { json = JSON.parse(line); } catch (_) { return; }
+            try {
+                const record = parseMatchRecord(json, rootInfo);
+                if (record && handlers.onMatch) handlers.onMatch(record);
+                if (json.type === 'summary') stats = json.data && json.data.stats;
+            } catch (error) {
+                failure = error;
+                abort();
+            }
+        };
         child.stdout.setEncoding('utf8');
         child.stdout.on('data', (chunk) => {
+            if (failure || (signal && signal.aborted)) return;
             buffer += chunk;
+            let start = 0;
             let newline;
-            while ((newline = buffer.indexOf('\n')) >= 0) {
-                const line = buffer.slice(0, newline).trim();
-                buffer = buffer.slice(newline + 1);
-                if (!line) continue;
-                try {
-                    const record = parseMatchRecord(JSON.parse(line), rootInfo);
-                    if (record && handlers.onMatch) handlers.onMatch(record);
-                } catch (_) {
-                    // ripgrep output is line-delimited JSON; ignore incomplete or
-                    // unsupported records while preserving the rest of the search.
-                }
+            while ((newline = buffer.indexOf('\n', start)) >= 0) {
+                consume(buffer.slice(start, newline));
+                start = newline + 1;
+                if (failure || (signal && signal.aborted)) { buffer = ''; return; }
             }
+            buffer = buffer.slice(start);
         });
-        let stderr = '';
         child.stderr.setEncoding('utf8');
-        child.stderr.on('data', (chunk) => {
-            stderr += chunk;
-        });
-        child.on('error', (error) => finish(error));
-        child.on('close', (code, signalName) => {
-            if (buffer.trim()) {
-                try {
-                    const record = parseMatchRecord(JSON.parse(buffer.trim()), rootInfo);
-                    if (record && handlers.onMatch) handlers.onMatch(record);
-                } catch (_) {
-                    // Ignore a trailing incomplete record.
-                }
-            }
-            if (settled) return;
-            if (signalName && signal && signal.aborted) return finish(createCancellationError());
-            if (code === 0 || code === 1) return finish(null, { code, stderr });
+        child.stderr.on('data', (chunk) => { stderr = (stderr + chunk).slice(-65536); });
+        child.on('error', (error) => { failure = error; });
+        child.on('close', (code) => {
+            if (signal) signal.removeEventListener('abort', abort);
+            consume(buffer);
+            if (failure) return reject(failure);
+            if (signal && signal.aborted) return reject(createCancellationError());
+            if (code === 0 || code === 1) return resolve({ code, stderr, stats });
             const error = new Error(stderr.trim() || `ripgrep exited with code ${code}`);
             error.code = 'RIPGREP_FAILED';
-            finish(error);
+            reject(error);
         });
     });
 }
 
-function runWithConcurrency(values, concurrency, task) {
-    const items = [...values];
-    if (items.length === 0) return Promise.resolve([]);
-    const results = new Array(items.length);
+async function runSearchJobs(jobs, parallelism, controller, task) {
+    const slots = Math.min(MAX_SEARCH_PROCESSES, parallelism, jobs.length);
     let next = 0;
-    const workers = Array.from({ length: Math.min(items.length, Math.max(1, concurrency)) }, async () => {
-        while (next < items.length) {
-            const index = next++;
-            results[index] = await task(items[index], index);
+    let failure;
+    let freeThreads = parallelism;
+    let active = 0;
+    await Promise.all(Array.from({ length: slots }, async () => {
+        while (next < jobs.length && !controller.signal.aborted) {
+            const job = jobs[next++];
+            const threads = Math.max(1, Math.floor(freeThreads / Math.min(slots - active, jobs.length - next + 1)));
+            freeThreads -= threads;
+            active++;
+            try { await task(job, threads); }
+            catch (error) {
+                if (!controller.signal.aborted) { failure = error; controller.abort(); }
+            } finally { freeThreads += threads; active--; }
         }
-    });
-    return Promise.all(workers).then(() => results);
+    }));
+    if (failure) throw failure;
 }
 
 class SourceSearchService {
@@ -342,6 +343,9 @@ class SourceSearchService {
         this.getOpenDocuments = options.getOpenDocuments || (() => []);
         this.log = options.log || (() => {});
         this.rg = options.rg || findRipgrep() || 'rg';
+        this.parallelism = Math.min(8, resolveRipgrepProcessConcurrency(options.parallelism));
+        this.runRipgrep = options.runRipgrep || runRipgrepJson;
+        this.collectFiles = options.collectFiles || collectSearchFiles;
     }
 
     resolveRoots(options = {}) {
@@ -354,6 +358,8 @@ class SourceSearchService {
     }
 
     async search(options = {}, progress = {}) {
+        if (progress.signal && progress.signal.aborted) throw createCancellationError();
+        const started = Date.now();
         const query = typeof options.query === 'string' ? options.query : '';
         if (!query.trim()) return { query, results: [], totalMatches: 0, totalFiles: 0, truncated: false, roots: [] };
         const config = { ...this.getConfig(), ...(options.config || {}) };
@@ -375,134 +381,175 @@ class SourceSearchService {
             1,
             Number(options.maxFiles) || Number(config.sourceSearchMaxFiles) || DEFAULT_MAX_FILES
         );
-        const { excludedFiles, excludedFolders } = pathPatternsFromConfig(config);
+        const { excludedFolders } = pathPatternsFromConfig(config);
         const includeGlobs = Array.isArray(options.includeGlobs) && options.includeGlobs.length > 0
             ? options.includeGlobs
             : DEFAULT_GLOBS;
-        const args = ['--json', '--color', 'never', '--line-number', '--column'];
+        const args = ['--json', '--line-buffered', '--color', 'never', '--line-number', '--column'];
         if (!normalizedOptions.regex) args.push('--fixed-strings');
         if (!normalizedOptions.caseSensitive) args.push('--ignore-case');
         if (normalizedOptions.wholeWord) args.push('--word-regexp');
-        for (const glob of includeGlobs) args.push('--glob', glob);
+        const fileArgs = [];
+        for (const glob of includeGlobs) fileArgs.push('--glob', glob);
         for (const folder of excludedFolders) {
-            if (/^[A-Za-z0-9_.*?@+-]+$/.test(folder)) args.push('--glob', `!**/${folder}/**`);
+            if (/^[A-Za-z0-9_.*?@+-]+$/.test(folder)) fileArgs.push('--glob', `!**/${folder}/**`);
         }
-        args.push('-e', query, '--');
+        args.push('-e', query);
 
+        const controller = new AbortController();
+        const cancel = () => controller.abort();
+        if (progress.signal) {
+            progress.signal.addEventListener('abort', cancel, { once: true });
+            if (progress.signal.aborted) cancel();
+        }
         const byFile = new Map();
+        const seen = new Map();
+        const pending = new Map();
+        const dirtyFiles = new Map();
         let totalMatches = 0;
         let truncated = false;
-        const onMatch = (record) => {
-            if (!fileMatchesConfig(record.file, config) || folderMatchesConfig(record.file, config)) return;
-            if (totalMatches >= maxResults) {
+        let timer;
+        let pendingCount = 0;
+        let delivery = Promise.resolve();
+        let deliveryError;
+        let firstResultMs;
+        const prioritizedRoots = [...roots].sort((left, right) => scopeRank(left.scope) - scopeRank(right.scope) || right.root.length - left.root.length);
+        const rootsByDirectory = new Map();
+        const findRoot = (file) => {
+            const directory = path.dirname(file);
+            if (!rootsByDirectory.has(directory)) rootsByDirectory.set(directory, prioritizedRoots.find((root) => isWithin(file, root.root)));
+            return rootsByDirectory.get(directory);
+        };
+        const flush = () => {
+            clearTimeout(timer);
+            timer = undefined;
+            if (!pendingCount) return;
+            const batch = [...pending.values()].sort((left, right) => scopeRank(left.scope) - scopeRank(right.scope) || left.file.localeCompare(right.file));
+            const info = { totalMatches, totalFiles: byFile.size, truncated };
+            pending.clear();
+            pendingCount = 0;
+            delivery = delivery.then(async () => {
+                if (deliveryError || (progress.signal && progress.signal.aborted)) return;
+                if (firstResultMs === undefined) firstResultMs = Date.now() - started;
+                if (progress.onBatch) await progress.onBatch(batch);
+                if (progress.onProgress) await progress.onProgress(info);
+            }).catch((error) => { deliveryError = error; controller.abort(); });
+        };
+        const onMatch = (record, unsaved = false) => {
+            if (controller.signal.aborted) return;
+            if (!unsaved && dirtyFiles.has(record.file)) return;
+            let entry = byFile.get(record.file);
+            if (!entry && (!fileMatchesConfig(record.file, config) || folderMatchesConfig(record.file, config))) return;
+            if (!entry && byFile.size >= maxFiles) {
                 truncated = true;
+                controller.abort();
                 return;
             }
-            let entry = byFile.get(record.file);
             if (!entry) {
-                if (byFile.size >= maxFiles) {
-                    truncated = true;
-                    return;
-                }
                 const root = record.root;
                 entry = {
-                    file: record.file,
-                    relativePath: path.relative(root.root, record.file) || path.basename(record.file),
-                    scope: root.scope,
-                    scopeLabel: scopeLabel(root.scope),
-                    root: root.root,
-                    rootLabel: root.label,
-                    module: root.module,
-                    version: root.version,
-                    matches: [],
+                    file: record.file, relativePath: path.relative(root.root, record.file) || path.basename(record.file),
+                    scope: root.scope, scopeLabel: scopeLabel(root.scope), root: root.root,
+                    rootLabel: root.label, module: root.module, version: root.version,
+                    ...(unsaved ? { unsaved: true } : {}), matches: [],
                 };
                 byFile.set(record.file, entry);
+                seen.set(record.file, new Set());
             }
-            if (entry.matches.length >= maxResults) {
-                truncated = true;
-                return;
-            }
-            entry.matches.push({
-                line: record.line,
-                column: record.column,
-                text: record.text,
-                ranges: record.ranges,
-            });
+            const key = `${record.line}:${record.column}`;
+            if (seen.get(record.file).has(key)) return;
+            seen.get(record.file).add(key);
+            const match = { line: record.line, column: record.column, text: record.text, ranges: record.ranges };
+            entry.matches.push(match);
             totalMatches++;
-            if (totalMatches >= maxResults) truncated = true;
+            let delta = pending.get(record.file);
+            if (!delta) { delta = { ...entry, matches: [] }; pending.set(record.file, delta); }
+            delta.matches.push(match);
+            pendingCount++;
+            if (totalMatches >= maxResults) { truncated = true; controller.abort(); }
+            if (pendingCount >= RESULT_BATCH_SIZE) flush();
+            else if (!timer) timer = setTimeout(flush, RESULT_BATCH_DELAY);
         };
-
-        const groups = splitSearchTargets(roots.map((root) => root.root), Math.min(16, DEFAULT_SEARCH_CONCURRENCY));
-        const rootByPath = new Map(roots.map((root) => [root.root, root]));
-        const findRoot = (file) => {
-            let best = null;
-            for (const root of roots) {
-                if (isWithin(file, root.root) && (!best || root.root.length > best.root.length)) best = root;
+        try {
+            // Snapshot dirty documents first so disk results are never shown and
+            // later retracted. Apply overlays within their scope's priority.
+            for (const document of this.getOpenDocuments() || []) {
+                if (controller.signal.aborted) break;
+                const file = normalizeAbsolute(document && document.uri && document.uri.fsPath);
+                if (!file || !document.isDirty || typeof document.getText !== 'function') continue;
+                const root = findRoot(file);
+                if (root) dirtyFiles.set(file, { root, text: document.getText() });
             }
-            return best;
-        };
-        await runWithConcurrency(groups, DEFAULT_SEARCH_CONCURRENCY, async (group) => {
+            const listedFiles = new Set();
+            let jobCount = 0;
+            let metadataMs = 0;
+            // Finish workspace work before admitting dependencies to the global
+            // result budget; fast dependency matches cannot crowd out the project.
+            for (const scope of ['workspace', 'dependency', 'stdlib']) {
+                if (controller.signal.aborted) break;
+                for (const [file, overlay] of dirtyFiles) {
+                    if (overlay.root.scope !== scope || controller.signal.aborted) continue;
+                    for (const match of matchTextLines(overlay.text, overlayMatcher, maxResults - totalMatches)) {
+                        onMatch({ ...match, file, root: overlay.root }, true);
+                        if (controller.signal.aborted) break;
+                    }
+                }
+                if (controller.signal.aborted) break;
+                const scopedRoots = roots.filter((root) => root.scope === scope);
+                const metadataStarted = Date.now();
+                const inventory = [];
+                await runSearchJobs(rootBatches(scopedRoots), this.parallelism, controller, async (batch, threads) => {
+                    const files = await this.collectFiles(this.rg, ['--files', '--null', '--threads', String(threads), ...fileArgs, '--', ...batch.roots.map((root) => root.root)], batch.roots[0], {
+                        signal: controller.signal,
+                        includeFile: (file) => {
+                            if (listedFiles.has(file) || dirtyFiles.has(file)) return false;
+                            if (!fileMatchesConfig(file, config) || folderMatchesConfig(file, config)) return false;
+                            listedFiles.add(file);
+                            return true;
+                        },
+                    });
+                    for (const file of files) {
+                        const root = findRoot(file.file);
+                        if (root) inventory.push({ ...file, root });
+                    }
+                });
+                const elapsed = Date.now() - metadataStarted;
+                metadataMs += elapsed;
+                if (controller.signal.aborted) break;
+                const jobs = planSearchJobs(inventory, this.parallelism);
+                const packageCount = new Set(inventory.map((file) => path.dirname(file.file))).size;
+                const totalBytes = inventory.reduce((sum, file) => sum + file.size, 0);
+                this.log(`source search ${scope}: ${inventory.length} files, ${packageCount} packages, ${totalBytes} bytes, metadata ${elapsed} ms, ${jobs.length} tasks`);
+                jobCount += jobs.length;
+                // These exact files already passed rg's ignore/glob rules and
+                // exclusions. Avoid re-enumerating directories for every shard.
+                await runSearchJobs(jobs, this.parallelism, controller, async (job, threads) => {
+                    await this.runRipgrep(this.rg, [...args, '--threads', String(threads), '--', ...job.files.map((file) => file.file)], job.files[0].root, {
+                        signal: controller.signal,
+                        onMatch: (record) => {
+                            const root = findRoot(record.file);
+                            if (root) onMatch({ ...record, root });
+                        },
+                    });
+                });
+                flush();
+                await delivery;
+            }
+            flush();
+            await delivery;
+            if (deliveryError) throw deliveryError;
             if (progress.signal && progress.signal.aborted) throw createCancellationError();
-            const targetRoot = findRoot(group[0]);
-            if (!targetRoot) return;
-            const scopedArgs = [...args, ...group];
-            await runRipgrepJson(this.rg, scopedArgs, targetRoot, {
-                signal: progress.signal,
-                onMatch: (record) => {
-                    const actualRoot = findRoot(record.file) || rootByPath.get(group[0]);
-                    if (actualRoot) onMatch({ ...record, root: actualRoot });
-                },
-            });
-        });
-
-        const overlays = this.getOpenDocuments() || [];
-        const dirtyFiles = new Set();
-        for (const document of overlays) {
-            const file = normalizeAbsolute(document && document.uri && document.uri.fsPath);
-            if (!file || !document.isDirty || typeof document.getText !== 'function') continue;
-            const root = findRoot(file);
-            if (!root) continue;
-            dirtyFiles.add(file);
-            byFile.delete(file);
-            const matches = matchTextLines(document.getText(), overlayMatcher);
-            if (matches.length === 0) continue;
-            byFile.set(file, {
-                file,
-                relativePath: path.relative(root.root, file) || path.basename(file),
-                scope: root.scope,
-                scopeLabel: scopeLabel(root.scope),
-                root: root.root,
-                rootLabel: root.label,
-                module: root.module,
-                version: root.version,
-                unsaved: true,
-                matches: matches.slice(0, Math.max(0, maxResults - totalMatches)),
-            });
+            const results = [...byFile.values()].sort((left, right) => scopeRank(left.scope) - scopeRank(right.scope) || left.file.localeCompare(right.file));
+            for (const entry of results) entry.matches.sort((left, right) => left.line - right.line || left.column - right.column);
+            if (progress.onProgress) await progress.onProgress({ totalMatches, totalFiles: results.length, truncated });
+            this.log(`source search: ${jobCount} tasks, up to ${this.parallelism} scan threads, metadata ${metadataMs} ms, first batch ${firstResultMs ?? '-'} ms, total ${Date.now() - started} ms`);
+            return { query, results, totalMatches, totalFiles: results.length, truncated, roots };
+        } finally {
+            clearTimeout(timer);
+            if (progress.signal) progress.signal.removeEventListener('abort', cancel);
+            controller.abort();
+            await delivery;
         }
-        if (dirtyFiles.size > 0) {
-            totalMatches = [...byFile.values()].reduce((sum, file) => sum + file.matches.length, 0);
-        }
-
-        const results = [...byFile.values()]
-            .filter((entry) => entry.matches.length > 0)
-            .sort((left, right) => scopeRank(left.scope) - scopeRank(right.scope)
-                || left.file.localeCompare(right.file));
-        const batches = [];
-        for (let index = 0; index < results.length; index += 50) batches.push(results.slice(index, index + 50));
-        if (typeof progress.onBatch === 'function') {
-            for (const batch of batches) await progress.onBatch(batch);
-        }
-        if (typeof progress.onProgress === 'function') {
-            await progress.onProgress({ totalMatches, totalFiles: results.length, truncated });
-        }
-        return {
-            query,
-            results,
-            totalMatches,
-            totalFiles: results.length,
-            truncated,
-            roots,
-        };
     }
 }
 
@@ -515,4 +562,5 @@ module.exports = {
     matchTextLines,
     resolveSourceRoots,
     runRipgrepJson,
+    planSearchJobs,
 };

@@ -632,6 +632,7 @@ class SourceSearchViewProvider {
     function addMatches(batch) {
       if (!Array.isArray(batch)) batch = [batch];
       const flat = [];
+      const changedFiles = new Set();
       batch.forEach((entry) => {
         if (!entry) return;
         if (entry.matches && Array.isArray(entry.matches)) {
@@ -643,10 +644,10 @@ class SourceSearchViewProvider {
         if (!file) { file = { file: match.file, relativePath: match.relativePath, scope: match.scope, scopeLabel: match.scopeLabel, rootLabel: match.rootLabel, module: match.module, version: match.version, unsaved: match.unsaved, matches: [], collapsed: false }; files.set(match.file, file); }
         file.relativePath = file.relativePath || match.relativePath; file.scope = file.scope || match.scope; file.scopeLabel = file.scopeLabel || match.scopeLabel; file.rootLabel = file.rootLabel || match.rootLabel; file.module = file.module || match.module; file.version = file.version || match.version; file.unsaved = file.unsaved || match.unsaved;
         const duplicate = file.matches.some((item) => item.line === match.line && item.column === match.column && item.text === match.text);
-        if (!duplicate) { file.matches.push(match); resultCount++; lastBatch.push(match); }
+        if (!duplicate) { file.matches.push(match); resultCount++; lastBatch.push(match); changedFiles.add(file.file); }
       });
       fileCount = files.size;
-      render();
+      render(changedFiles);
     }
     function displayFile(file) {
       const slash = String(file.relativePath || file.file).replace(/\\\\/g, '/');
@@ -655,10 +656,16 @@ class SourceSearchViewProvider {
       const parent = pieces.join('/');
       return { name: name + (file.unsaved ? ' •' : ''), parent };
     }
-    function render() {
+    function render(changedFiles) {
       if (fileCount === 0) { empty.hidden = false; return; }
-      empty.hidden = true; results.querySelectorAll('.file').forEach((node) => node.remove());
-      [...files.values()].sort((left, right) => scopeRank(left.scope) - scopeRank(right.scope) || left.file.localeCompare(right.file)).forEach((file) => {
+      empty.hidden = true;
+      const ordered = [...files.values()].sort((left, right) => scopeRank(left.scope) - scopeRank(right.scope) || left.file.localeCompare(right.file));
+      // Only update files that received new matches. Streaming batches should
+      // not rebuild the entire tree or disturb collapsed, unchanged files.
+      for (let index = ordered.length - 1; index >= 0; index--) {
+        const file = ordered[index];
+        if (!changedFiles.has(file.file)) continue;
+        file.matches.sort((left, right) => left.line - right.line || left.column - right.column);
         const wrap = document.createElement('section'); wrap.className = 'file' + (file.collapsed ? ' collapsed' : ''); wrap.setAttribute('role', 'treeitem');
         const shown = displayFile(file);
         const badge = sourceBadge(file);
@@ -667,8 +674,10 @@ class SourceSearchViewProvider {
         const head = wrap.querySelector('.file-head'); head.addEventListener('click', () => { file.collapsed = !file.collapsed; wrap.classList.toggle('collapsed', file.collapsed); }); head.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); file.collapsed = !file.collapsed; wrap.classList.toggle('collapsed', file.collapsed); } });
         const list = wrap.querySelector('.matches'); file.matches.slice(0, 300).forEach((match) => { const row = document.createElement('div'); row.className = 'match'; row.setAttribute('role', 'treeitem'); row.title = 'Open ' + file.file + ':' + match.line; row.innerHTML = '<span class="line-number">' + esc(match.line) + ':</span><span class="match-text">' + highlight(match.preview) + '</span>'; row.addEventListener('click', () => vscode.postMessage({ type: 'openMatch', match })); list.appendChild(row); });
         if (file.matches.length > 300) { const more = document.createElement('div'); more.className = 'result-ellipsis'; more.textContent = '… ' + (file.matches.length - 300) + ' more matches'; list.appendChild(more); }
-        results.appendChild(wrap);
-      });
+        if (file.element) file.element.replaceWith(wrap);
+        else results.insertBefore(wrap, ordered[index + 1]?.element || null);
+        file.element = wrap;
+      }
     }
     function updateStatus(cancelled) {
       progress.classList.toggle('busy', running);

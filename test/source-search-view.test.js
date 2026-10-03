@@ -86,6 +86,18 @@ class Element {
         this.parent.children = this.parent.children.filter((child) => child !== this);
     }
 
+    insertBefore(child, next) {
+        if (!next) return this.appendChild(child);
+        this.children.splice(this.children.indexOf(next), 0, child);
+        child.parent = this;
+        return child;
+    }
+
+    replaceWith(child) {
+        this.parent.insertBefore(child, this);
+        this.remove();
+    }
+
     querySelector(selector) {
         const existing = this.querySelectorAll(selector)[0];
         if (existing) return existing;
@@ -269,6 +281,29 @@ const noMatch = renderMatch('plain source', { query: '[' , useRegex: true });
 assert('invalid fallback regex still renders the source safely', noMatch.innerHTML.includes('plain source'));
 const zeroLength = renderMatch('abc', { query: '^', useRegex: true });
 assert('zero-length regex preview terminates and preserves the line', zeroLength.innerHTML.includes('<mark></mark>abc'));
+
+console.log('\n== incremental result batches ==');
+const incremental = createWebviewHarness();
+const post = (data) => incremental.window.dispatch('message', { data });
+const add = (file, line, scope = 'workspace') => post({ type: 'appendResults', results: [{ file, line, scope, text: 'needle', column: 1 }] });
+post({ type: 'searchStarted', options: { query: 'needle' } });
+add('/z.go', 10, 'dependency');
+const untouched = incremental.elements.results.querySelectorAll('.file')[0];
+untouched.querySelector('.file-head').dispatch('click');
+add('/b.go', 20);
+add('/a.go', 30);
+const initialFiles = incremental.elements.results.querySelectorAll('.file');
+eq('streamed workspace files sort before dependencies', initialFiles.map((file) => file.querySelector('.matches').children[0].innerHTML.match(/line-number">(\d+)/)[1]), ['30', '20', '10']);
+assert('new batches preserve unaffected file nodes', initialFiles[2] === untouched);
+assert('unaffected files retain their collapsed state', untouched.classList.contains('collapsed'));
+add('/a.go', 2);
+const updated = incremental.elements.results.querySelectorAll('.file');
+assert('appending a match only rebuilds its own file', updated[0] !== initialFiles[0] && updated[1] === initialFiles[1] && updated[2] === untouched);
+eq('out-of-order batches keep matches sorted by source line', updated[0].querySelector('.matches').children.map((row) => row.innerHTML.match(/line-number">(\d+)/)[1]), ['2', '30']);
+add('/a.go', 2);
+assert('duplicate streamed matches do not rebuild a file', incremental.elements.results.querySelectorAll('.file')[0] === updated[0]);
+post({ type: 'searchFinished', resultCount: 4, fileCount: 3 });
+assert('streamed result totals are not double-counted', incremental.elements.status.innerHTML.includes('<strong>4</strong> results in <strong>3</strong> files'));
 
 console.log('\n== search after typing pauses ==');
 const typing = createWebviewHarness();
