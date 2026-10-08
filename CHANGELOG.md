@@ -2,6 +2,14 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.1.14] - 2026-10-08
+
+### Changed
+
+- Select the existing source-search query when its command or keyboard shortcut
+  is invoked, so typing or pasting replaces the previous query like VS Code.
+- Show a native-style clear button while the source-search query is non-empty.
+
 ## [2.1.13] - 2026-10-03
 
 ### Changed

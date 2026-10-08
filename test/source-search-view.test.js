@@ -43,10 +43,15 @@ class Element {
         this.classList = new ClassList();
         this.attributes = new Map();
         this.focusCalls = 0;
+        this.selectCalls = 0;
     }
 
     focus() {
         this.focusCalls++;
+    }
+
+    select() {
+        this.selectCalls++;
     }
 
     addEventListener(type, listener) {
@@ -119,7 +124,7 @@ function createWebviewHarness() {
     const html = provider._getHtml({ cspSource: 'https:' });
     const script = html.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)[1];
     const ids = [
-        'query', 'scope', 'search-toggle', 'query-details', 'details-toggle',
+        'query', 'search-box', 'clear-query', 'scope', 'search-toggle', 'query-details', 'details-toggle',
         'scope-row', 'results', 'status', 'progress', 'open-editor', 'empty',
         'regex', 'case', 'word',
     ];
@@ -318,7 +323,10 @@ function configure(searchOnType, searchOnTypeDebouncePeriod) {
     typing.window.dispatch('message', { data: { type: 'searchConfiguration', searchOnType, searchOnTypeDebouncePeriod } });
 }
 
+assert('clear-query button starts hidden', typing.elements['clear-query'].hidden);
 input('Load');
+assert('typing shows the clear-query button', !typing.elements['clear-query'].hidden);
+assert('typing reserves room for the clear-query button', typing.elements['search-box'].classList.contains('has-query'));
 typing.tick(299);
 eq('typing waits for the default debounce period', searches().length, 0);
 input('LoadComplete');
@@ -358,10 +366,21 @@ eq('scope cancels the delayed duplicate', searches().length, beforeScope + 1);
 
 input('pending');
 const beforeClear = searches().length;
-input('');
-eq('clearing input immediately clears results', typing.messages.at(-1).type, 'clearResults');
+const focusBeforeClear = query.focusCalls;
+typing.elements['clear-query'].dispatch('click', { preventDefault() {}, stopPropagation() {} });
+eq('clear-query button empties the input', query.value, '');
+assert('clear-query button hides after clearing', typing.elements['clear-query'].hidden);
+assert('clearing releases the reserved button space', !typing.elements['search-box'].classList.contains('has-query'));
+eq('clear-query button keeps input focus', query.focusCalls, focusBeforeClear + 1);
+eq('clear-query button immediately clears results', typing.messages.at(-1).type, 'clearResults');
 typing.tick(500);
-eq('clearing input cancels queued searches', searches().length, beforeClear);
+eq('clear-query button cancels queued searches', searches().length, beforeClear);
+input('backspace clear');
+input('');
+assert('deleting the query hides the clear-query button', typing.elements['clear-query'].hidden);
+eq('deleting the query also clears results', typing.messages.at(-1).type, 'clearResults');
+typing.tick(500);
+eq('deleting the query cancels its queued search', searches().length, beforeClear);
 key('Enter');
 eq('empty Enter clears instead of searching', typing.messages.at(-1).type, 'clearResults');
 typing.window.dispatch('message', { data: { type: 'clearResults' } });
@@ -470,10 +489,12 @@ async function testSearchFocus() {
         first.ready();
         eq('ready Webview receives the pending focus request', outgoing.at(-1), { type: 'focusQuery' });
         eq('first shortcut focuses the query input', harness.elements.query.focusCalls, 1);
+        eq('first shortcut selects the existing query', harness.elements.query.selectCalls, 1);
         eq('focusing preserves the existing query', harness.elements.query.value, 'LoadComplete');
 
         await provider.focusSearch();
         eq('repeating shortcut focuses an already visible input', harness.elements.query.focusCalls, 2);
+        eq('repeating shortcut selects the existing query for replacement', harness.elements.query.selectCalls, 2);
         eq('show transfers focus to the Webview', showCalls, [false]);
 
         first.view.visible = false;

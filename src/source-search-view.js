@@ -337,6 +337,7 @@ class SourceSearchViewProvider {
     /* These codepoints are the native VS Code @vscode/codicons glyphs. */
     .codicon-case-sensitive::before { content: "\\eab1"; }
     .codicon-chevron-right::before { content: "\\eab6"; }
+    .codicon-close::before { content: "\\ea76"; }
     .codicon-more::before { content: "\\ea7c"; }
     .codicon-regex::before { content: "\\eb38"; }
     .codicon-whole-word::before { content: "\\eb7e"; }
@@ -351,6 +352,7 @@ class SourceSearchViewProvider {
     .search-box { position: relative; flex: 1; min-width: 0; display: block; height: 26px; margin-left: 18px; padding: 0 2px 0 0; background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 3px; }
     .search-box:focus-within { border-color: var(--vscode-focusBorder, #007fd4); }
     #query { display: block; width: 100%; min-width: 0; height: 24px; padding: 3px 68px 3px 6px; background: transparent; border: 0; outline: 0; color: var(--input-fg); font-size: var(--vscode-font-size, 13px); line-height: 18px; text-overflow: ellipsis; }
+    .search-box.has-query #query { padding-right: 90px; }
     #query::placeholder { color: var(--placeholder); opacity: 1; }
     #query::-webkit-search-cancel-button,
     #query::-webkit-search-decoration { -webkit-appearance: none; appearance: none; display: none; }
@@ -360,6 +362,10 @@ class SourceSearchViewProvider {
     .search-filter-btn:hover { background: var(--hover); color: var(--vscode-foreground); }
     .search-filter-btn.active { color: var(--vscode-inputOption-activeForeground, var(--accent)); background: var(--vscode-inputOption-activeBackground, var(--vscode-toolbar-hoverBackground, rgba(80, 150, 220, .13))); border-color: var(--vscode-inputOption-activeBorder, var(--accent)); }
     .search-filter-btn .codicon { font-size: 16px; }
+    .search-clear { display: inline-flex; align-items: center; justify-content: center; width: 20px; min-width: 20px; height: 20px; margin-left: 2px; padding: 1px; border-radius: 3px; color: var(--vscode-icon-foreground, var(--result-muted)); }
+    .search-clear[hidden] { display: none; }
+    .search-clear:hover { background: var(--vscode-toolbar-hoverBackground, var(--hover)); color: var(--vscode-foreground); }
+    .search-clear .codicon { font-size: 16px; }
     .query-details { min-height: 16px; position: relative; margin: 0 0 0 18px; }
     .details-toggle { position: absolute; right: -2px; top: 0; width: 25px; height: 16px; padding: 0; color: var(--muted); font-size: 16px; line-height: 12px; border-radius: 3px; }
     .details-toggle:hover { background: var(--hover); color: var(--vscode-foreground); }
@@ -411,12 +417,13 @@ class SourceSearchViewProvider {
     <header class="header">
       <div class="search-row">
         <button class="search-toggle" id="search-toggle" type="button" title="Search options" aria-label="Search options" aria-expanded="false"><span class="codicon codicon-chevron-right" aria-hidden="true"></span></button>
-        <div class="search-box" role="search">
+        <div class="search-box" id="search-box" role="search">
           <input id="query" type="search" aria-label="Search source" autocomplete="off" spellcheck="false" placeholder="Search" />
-          <span class="search-filter-controls" aria-label="Search filters">
+          <span class="search-filter-controls" aria-label="Search actions">
             <button class="search-filter-btn" id="case" title="Match case" aria-label="Match case" aria-pressed="false"><span class="codicon codicon-case-sensitive" aria-hidden="true"></span></button>
             <button class="search-filter-btn" id="word" title="Match whole word" aria-label="Match whole word" aria-pressed="false"><span class="codicon codicon-whole-word" aria-hidden="true"></span></button>
             <button class="search-filter-btn" id="regex" title="Use regular expression" aria-label="Use regular expression" aria-pressed="false"><span class="codicon codicon-regex" aria-hidden="true"></span></button>
+            <button class="search-clear" id="clear-query" type="button" title="Clear Search" aria-label="Clear Search" hidden><span class="codicon codicon-close" aria-hidden="true"></span></button>
           </span>
         </div>
       </div>
@@ -441,6 +448,8 @@ class SourceSearchViewProvider {
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const query = document.getElementById('query');
+    const searchBox = document.getElementById('search-box');
+    const clearQuery = document.getElementById('clear-query');
     const scope = document.getElementById('scope');
     const searchToggle = document.getElementById('search-toggle');
     const queryDetails = document.getElementById('query-details');
@@ -538,6 +547,18 @@ class SourceSearchViewProvider {
       if (searchTimer !== null) clearTimeout(searchTimer);
       searchTimer = null;
     }
+    function updateClearButton() {
+      const hasQuery = query.value.length > 0;
+      clearQuery.hidden = !hasQuery;
+      searchBox.classList.toggle('has-query', hasQuery);
+    }
+    function clearQueryValue() {
+      cancelScheduledSearch();
+      query.value = '';
+      updateClearButton();
+      vscode.postMessage({ type: 'clearResults' });
+      query.focus();
+    }
     function scheduleSearch() {
       cancelScheduledSearch();
       if (composing) return;
@@ -580,6 +601,7 @@ class SourceSearchViewProvider {
     searchToggle.addEventListener('click', toggleDetails);
     detailsToggle.addEventListener('click', toggleDetails);
     query.addEventListener('input', (event) => {
+      updateClearButton();
       if (event.isComposing) { cancelScheduledSearch(); return; }
       scheduleSearch();
     });
@@ -594,13 +616,14 @@ class SourceSearchViewProvider {
         event.preventDefault();
         cancelScheduledSearch();
         if (running) vscode.postMessage({ type: 'cancel' });
-        else { query.value = ''; vscode.postMessage({ type: 'clearResults' }); }
+        else clearQueryValue();
       }
     });
     scope.addEventListener('change', () => { if (query.value.trim()) sendSearch(); });
     document.getElementById('regex').addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); setFilter('regex', 'regex'); });
     document.getElementById('case').addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); setFilter('case', 'matchCase'); });
     document.getElementById('word').addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); setFilter('word', 'wholeWord'); });
+    clearQuery.addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); clearQueryValue(); });
     openEditor.addEventListener('click', () => vscode.postMessage({ type: 'openInEditor', options: latestOptions, results: lastBatch }));
 
     function reset() {
@@ -696,7 +719,7 @@ class SourceSearchViewProvider {
           if (changed && searchTimer !== null) scheduleSearch();
           break;
         }
-        case 'focusQuery': query.focus(); break;
+        case 'focusQuery': query.focus(); query.select(); break;
         case 'searchStarted': latestOptions = message.options || latestOptions; syncFilterButtons(latestOptions); reset(); running = true; updateStatus(); break;
         case 'appendResults': addMatches(message.results || message.batch || []); break;
         case 'searchProgress':
@@ -711,6 +734,7 @@ class SourceSearchViewProvider {
         case 'clearResults': running = false; latestOptions = {}; reset(); updateStatus(); break;
       }
     });
+    updateClearButton();
     vscode.postMessage({ type: 'ready' });
   </script>
 </body>
