@@ -2,6 +2,13 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.1.16] - 2026-10-19
+
+### Fixed
+
+- Resize the extension icon to 256 × 256 pixels so it stays below the
+  Marketplace's 1024 KB file-size limit and no longer blocks VSIX uploads.
+
 ## [2.1.15] - 2026-10-19
 
 ### Changed

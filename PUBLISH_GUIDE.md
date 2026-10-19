@@ -47,5 +47,5 @@ OVSX_TOKEN=<token> npx ovsx publish go-interface-lens-1.0.3.vsix
 1. 更新 `package.json` 中的 SemVer 版本。
 2. 更新 `CHANGELOG.md`。
 3. 运行全部测试。
-4. 重新打包并核验 VSIX 内的 Publisher、名称与版本。
+4. 重新打包并核验 VSIX 内的 Publisher、名称与版本，以及图标文件不超过 1024 KB。
 5. 创建 Git tag 和 GitHub Release 后再发布市场版本。
