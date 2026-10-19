@@ -11,6 +11,7 @@ const {
 } = require('./search');
 const { resolveLockedModuleDirs } = require('./gomod');
 const { collectSearchFiles, planSearchJobs, rootBatches } = require('./source-search-plan');
+const { SourceSearchInventory } = require('./source-search-inventory');
 
 const DEFAULT_MAX_RESULTS = 2000;
 const DEFAULT_MAX_FILES = 1000;
@@ -346,6 +347,22 @@ class SourceSearchService {
         this.parallelism = Math.min(8, resolveRipgrepProcessConcurrency(options.parallelism));
         this.runRipgrep = options.runRipgrep || runRipgrepJson;
         this.collectFiles = options.collectFiles || collectSearchFiles;
+        this.inventory = new SourceSearchInventory({
+            collectFiles: this.collectFiles, statFile: options.statFile,
+            watchRoots: options.watchRoots, log: this.log,
+        });
+        this.searchControllers = new Set();
+        this.disposed = false;
+    }
+
+    clearCache() { this.inventory.clear(); }
+
+    notifyFileChange(file, type = 'change') { this.inventory.notify({ file, type }); }
+
+    dispose() {
+        this.disposed = true;
+        for (const controller of this.searchControllers) controller.abort();
+        this.inventory.dispose();
     }
 
     resolveRoots(options = {}) {
@@ -358,7 +375,7 @@ class SourceSearchService {
     }
 
     async search(options = {}, progress = {}) {
-        if (progress.signal && progress.signal.aborted) throw createCancellationError();
+        if (this.disposed || (progress.signal && progress.signal.aborted)) throw createCancellationError();
         const started = Date.now();
         const query = typeof options.query === 'string' ? options.query : '';
         if (!query.trim()) return { query, results: [], totalMatches: 0, totalFiles: 0, truncated: false, roots: [] };
@@ -381,7 +398,7 @@ class SourceSearchService {
             1,
             Number(options.maxFiles) || Number(config.sourceSearchMaxFiles) || DEFAULT_MAX_FILES
         );
-        const { excludedFolders } = pathPatternsFromConfig(config);
+        const { excludedFolders, excludedFiles } = pathPatternsFromConfig(config);
         const includeGlobs = Array.isArray(options.includeGlobs) && options.includeGlobs.length > 0
             ? options.includeGlobs
             : DEFAULT_GLOBS;
@@ -397,6 +414,7 @@ class SourceSearchService {
         args.push('-e', query);
 
         const controller = new AbortController();
+        this.searchControllers.add(controller);
         const cancel = () => controller.abort();
         if (progress.signal) {
             progress.signal.addEventListener('abort', cancel, { once: true });
@@ -480,6 +498,16 @@ class SourceSearchService {
                 const root = findRoot(file);
                 if (root) dirtyFiles.set(file, { root, text: document.getText() });
             }
+            const inventoryState = this.inventory.prepare(
+                JSON.stringify([roots.map((root) => root.root), fileArgs, excludedFiles, excludedFolders]),
+                () => {
+                    // One module-cache watcher covers all locked versions. Local
+                    // replaces and other external roots get their own coverage.
+                    const modCache = roots.some((root) => root.scope === 'dependency') ? resolveGoModCache(config.goModCache) : null;
+                    const watchRoots = [...new Set(roots.map((root) => root.scope === 'dependency' && modCache && isWithin(root.root, modCache) ? modCache : root.root))];
+                    return watchRoots.filter((root) => !watchRoots.some((other) => root !== other && isWithin(root, other)));
+                }
+            );
             const listedFiles = new Set();
             let jobCount = 0;
             let metadataMs = 0;
@@ -499,16 +527,15 @@ class SourceSearchService {
                 const metadataStarted = Date.now();
                 const inventory = [];
                 await runSearchJobs(rootBatches(scopedRoots), this.parallelism, controller, async (batch, threads) => {
-                    const files = await this.collectFiles(this.rg, ['--files', '--null', '--threads', String(threads), ...fileArgs, '--', ...batch.roots.map((root) => root.root)], batch.roots[0], {
+                    const files = await this.inventory.get(inventoryState, this.rg, ['--files', '--null', '--threads', String(threads), ...fileArgs, '--', ...batch.roots.map((root) => root.root)], batch.roots[0], {
                         signal: controller.signal,
-                        includeFile: (file) => {
-                            if (listedFiles.has(file) || dirtyFiles.has(file)) return false;
-                            if (!fileMatchesConfig(file, config) || folderMatchesConfig(file, config)) return false;
-                            listedFiles.add(file);
-                            return true;
-                        },
+                        includeFile: (file) => fileMatchesConfig(file, config) && !folderMatchesConfig(file, config),
                     });
                     for (const file of files) {
+                        // Overlays and cross-batch deduplication belong to this
+                        // query; the reusable disk inventory must include dirty files.
+                        if (listedFiles.has(file.file) || dirtyFiles.has(file.file)) continue;
+                        listedFiles.add(file.file);
                         const root = findRoot(file.file);
                         if (root) inventory.push({ ...file, root });
                     }
@@ -538,7 +565,7 @@ class SourceSearchService {
             flush();
             await delivery;
             if (deliveryError) throw deliveryError;
-            if (progress.signal && progress.signal.aborted) throw createCancellationError();
+            if (this.disposed || (progress.signal && progress.signal.aborted)) throw createCancellationError();
             const results = [...byFile.values()].sort((left, right) => scopeRank(left.scope) - scopeRank(right.scope) || left.file.localeCompare(right.file));
             for (const entry of results) entry.matches.sort((left, right) => left.line - right.line || left.column - right.column);
             if (progress.onProgress) await progress.onProgress({ totalMatches, totalFiles: results.length, truncated });
@@ -547,6 +574,7 @@ class SourceSearchService {
         } finally {
             clearTimeout(timer);
             if (progress.signal) progress.signal.removeEventListener('abort', cancel);
+            this.searchControllers.delete(controller);
             controller.abort();
             await delivery;
         }

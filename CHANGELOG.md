@@ -2,6 +2,17 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.1.15] - 2026-10-19
+
+### Changed
+
+- Reuse source-search file inventories across keyword changes, refreshing only
+  changed file sizes and removing deleted files through file-system events.
+- Recheck membership after file creation or ignore-rule changes while retaining
+  unchanged sizes; rebuild inventories when search filters or roots change.
+- Watch workspace, dependency and standard-library roots on demand, and release
+  watchers when searches are reconfigured, caches are cleared or the extension stops.
+
 ## [2.1.14] - 2026-10-08
 
 ### Changed
