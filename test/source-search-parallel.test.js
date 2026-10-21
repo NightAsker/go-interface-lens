@@ -9,7 +9,7 @@ const originalResolve = Module._resolveFilename;
 Module._resolveFilename = function (request, ...rest) {
     return request === 'vscode' ? path.join(__dirname, 'vscode-stub.js') : originalResolve.call(this, request, ...rest);
 };
-const { SourceSearchService, planSearchJobs, runRipgrepJson } = require('../src/source-search');
+const { SourceSearchService, runRipgrepJson } = require('../src/source-search');
 Module._resolveFilename = originalResolve;
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'go-source-parallel-'));
@@ -26,7 +26,6 @@ function match(file, line = 1, text = 'needle') {
 function fakeService(roots, runRipgrep, extra = {}) {
     const service = new SourceSearchService({
         parallelism: 8, runRipgrep,
-        collectFiles: async (_command, args) => args.slice(args.indexOf('--') + 1).map((directory) => ({ file: path.join(directory, 'service.go'), size: 1024 })),
         ...extra,
     });
     service.resolveRoots = () => roots;
@@ -39,22 +38,18 @@ async function rejectsCode(promise, code, label) {
 }
 
 async function run() {
-    console.log('== workload-based search tasks ==');
+    console.log('== direct root searches ==');
     const roots = Array.from({ length: 200 }, (_, i) => root('pkg' + i));
-    const files = roots.map((root, index) => ({ root, file: path.join(root.root, 'service.go'), size: index === 0 ? 80 * 1024 * 1024 : 1024 }));
-    const jobs = planSearchJobs(files, 8);
-    eq('largest measured file starts first in its own task', jobs[0].files.map((file) => file.file), [files[0].file]);
-    eq('every file occurs in exactly one task', new Set(jobs.flatMap((job) => job.files.map((item) => item.file))).size, files.length);
-    eq('job construction does not duplicate files', jobs.reduce((sum, job) => sum + job.files.length, 0), files.length);
-    assert('small packages share tasks to reduce process startup', jobs.some((job) => job.files.length > 1));
-    assert('task command lines and file counts are bounded', jobs.every((job) => job.pathBytes <= 24000 && job.files.length <= 256));
-    const largePackage = Array.from({ length: 64 }, (_, index) => ({ root: roots[0], file: path.join(roots[0].root, `part${index}.go`), size: 1024 * 1024 }));
-    const split = planSearchJobs(largePackage, 8);
-    assert('a single large package is split across several balanced tasks', split.length >= 4 && Math.max(...split.map((job) => job.bytes)) <= 8 * 1024 * 1024);
-    const tiny = files.slice(1, 101).map((file) => ({ ...file, file: path.join(tmp, 'tiny', path.basename(file.root.root) + '.go'), size: 1 }));
-    const sameBytes = [{ root: roots[0], file: path.join(tmp, 'single', 'one.go'), size: 100 }];
-    const countsMatter = planSearchJobs([...sameBytes, ...tiny], 8);
-    assert('many small files contribute to scheduling weight', countsMatter[0].files.length > 1);
+    const commands = [];
+    await fakeService(roots, async (_command, args) => { commands.push(args); return {}; }).search({ query: 'needle' });
+    const targets = commands.map((args) => args.slice(args.indexOf('--') + 1));
+    eq('all roots are searched directly without an explicit file list', targets.flat(), roots.map((entry) => entry.root));
+    assert('root batches bound both path bytes and root counts', targets.every((batch) => batch.length <= 32 && batch.reduce((sum, directory) => sum + Buffer.byteLength(directory) + 1, 0) <= 24000));
+    assert('each direct scan receives include globs and streaming JSON flags', commands.every((args) => args.includes('*.go') && args.includes('--json') && args.includes('--line-buffered') && !args.includes('--files')));
+    const longRoots = Array.from({ length: 20 }, (_, i) => root('long' + i + '/' + 'a'.repeat(1500)));
+    const longCommands = [];
+    await fakeService(longRoots, async (_command, args) => { longCommands.push(args.slice(args.indexOf('--') + 1)); return {}; }).search({ query: 'needle' });
+    assert('long root paths split before the command-line byte budget', longCommands.length > 1 && longCommands.every((batch) => batch.reduce((sum, directory) => sum + Buffer.byteLength(directory) + 1, 0) <= 24000));
 
     console.log('\n== bounded native threads and dynamic queue ==');
     let activeThreads = 0;
@@ -63,7 +58,7 @@ async function run() {
     let peakProcesses = 0;
     const pending = [];
     let drain = false;
-    const many = roots.slice(0, 12);
+    const many = roots;
     const service = fakeService(many, async (_command, args, _root, handlers) => {
         const threads = Number(args[args.indexOf('--threads') + 1]);
         activeThreads += threads;
@@ -73,7 +68,7 @@ async function run() {
         const gate = deferred();
         pending.push(gate);
         if (!drain) await gate.promise;
-        for (const file of args.slice(args.indexOf('--') + 1)) handlers.onMatch(match(file));
+        for (const directory of args.slice(args.indexOf('--') + 1)) handlers.onMatch(match(path.join(directory, 'service.go')));
         activeThreads -= threads;
         activeProcesses--;
         return { stats: { bytes_searched: 4096 } };
@@ -83,7 +78,7 @@ async function run() {
     eq('four processes start within the total thread budget', [pending.length, activeThreads], [4, 8]);
     pending[3].resolve();
     await tick();
-    eq('a free worker takes another package without waiting for the slowest', pending.length, 5);
+    eq('a free worker takes another root batch without waiting for the slowest', pending.length, 5);
     drain = true;
     for (const gate of pending) gate.resolve();
     const combined = await search;
@@ -96,16 +91,7 @@ async function run() {
         singleThreads = Number(args[args.indexOf('--threads') + 1]);
         return { stats: { bytes_searched: 1024 } };
     }).search({ query: 'needle' });
-    eq('one large workspace uses all available native scan threads', singleThreads, 8);
-
-    const startOrder = [];
-    const measuredService = fakeService(many, async (_command, args, entry, handlers) => {
-        startOrder.push(entry.root);
-        const bytes = entry.root === many[11].root ? 100000000 : 1024;
-        return { stats: { bytes_searched: bytes } };
-    }, { collectFiles: async () => many.map((entry) => ({ file: path.join(entry.root, 'service.go'), size: entry.root === many[11].root ? 100000000 : 1024 })) });
-    await measuredService.search({ query: 'needle' });
-    eq('the first query starts the largest measured package without history', startOrder[0], many[11].root);
+    eq('one workspace uses one process with the full native thread budget', singleThreads, 8);
 
     console.log('\n== streaming, limits and scope priority ==');
     const batchSeen = deferred();
@@ -114,6 +100,8 @@ async function run() {
     let batches = 0;
     const streaming = fakeService([roots[0]], async (_command, _args, entry, handlers) => {
         handlers.onMatch(match(path.join(entry.root, 'service.go')));
+        await Promise.resolve();
+        eq('the first match is delivered without waiting for the batch timer', batches, 1);
         await finishEngine.promise;
         engineFinished = true;
         return { stats: { bytes_searched: 1234 } };
@@ -178,6 +166,17 @@ async function run() {
     eq('cancellation stops all active workers and starts no queued work', [canceled, starts], [4, 4]);
     await rejectsCode(cancellable.search({ query: 'needle' }, { signal: stop.signal }), 'SEARCH_CANCELLED', 'pre-canceled query starts no work');
     eq('pre-canceled search does not launch workers', starts, 4);
+
+    let disposedScanStopped = false;
+    const disposable = fakeService([roots[0]], (_command, _args, _root, handlers) => new Promise((resolve) => {
+        handlers.signal.addEventListener('abort', () => { disposedScanStopped = true; resolve({}); }, { once: true });
+    }));
+    const disposedSearch = disposable.search({ query: 'needle' });
+    await tick();
+    disposable.dispose();
+    await rejectsCode(disposedSearch, 'SEARCH_CANCELLED', 'disposing the service cancels its pending search');
+    assert('disposing the service stops active scans', disposedScanStopped);
+    await rejectsCode(disposable.search({ query: 'needle' }), 'SEARCH_CANCELLED', 'disposed services do not launch another scan');
 
     let siblingsStopped = 0;
     const failed = fakeService(many, async (_command, _args, entry, handlers) => {

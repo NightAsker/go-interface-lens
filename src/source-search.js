@@ -10,12 +10,12 @@ const {
     resolveRipgrepProcessConcurrency,
 } = require('./search');
 const { resolveLockedModuleDirs } = require('./gomod');
-const { collectSearchFiles, planSearchJobs, rootBatches } = require('./source-search-plan');
-const { SourceSearchInventory } = require('./source-search-inventory');
 
 const DEFAULT_MAX_RESULTS = 2000;
 const DEFAULT_MAX_FILES = 1000;
 const MAX_SEARCH_PROCESSES = 4;
+const MAX_ROOTS_PER_TASK = 32;
+const MAX_PATH_BYTES = 24000;
 const RESULT_BATCH_DELAY = 50;
 const RESULT_BATCH_SIZE = 100;
 const DEFAULT_GLOBS = ['*.go', 'go.mod', 'go.sum', 'go.work', 'go.work.sum'];
@@ -259,6 +259,21 @@ function createCancellationError() {
     return error;
 }
 
+function rootBatches(roots) {
+    const batches = [];
+    for (const root of roots) {
+        const size = Buffer.byteLength(root.root) + 1;
+        let batch = batches[batches.length - 1];
+        if (!batch || batch.roots.length >= MAX_ROOTS_PER_TASK || batch.pathBytes + size > MAX_PATH_BYTES) {
+            batch = { roots: [], pathBytes: 0 };
+            batches.push(batch);
+        }
+        batch.roots.push(root);
+        batch.pathBytes += size;
+    }
+    return batches;
+}
+
 function runRipgrepJson(command, args, rootInfo, handlers = {}) {
     return new Promise((resolve, reject) => {
         const signal = handlers.signal;
@@ -346,23 +361,13 @@ class SourceSearchService {
         this.rg = options.rg || findRipgrep() || 'rg';
         this.parallelism = Math.min(8, resolveRipgrepProcessConcurrency(options.parallelism));
         this.runRipgrep = options.runRipgrep || runRipgrepJson;
-        this.collectFiles = options.collectFiles || collectSearchFiles;
-        this.inventory = new SourceSearchInventory({
-            collectFiles: this.collectFiles, statFile: options.statFile,
-            watchRoots: options.watchRoots, log: this.log,
-        });
         this.searchControllers = new Set();
         this.disposed = false;
     }
 
-    clearCache() { this.inventory.clear(); }
-
-    notifyFileChange(file, type = 'change') { this.inventory.notify({ file, type }); }
-
     dispose() {
         this.disposed = true;
         for (const controller of this.searchControllers) controller.abort();
-        this.inventory.dispose();
     }
 
     resolveRoots(options = {}) {
@@ -390,6 +395,7 @@ class SourceSearchService {
         let stdlibRoot = options.stdlibRoot;
         if ((options.scope || 'all') === 'stdlib' && !stdlibRoot) stdlibRoot = await resolveGoRoot();
         const roots = this.resolveRoots({ ...options, config, stdlibRoot });
+        const rootsMs = Date.now() - started;
         const maxResults = Math.max(
             1,
             Number(options.maxResults) || Number(config.sourceSearchMaxResults) || DEFAULT_MAX_RESULTS
@@ -398,7 +404,7 @@ class SourceSearchService {
             1,
             Number(options.maxFiles) || Number(config.sourceSearchMaxFiles) || DEFAULT_MAX_FILES
         );
-        const { excludedFolders, excludedFiles } = pathPatternsFromConfig(config);
+        const { excludedFolders } = pathPatternsFromConfig(config);
         const includeGlobs = Array.isArray(options.includeGlobs) && options.includeGlobs.length > 0
             ? options.includeGlobs
             : DEFAULT_GLOBS;
@@ -411,7 +417,7 @@ class SourceSearchService {
         for (const folder of excludedFolders) {
             if (/^[A-Za-z0-9_.*?@+-]+$/.test(folder)) fileArgs.push('--glob', `!**/${folder}/**`);
         }
-        args.push('-e', query);
+        args.push(...fileArgs, '-e', query);
 
         const controller = new AbortController();
         this.searchControllers.add(controller);
@@ -485,7 +491,7 @@ class SourceSearchService {
             delta.matches.push(match);
             pendingCount++;
             if (totalMatches >= maxResults) { truncated = true; controller.abort(); }
-            if (pendingCount >= RESULT_BATCH_SIZE) flush();
+            if (totalMatches === 1 || pendingCount >= RESULT_BATCH_SIZE) flush();
             else if (!timer) timer = setTimeout(flush, RESULT_BATCH_DELAY);
         };
         try {
@@ -498,19 +504,7 @@ class SourceSearchService {
                 const root = findRoot(file);
                 if (root) dirtyFiles.set(file, { root, text: document.getText() });
             }
-            const inventoryState = this.inventory.prepare(
-                JSON.stringify([roots.map((root) => root.root), fileArgs, excludedFiles, excludedFolders]),
-                () => {
-                    // One module-cache watcher covers all locked versions. Local
-                    // replaces and other external roots get their own coverage.
-                    const modCache = roots.some((root) => root.scope === 'dependency') ? resolveGoModCache(config.goModCache) : null;
-                    const watchRoots = [...new Set(roots.map((root) => root.scope === 'dependency' && modCache && isWithin(root.root, modCache) ? modCache : root.root))];
-                    return watchRoots.filter((root) => !watchRoots.some((other) => root !== other && isWithin(root, other)));
-                }
-            );
-            const listedFiles = new Set();
             let jobCount = 0;
-            let metadataMs = 0;
             // Finish workspace work before admitting dependencies to the global
             // result budget; fast dependency matches cannot crowd out the project.
             for (const scope of ['workspace', 'dependency', 'stdlib']) {
@@ -524,34 +518,13 @@ class SourceSearchService {
                 }
                 if (controller.signal.aborted) break;
                 const scopedRoots = roots.filter((root) => root.scope === scope);
-                const metadataStarted = Date.now();
-                const inventory = [];
-                await runSearchJobs(rootBatches(scopedRoots), this.parallelism, controller, async (batch, threads) => {
-                    const files = await this.inventory.get(inventoryState, this.rg, ['--files', '--null', '--threads', String(threads), ...fileArgs, '--', ...batch.roots.map((root) => root.root)], batch.roots[0], {
-                        signal: controller.signal,
-                        includeFile: (file) => fileMatchesConfig(file, config) && !folderMatchesConfig(file, config),
-                    });
-                    for (const file of files) {
-                        // Overlays and cross-batch deduplication belong to this
-                        // query; the reusable disk inventory must include dirty files.
-                        if (listedFiles.has(file.file) || dirtyFiles.has(file.file)) continue;
-                        listedFiles.add(file.file);
-                        const root = findRoot(file.file);
-                        if (root) inventory.push({ ...file, root });
-                    }
-                });
-                const elapsed = Date.now() - metadataStarted;
-                metadataMs += elapsed;
-                if (controller.signal.aborted) break;
-                const jobs = planSearchJobs(inventory, this.parallelism);
-                const packageCount = new Set(inventory.map((file) => path.dirname(file.file))).size;
-                const totalBytes = inventory.reduce((sum, file) => sum + file.size, 0);
-                this.log(`source search ${scope}: ${inventory.length} files, ${packageCount} packages, ${totalBytes} bytes, metadata ${elapsed} ms, ${jobs.length} tasks`);
-                jobCount += jobs.length;
-                // These exact files already passed rg's ignore/glob rules and
-                // exclusions. Avoid re-enumerating directories for every shard.
+                const jobs = rootBatches(scopedRoots);
+                if (jobs.length) this.log(`source search ${scope}: ${scopedRoots.length} roots, ${jobs.length} tasks`);
+                // Let rg walk and search each root in one pass, so matches can
+                // stream before the rest of the tree has even been discovered.
                 await runSearchJobs(jobs, this.parallelism, controller, async (job, threads) => {
-                    await this.runRipgrep(this.rg, [...args, '--threads', String(threads), '--', ...job.files.map((file) => file.file)], job.files[0].root, {
+                    jobCount++;
+                    await this.runRipgrep(this.rg, [...args, '--threads', String(threads), '--', ...job.roots.map((root) => root.root)], job.roots[0], {
                         signal: controller.signal,
                         onMatch: (record) => {
                             const root = findRoot(record.file);
@@ -569,7 +542,7 @@ class SourceSearchService {
             const results = [...byFile.values()].sort((left, right) => scopeRank(left.scope) - scopeRank(right.scope) || left.file.localeCompare(right.file));
             for (const entry of results) entry.matches.sort((left, right) => left.line - right.line || left.column - right.column);
             if (progress.onProgress) await progress.onProgress({ totalMatches, totalFiles: results.length, truncated });
-            this.log(`source search: ${jobCount} tasks, up to ${this.parallelism} scan threads, metadata ${metadataMs} ms, first batch ${firstResultMs ?? '-'} ms, total ${Date.now() - started} ms`);
+            this.log(`source search: ${jobCount} tasks, up to ${this.parallelism} scan threads, roots ${rootsMs} ms, first batch ${firstResultMs ?? '-'} ms, total ${Date.now() - started} ms`);
             return { query, results, totalMatches, totalFiles: results.length, truncated, roots };
         } finally {
             clearTimeout(timer);
@@ -590,5 +563,4 @@ module.exports = {
     matchTextLines,
     resolveSourceRoots,
     runRipgrepJson,
-    planSearchJobs,
 };

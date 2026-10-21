@@ -2,6 +2,29 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.1.18] - 2026-10-21
+
+### Changed
+
+- Search source roots directly with ripgrep and stream the first match immediately,
+  then append batches without waiting for the whole tree to finish scanning.
+- Remove the full file enumeration, size statistics, per-file task planning and
+  persistent inventory watchers from workspace, dependency and standard-library
+  source searches. A single workspace uses one native multithreaded scan.
+- Preserve workspace-first results, go.mod-locked dependencies, local replacements,
+  ignore rules, unsaved text, global limits and cancellation of active scans.
+
+## [2.1.17] - 2026-10-20
+
+### Fixed
+
+- Enumerate dependency source files and sizes on demand for each query instead
+  of recursively watching the entire Go module cache in every VS Code window.
+- Preserve go.mod-locked versions and local replacements, discovering dependency
+  additions, edits, deletions and ignore-rule changes without watcher events.
+- Keep incremental workspace and standard-library inventories and skip dependency
+  enumeration when workspace results already reach the search limit.
+
 ## [2.1.16] - 2026-10-19
 
 ### Fixed

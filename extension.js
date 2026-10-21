@@ -414,10 +414,6 @@ function activate(context) {
     if (typeof vscode.workspace.onDidChangeConfiguration === 'function') {
         context.subscriptions.push(
             vscode.workspace.onDidChangeConfiguration((event) => {
-                if (['sourceSearchExcludedFolders', 'sourceSearchExcludedFilePatterns', 'goModCache', 'searchDependencies']
-                    .some((setting) => event.affectsConfiguration(`goInterfaceLens.${setting}`))) {
-                    sourceSearchService.clearCache();
-                }
                 if (
                     !event.affectsConfiguration('goInterfaceLens.excludedFolders') &&
                     !event.affectsConfiguration('goInterfaceLens.excludedFilePatterns') &&
@@ -454,7 +450,6 @@ function activate(context) {
         vscode.commands.registerCommand('go-interface-lens.gotoInterface', gotoInterface),
         vscode.commands.registerCommand('go-interface-lens.clearCache', () => {
             workspaceIndex.clear();
-            sourceSearchService.clearCache();
             provider._onDidChangeCodeLenses.fire();
             vscode.window.showInformationMessage('Go Interface Lens: index cleared');
         }),
@@ -467,7 +462,6 @@ function activate(context) {
         }),
         vscode.workspace.onDidChangeTextDocument((event) => scheduleDocumentOverlay(event.document)),
         vscode.workspace.onDidSaveTextDocument((document) => {
-            if (document.uri.fsPath) sourceSearchService.notifyFileChange(document.uri.fsPath);
             if (document.languageId !== 'go' || !document.uri.fsPath) return;
             cancelOverlayTimer(document.uri.fsPath);
             workspaceIndex.updateFileText(document.uri.fsPath, document.getText());
@@ -484,25 +478,6 @@ function activate(context) {
             },
         }
     );
-
-    if (typeof vscode.workspace.onDidChangeWorkspaceFolders === 'function') {
-        context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(() => sourceSearchService.clearCache()));
-    }
-    for (const [event, type] of [['onDidCreateFiles', 'create'], ['onDidDeleteFiles', 'delete']]) {
-        if (typeof vscode.workspace[event] === 'function') {
-            context.subscriptions.push(vscode.workspace[event](({ files }) => {
-                for (const uri of files) sourceSearchService.notifyFileChange(uri.fsPath, type);
-            }));
-        }
-    }
-    if (typeof vscode.workspace.onDidRenameFiles === 'function') {
-        context.subscriptions.push(vscode.workspace.onDidRenameFiles(({ files }) => {
-            for (const { oldUri, newUri } of files) {
-                sourceSearchService.notifyFileChange(oldUri.fsPath, 'delete');
-                sourceSearchService.notifyFileChange(newUri.fsPath, 'create');
-            }
-        }));
-    }
 
     log('All components registered');
 }
