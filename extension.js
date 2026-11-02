@@ -433,6 +433,15 @@ function activate(context) {
         vscode.commands.registerCommand('go-interface-lens.searchSource', async () => {
             await sourceSearchView.focusSearch();
         }),
+        vscode.commands.registerCommand('go-interface-lens.clearSourceSearch', () => {
+            sourceSearchView.clearSearch();
+        }),
+        vscode.commands.registerCommand('go-interface-lens.collapseAllResults', () => {
+            sourceSearchView.setResultsCollapsed(true);
+        }),
+        vscode.commands.registerCommand('go-interface-lens.expandAllResults', () => {
+            sourceSearchView.setResultsCollapsed(false);
+        }),
         ...(vscode.window.registerWebviewViewProvider
             ? [
                   vscode.window.registerWebviewViewProvider(

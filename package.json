@@ -2,7 +2,7 @@
   "name": "go-interface-lens",
   "displayName": "Go Interface Lens",
   "description": "Fast bidirectional CodeLens navigation between Go interfaces and their implementations",
-  "version": "2.1.18",
+  "version": "2.1.19",
   "publisher": "xiaoyao",
   "author": {
     "name": "xiaoyao"
@@ -35,7 +35,7 @@
       "activitybar": [
         {
           "id": "go-interface-lens",
-          "title": "Go Interface Lens",
+          "title": "Source Search",
           "icon": "media/source-search.svg"
         }
       ]
@@ -45,7 +45,8 @@
         {
           "type": "webview",
           "id": "go-interface-lens.sourceSearch",
-          "name": "Source Search"
+          "name": "Source Search",
+          "contextualTitle": "Source Search"
         }
       ]
     },
@@ -54,6 +55,23 @@
         "command": "go-interface-lens.searchSource",
         "title": "Go: Search Source",
         "category": "Go"
+      },
+      {
+        "command": "go-interface-lens.clearSourceSearch",
+        "title": "Clear Search",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "go-interface-lens.collapseAllResults",
+        "title": "Collapse All",
+        "icon": "$(collapse-all)",
+        "enablement": "goInterfaceLens.sourceSearchResultState == expanded"
+      },
+      {
+        "command": "go-interface-lens.expandAllResults",
+        "title": "Expand All",
+        "icon": "$(expand-all)",
+        "enablement": "goInterfaceLens.sourceSearchResultState == collapsed"
       },
       {
         "command": "go-interface-lens.showImplementations",
@@ -76,6 +94,39 @@
         "category": "Go"
       }
     ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "go-interface-lens.clearSourceSearch",
+          "when": "view == go-interface-lens.sourceSearch",
+          "group": "navigation@1"
+        },
+        {
+          "command": "go-interface-lens.collapseAllResults",
+          "when": "view == go-interface-lens.sourceSearch && goInterfaceLens.sourceSearchResultState != collapsed",
+          "group": "navigation@2"
+        },
+        {
+          "command": "go-interface-lens.expandAllResults",
+          "when": "view == go-interface-lens.sourceSearch && goInterfaceLens.sourceSearchResultState == collapsed",
+          "group": "navigation@2"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "go-interface-lens.clearSourceSearch",
+          "when": "false"
+        },
+        {
+          "command": "go-interface-lens.collapseAllResults",
+          "when": "false"
+        },
+        {
+          "command": "go-interface-lens.expandAllResults",
+          "when": "false"
+        }
+      ]
+    },
     "configuration": {
       "title": "Go Interface Lens",
       "properties": {

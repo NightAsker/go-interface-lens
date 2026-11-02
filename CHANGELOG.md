@@ -2,6 +2,23 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.1.19] - 2026-11-02
+
+### Added
+
+- Add native title-bar actions to clear the current source search and toggle
+  all result files between collapsed and expanded states, including workspace,
+  dependency and standard-library results.
+- Switch the toolbar icon and tooltip between Collapse All and Expand All,
+  preserving the selected state for newly streamed files and manual file toggles.
+- Cancel active and scheduled searches when clearing, remove the query and
+  results, and return focus to the search input while retaining search filters.
+
+### Changed
+
+- Shorten the sidebar and view titles to Source Search, keeping toolbar actions
+  out of the search summary so they fit narrow sidebars.
+
 ## [2.1.18] - 2026-10-21
 
 ### Changed

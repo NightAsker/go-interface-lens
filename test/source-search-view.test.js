@@ -81,6 +81,14 @@ class Element {
         return this.html;
     }
 
+    set className(value) {
+        this.classList.values = new Set(value.split(/\s+/).filter(Boolean));
+    }
+
+    get className() {
+        return [...this.classList.values].join(' ');
+    }
+
     appendChild(child) {
         this.children.push(child);
         child.parent = this;
@@ -309,6 +317,58 @@ add('/a.go', 2);
 assert('duplicate streamed matches do not rebuild a file', incremental.elements.results.querySelectorAll('.file')[0] === updated[0]);
 post({ type: 'searchFinished', resultCount: 4, fileCount: 3 });
 assert('streamed result totals are not double-counted', incremental.elements.status.innerHTML.includes('<strong>4</strong> results in <strong>3</strong> files'));
+
+console.log('\n== collapse and expand all source search results ==');
+const resultCollapse = createWebviewHarness();
+const resultPost = (data) => resultCollapse.window.dispatch('message', { data });
+const collapseState = () => resultCollapse.messages.filter((message) => message.type === 'resultCollapseState').at(-1);
+const setResultCollapse = (collapsed) => resultPost({ type: 'setResultsCollapsed', collapsed });
+eq('empty view disables the native result toolbar action', collapseState(), { type: 'resultCollapseState', hasResults: false, collapsed: false });
+resultPost({ type: 'searchStarted', options: { query: 'needle' } });
+resultPost({ type: 'appendResults', results: [
+    { file: '/workspace/service.go', scope: 'workspace', line: 10, text: 'needle' },
+] });
+eq('workspace-only results enable the native collapse action', collapseState(), { type: 'resultCollapseState', hasResults: true, collapsed: false });
+resultPost({ type: 'appendResults', results: [
+    { file: '/go/pkg/mod/acme/client.go', scope: 'dependency', line: 20, text: 'needle' },
+    { file: '/goroot/src/net/http/client.go', scope: 'stdlib', line: 30, text: 'needle' },
+] });
+const resultFiles = () => resultCollapse.elements.results.querySelectorAll('.file');
+const fileFor = (needle) => resultFiles().find((file) => file.innerHTML.includes(needle));
+const originalNodes = resultFiles();
+setResultCollapse(true);
+assert('native collapse command collapses dependency file rows', fileFor('/go/pkg/mod/acme/client.go').classList.contains('collapsed'));
+assert('native collapse command collapses workspace file rows', fileFor('/workspace/service.go').classList.contains('collapsed'));
+assert('native collapse command collapses standard-library rows', fileFor('/goroot/src/net/http/client.go').classList.contains('collapsed'));
+assert('collapsing preserves existing file nodes', resultFiles().every((file, index) => file === originalNodes[index]));
+eq('collapsed results switch the native toolbar to expand', collapseState(), { type: 'resultCollapseState', hasResults: true, collapsed: true });
+assert('collapsed rows expose their expanded state', resultFiles().every((file) => file.getAttribute('aria-expanded') === 'false'));
+resultPost({ type: 'appendResults', results: [
+    { file: '/workspace/handler.go', scope: 'workspace', line: 30, text: 'needle' },
+    { file: '/go/pkg/mod/acme/transport.go', scope: 'dependency', line: 30, text: 'needle' },
+    { file: '/goroot/src/io/io.go', scope: 'stdlib', line: 30, text: 'needle' },
+    { file: '/other.go', line: 30, text: 'needle' },
+] });
+assert('new result batches from every scope honor the active collapsed state', resultFiles().every((file) => file.classList.contains('collapsed')));
+fileFor('/workspace/service.go').querySelector('.file-head').dispatch('click');
+eq('manually expanding a workspace file restores the native collapse action', collapseState().collapsed, false);
+resultPost({ type: 'appendResults', results: [{ file: '/workspace/service.go', scope: 'workspace', line: 21, text: 'needle' }] });
+assert('streaming preserves a manually expanded workspace file', !fileFor('/workspace/service.go').classList.contains('collapsed'));
+setResultCollapse(false);
+assert('native expand command expands every result scope', resultFiles().every((file) => !file.classList.contains('collapsed')));
+assert('expanded rows expose their expanded state', resultFiles().every((file) => file.getAttribute('aria-expanded') === 'true'));
+for (const expected of [true, false, true, false]) {
+    setResultCollapse(!collapseState().collapsed);
+    assert(`repeated toolbar clicks ${expected ? 'collapse' : 'expand'} every result`, resultFiles().every((file) => file.classList.contains('collapsed') === expected));
+    eq('toolbar state follows each repeated click', collapseState().collapsed, expected);
+}
+setResultCollapse(true);
+resultPost({ type: 'searchStarted', options: { query: 'new query' } });
+eq('new searches disable the result toolbar while results reset', collapseState().hasResults, false);
+resultPost({ type: 'appendResults', results: [{ file: '/workspace/service.go', scope: 'workspace', line: 20, text: 'new query' }] });
+assert('new searches start with expanded results', !fileFor('/workspace/service.go').classList.contains('collapsed'));
+resultPost({ type: 'clearResults' });
+eq('clearing results disables the native result toolbar', collapseState().hasResults, false);
 
 console.log('\n== search after typing pauses ==');
 const typing = createWebviewHarness();
@@ -585,6 +645,101 @@ async function testNativeSearchConfiguration() {
     assert('disposing the view removes its settings listener', disposed);
 }
 
+async function testNativeResultToolbar() {
+    console.log('\n== native result toolbar ==');
+    const manifest = require('../package.json');
+    const view = manifest.contributes.views['go-interface-lens'][0];
+    eq('sidebar container uses the compact Source Search title', manifest.contributes.viewsContainers.activitybar[0].title, 'Source Search');
+    eq('view title matches its container title', view.name, 'Source Search');
+    eq('moved views keep the compact Source Search title', view.contextualTitle, 'Source Search');
+    for (const [action, icon, title] of [['clearSourceSearch', 'clear-all', 'Clear Search'], ['collapseAllResults', 'collapse-all', 'Collapse All'], ['expandAllResults', 'expand-all', 'Expand All']]) {
+        const command = 'go-interface-lens.' + action;
+        const contribution = manifest.contributes.commands.find((item) => item.command === command);
+        const menu = manifest.contributes.menus['view/title'].find((item) => item.command === command);
+        eq(`${action} uses the native workbench icon`, contribution.icon, '$(' + icon + ')');
+        eq(`${action} uses the matching toolbar tooltip`, contribution.title, title);
+        assert(`${action} is in the native title toolbar`, menu.group.startsWith('navigation'));
+        assert(`${action} is limited to the source search view`, menu.when.includes('view == go-interface-lens.sourceSearch'));
+    }
+
+    const vscode = require(stubPath);
+    const originalCommands = vscode.commands;
+    const calls = [];
+    vscode.commands = { async executeCommand(...args) { calls.push(args); } };
+    const provider = new SourceSearchViewProvider();
+    const outgoing = [];
+    provider._view = { webview: { postMessage(message) { outgoing.push(message); } } };
+    try {
+        await provider._handleMessage({ type: 'resultCollapseState', hasResults: true, collapsed: false });
+        eq('search results enable the native collapse icon', calls.at(-1), ['setContext', 'goInterfaceLens.sourceSearchResultState', 'expanded']);
+        provider.setResultsCollapsed(true);
+        eq('native collapse command reaches the Webview', outgoing.at(-1), { type: 'setResultsCollapsed', collapsed: true });
+        await provider._handleMessage({ type: 'resultCollapseState', hasResults: true, collapsed: true });
+        eq('collapsed results select the native expand icon', calls.at(-1), ['setContext', 'goInterfaceLens.sourceSearchResultState', 'collapsed']);
+        provider.setResultsCollapsed(false);
+        eq('native expand command reaches the Webview', outgoing.at(-1), { type: 'setResultsCollapsed', collapsed: false });
+        await provider._handleMessage({ type: 'resultCollapseState', hasResults: false, collapsed: false });
+        eq('empty results disable the native toolbar action', calls.at(-1), ['setContext', 'goInterfaceLens.sourceSearchResultState', 'empty']);
+        await provider._handleMessage({ type: 'resultCollapseState', hasResults: true, collapsed: true });
+        provider.dispose();
+        eq('disposing the view clears the native toolbar state', calls.at(-1), ['setContext', 'goInterfaceLens.sourceSearchResultState', 'empty']);
+    } finally {
+        provider.dispose();
+        vscode.commands = originalCommands;
+    }
+}
+
+async function testNativeSearchClear() {
+    console.log('\n== native toolbar clears the current search ==');
+    const clearing = createWebviewHarness();
+    let callbacks;
+    let finish;
+    const provider = new SourceSearchViewProvider({ engine: {
+        search(_options, handlers) {
+            callbacks = handlers;
+            return new Promise((resolve) => { finish = resolve; });
+        },
+    } });
+    const outgoing = [];
+    provider._view = { webview: { postMessage(message) {
+        outgoing.push(message);
+        clearing.window.dispatch('message', { data: message });
+    } } };
+    clearing.elements.query.value = 'needle';
+    clearing.elements.scope.value = 'workspace';
+    const pending = provider._startSearch({ query: 'needle', scope: 'workspace', matchCase: true, wholeWord: true });
+    try {
+        callbacks.onBatch([{ file: '/workspace/service.go', scope: 'workspace', line: 10, text: 'needle' }]);
+        clearing.elements.query.value = 'pending next query';
+        clearing.elements.query.dispatch('input');
+        const focusBefore = clearing.elements.query.focusCalls;
+        provider.clearSearch();
+        assert('native clear aborts the active engine search', callbacks.signal.aborted);
+        eq('native clear empties the current search text', clearing.elements.query.value, '');
+        eq('native clear returns focus to the input', clearing.elements.query.focusCalls, focusBefore + 1);
+        assert('native clear hides the input clear button', clearing.elements['clear-query'].hidden);
+        eq('native clear asks the host to clear its results', clearing.messages.at(-1).type, 'clearResults');
+        await provider._handleMessage(clearing.messages.at(-1));
+        eq('native clear removes the displayed results', clearing.elements.results.querySelectorAll('.file').length, 0);
+        eq('native clear restores the initial search prompt', clearing.elements.status.textContent, 'Type to search source');
+        eq('native clear preserves the selected search scope', clearing.elements.scope.value, 'workspace');
+        eq('native clear preserves match case', clearing.elements.case.getAttribute('aria-pressed'), 'true');
+        eq('native clear preserves whole word', clearing.elements.word.getAttribute('aria-pressed'), 'true');
+        const searchesBefore = clearing.messages.filter((message) => message.type === 'search').length;
+        clearing.tick(1000);
+        eq('native clear cancels pending automatic searches', clearing.messages.filter((message) => message.type === 'search').length, searchesBefore);
+        const outgoingBefore = outgoing.length;
+        callbacks.onBatch([{ file: '/workspace/stale.go', text: 'needle' }]);
+        finish({ totalMatches: 999, totalFiles: 999 });
+        await pending;
+        eq('cancelled search callbacks cannot restore cleared results', outgoing.length, outgoingBefore);
+    } finally {
+        finish({ totalMatches: 0, totalFiles: 0 });
+        await pending;
+        provider.dispose();
+    }
+}
+
 async function testOverlappingSearches() {
     console.log('\n== overlapping automatic searches ==');
     for (const ending of ['AbortError', 'Error', 'success']) {
@@ -627,7 +782,7 @@ async function testOverlappingSearches() {
     provider.dispose();
 }
 
-testSearchFocus().then(testNativeSearchConfiguration).then(testOverlappingSearches).then(done).catch((error) => {
+testSearchFocus().then(testNativeSearchConfiguration).then(testNativeResultToolbar).then(testNativeSearchClear).then(testOverlappingSearches).then(done).catch((error) => {
     console.error(error);
     process.exitCode = 1;
 });

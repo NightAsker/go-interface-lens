@@ -11,6 +11,7 @@
 const vscode = require('vscode');
 
 const VIEW_TYPE = 'go-interface-lens.sourceSearch';
+const RESULT_STATE_CONTEXT = 'goInterfaceLens.sourceSearchResultState';
 
 function randomNonce() {
     return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
@@ -50,6 +51,7 @@ class SourceSearchViewProvider {
         this._disposables = [];
         this._searchAbort = null;
         this._searchId = 0;
+        this._resultState = 'empty';
     }
 
     setEngine(engine) {
@@ -62,6 +64,20 @@ class SourceSearchViewProvider {
         if (typeof onOpenInEditor === 'function') this.onOpenInEditor = onOpenInEditor;
         if (typeof onSearch === 'function') this.onSearch = onSearch;
         return this;
+    }
+
+    clearSearch() {
+        this._cancelSearch();
+        this._post({ type: 'clearQuery' });
+    }
+
+    setResultsCollapsed(collapsed) {
+        this._post({ type: 'setResultsCollapsed', collapsed: !!collapsed });
+    }
+
+    async _setResultState(state) {
+        this._resultState = state;
+        await vscode.commands.executeCommand('setContext', RESULT_STATE_CONTEXT, state);
     }
 
     async focusSearch() {
@@ -149,6 +165,11 @@ class SourceSearchViewProvider {
                 return;
             case 'changeScope':
                 if (typeof this.onSearch === 'function') await this.onSearch(message);
+                return;
+            case 'resultCollapseState':
+                await this._setResultState(!message.hasResults
+                    ? 'empty'
+                    : (message.collapsed ? 'collapsed' : 'expanded'));
                 return;
             default:
                 return;
@@ -296,7 +317,7 @@ class SourceSearchViewProvider {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'unsafe-inline'; ${fontSource} script-src 'nonce-${nonce}';">
-  <title>Go Source Search</title>
+  <title>Source Search</title>
   <style>
     ${codiconFont}
     :root {
@@ -471,6 +492,8 @@ class SourceSearchViewProvider {
     let searchSettings = ${JSON.stringify(searchConfiguration())};
     let searchTimer = null;
     let composing = false;
+    let resultsCollapsed = false;
+    let resultState = '';
 
     function esc(value) {
       return String(value == null ? '' : value).replace(/[&<>"']/g, (ch) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[ch]));
@@ -625,10 +648,32 @@ class SourceSearchViewProvider {
     document.getElementById('word').addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); setFilter('word', 'wholeWord'); });
     clearQuery.addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); clearQueryValue(); });
     openEditor.addEventListener('click', () => vscode.postMessage({ type: 'openInEditor', options: latestOptions, results: lastBatch }));
+    function updateResultCollapseState() {
+      const entries = [...files.values()];
+      const hasResults = entries.length > 0;
+      const collapsed = hasResults && entries.every((file) => file.collapsed);
+      const state = hasResults ? (collapsed ? 'collapsed' : 'expanded') : 'empty';
+      if (state === resultState) return;
+      resultState = state;
+      vscode.postMessage({ type: 'resultCollapseState', hasResults, collapsed });
+    }
+    function setFileCollapsed(file, collapsed) {
+      file.collapsed = collapsed;
+      if (file.element) {
+        file.element.classList.toggle('collapsed', collapsed);
+        file.element.setAttribute('aria-expanded', String(!collapsed));
+      }
+    }
+    function setResultsCollapsed(collapsed) {
+      resultsCollapsed = !!collapsed;
+      files.forEach((file) => setFileCollapsed(file, resultsCollapsed));
+      updateResultCollapseState();
+    }
 
     function reset() {
-      files.clear(); resultCount = 0; fileCount = 0; lastBatch = []; truncated = false;
+      files.clear(); resultCount = 0; fileCount = 0; lastBatch = []; truncated = false; resultsCollapsed = false;
       results.innerHTML = ''; results.appendChild(empty); empty.hidden = false; openEditor.hidden = true;
+      updateResultCollapseState();
     }
     function normaliseMatch(raw) {
       if (!raw || typeof raw !== 'object') return null;
@@ -664,7 +709,7 @@ class SourceSearchViewProvider {
       });
       flat.map(normaliseMatch).filter(Boolean).forEach((match) => {
         let file = files.get(match.file);
-        if (!file) { file = { file: match.file, relativePath: match.relativePath, scope: match.scope, scopeLabel: match.scopeLabel, rootLabel: match.rootLabel, module: match.module, version: match.version, unsaved: match.unsaved, matches: [], collapsed: false }; files.set(match.file, file); }
+        if (!file) { file = { file: match.file, relativePath: match.relativePath, scope: match.scope, scopeLabel: match.scopeLabel, rootLabel: match.rootLabel, module: match.module, version: match.version, unsaved: match.unsaved, matches: [], collapsed: resultsCollapsed }; files.set(match.file, file); }
         file.relativePath = file.relativePath || match.relativePath; file.scope = file.scope || match.scope; file.scopeLabel = file.scopeLabel || match.scopeLabel; file.rootLabel = file.rootLabel || match.rootLabel; file.module = file.module || match.module; file.version = file.version || match.version; file.unsaved = file.unsaved || match.unsaved;
         const duplicate = file.matches.some((item) => item.line === match.line && item.column === match.column && item.text === match.text);
         if (!duplicate) { file.matches.push(match); resultCount++; lastBatch.push(match); changedFiles.add(file.file); }
@@ -680,7 +725,7 @@ class SourceSearchViewProvider {
       return { name: name + (file.unsaved ? ' •' : ''), parent };
     }
     function render(changedFiles) {
-      if (fileCount === 0) { empty.hidden = false; return; }
+      if (fileCount === 0) { empty.hidden = false; updateResultCollapseState(); return; }
       empty.hidden = true;
       const ordered = [...files.values()].sort((left, right) => scopeRank(left.scope) - scopeRank(right.scope) || left.file.localeCompare(right.file));
       // Only update files that received new matches. Streaming batches should
@@ -689,18 +734,20 @@ class SourceSearchViewProvider {
         const file = ordered[index];
         if (!changedFiles.has(file.file)) continue;
         file.matches.sort((left, right) => left.line - right.line || left.column - right.column);
-        const wrap = document.createElement('section'); wrap.className = 'file' + (file.collapsed ? ' collapsed' : ''); wrap.setAttribute('role', 'treeitem');
+        const wrap = document.createElement('section'); wrap.className = 'file' + (file.collapsed ? ' collapsed' : ''); wrap.setAttribute('role', 'treeitem'); wrap.setAttribute('aria-expanded', String(!file.collapsed));
         const shown = displayFile(file);
         const badge = sourceBadge(file);
         const badgeHtml = badge ? '<span class="scope-label ' + badge.className + '" title="' + esc(badge.title) + '">' + esc(badge.text) + '</span>' : '';
         wrap.innerHTML = '<div class="file-head" tabindex="0"><span class="twisty">' + icon('down') + '</span><span class="file-icon" aria-hidden="true">' + icon('go') + '</span><span class="file-name" title="' + esc(file.file) + '">' + esc(shown.name) + '</span><span class="file-path" title="' + esc(shown.parent) + '">' + esc(shown.parent) + '</span>' + badgeHtml + '<span class="count">' + file.matches.length + '</span></div><div class="matches"></div>';
-        const head = wrap.querySelector('.file-head'); head.addEventListener('click', () => { file.collapsed = !file.collapsed; wrap.classList.toggle('collapsed', file.collapsed); }); head.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); file.collapsed = !file.collapsed; wrap.classList.toggle('collapsed', file.collapsed); } });
+        const toggle = () => { setFileCollapsed(file, !file.collapsed); updateResultCollapseState(); };
+        const head = wrap.querySelector('.file-head'); head.addEventListener('click', toggle); head.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggle(); } });
         const list = wrap.querySelector('.matches'); file.matches.slice(0, 300).forEach((match) => { const row = document.createElement('div'); row.className = 'match'; row.setAttribute('role', 'treeitem'); row.title = 'Open ' + file.file + ':' + match.line; row.innerHTML = '<span class="line-number">' + esc(match.line) + ':</span><span class="match-text">' + highlight(match.preview) + '</span>'; row.addEventListener('click', () => vscode.postMessage({ type: 'openMatch', match })); list.appendChild(row); });
         if (file.matches.length > 300) { const more = document.createElement('div'); more.className = 'result-ellipsis'; more.textContent = '… ' + (file.matches.length - 300) + ' more matches'; list.appendChild(more); }
         if (file.element) file.element.replaceWith(wrap);
         else results.insertBefore(wrap, ordered[index + 1]?.element || null);
         file.element = wrap;
       }
+      updateResultCollapseState();
     }
     function updateStatus(cancelled) {
       progress.classList.toggle('busy', running);
@@ -720,6 +767,8 @@ class SourceSearchViewProvider {
           break;
         }
         case 'focusQuery': query.focus(); query.select(); break;
+        case 'clearQuery': clearQueryValue(); break;
+        case 'setResultsCollapsed': setResultsCollapsed(message.collapsed); break;
         case 'searchStarted': latestOptions = message.options || latestOptions; syncFilterButtons(latestOptions); reset(); running = true; updateStatus(); break;
         case 'appendResults': addMatches(message.results || message.batch || []); break;
         case 'searchProgress':
@@ -736,6 +785,7 @@ class SourceSearchViewProvider {
     });
     updateClearButton();
     vscode.postMessage({ type: 'ready' });
+    updateResultCollapseState();
   </script>
 </body>
 </html>`;
@@ -743,6 +793,11 @@ class SourceSearchViewProvider {
 
     dispose() {
         this._cancelSearch();
+        if (this._resultState !== 'empty') {
+            this._setResultState('empty').catch((error) => {
+                this.logger(`source search toolbar reset failed: ${error.message || error}`);
+            });
+        }
         this._view = null;
         this._webviewReady = false;
         this._focusRequested = false;
