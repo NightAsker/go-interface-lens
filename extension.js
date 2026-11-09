@@ -214,6 +214,10 @@ async function openSourceSearchResultsInEditor(message) {
     ];
     for (const entry of entries) {
         if (!entry || !entry.file) continue;
+        if (entry.fileNameOnly) {
+            lines.push(entry.file);
+            continue;
+        }
         const matches = Array.isArray(entry.matches) ? entry.matches : [entry];
         for (const match of matches) {
             lines.push(`${entry.file}:${match.line || 1}:${match.column || 1}`);

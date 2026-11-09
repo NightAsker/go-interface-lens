@@ -133,7 +133,7 @@ function createWebviewHarness() {
     const script = html.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)[1];
     const ids = [
         'query', 'search-box', 'clear-query', 'scope', 'search-toggle', 'query-details', 'details-toggle',
-        'scope-row', 'results', 'status', 'progress', 'open-editor', 'empty',
+        'scope-row', 'file-name-row', 'file-name-query', 'file-name-regex', 'results', 'status', 'progress', 'open-editor', 'empty',
         'regex', 'case', 'word',
     ];
     const elements = Object.fromEntries(ids.map((id) => [id, new Element(id)]));
@@ -782,7 +782,91 @@ async function testOverlappingSearches() {
     provider.dispose();
 }
 
-testSearchFocus().then(testNativeSearchConfiguration).then(testNativeResultToolbar).then(testNativeSearchClear).then(testOverlappingSearches).then(done).catch((error) => {
+async function testFileNameOptions() {
+    console.log('\n== file name condition in expanded search options ==');
+    const ui = createWebviewHarness();
+    const click = (id) => ui.elements[id].dispatch('click', { preventDefault() {}, stopPropagation() {} });
+    const searches = () => ui.messages.filter((message) => message.type === 'search');
+    click('search-toggle');
+    eq('expanding the arrow reveals scope and file name together', [ui.elements['scope-row'].hidden, ui.elements['file-name-row'].hidden], [false, false]);
+    eq('expanded arrow exposes its expanded state', ui.elements['search-toggle'].getAttribute('aria-expanded'), 'true');
+    assert('expanded arrow rotates the right chevron down', /\.search-toggle\[aria-expanded="true"\] \.codicon\s*\{[^}]*transform:\s*rotate\(90deg\)/.test(ui.html));
+    assert('file name is placed beneath the scope selector', ui.html.indexOf('id="file-name-query"') > ui.html.indexOf('id="scope"'));
+    ui.elements.query.value = 'needle';
+    ui.elements.scope.value = 'dependency';
+    ui.elements['file-name-query'].value = '^client.*\\.go$';
+    ui.elements['file-name-query'].dispatch('input');
+    ui.tick(299);
+    eq('filename typing waits for the native debounce', searches().length, 0);
+    ui.tick(1);
+    eq('all three conditions are sent in one search', [searches().at(-1).options.query, searches().at(-1).options.scope, searches().at(-1).options.fileNameQuery], ['needle', 'dependency', '^client.*\\.go$']);
+    click('file-name-regex');
+    eq('filename regex can be enabled independently of content regex', [searches().at(-1).options.fileNameRegex, searches().at(-1).options.regex], [true, false]);
+    click('details-toggle');
+    eq('collapsing the details hides scope and filename together', [ui.elements['scope-row'].hidden, ui.elements['file-name-row'].hidden], [true, true]);
+    eq('collapsing resets the arrow direction state', ui.elements['search-toggle'].getAttribute('aria-expanded'), 'false');
+    eq('collapsing options retains the active filename condition', ui.elements['file-name-query'].value, '^client.*\\.go$');
+    click('search-toggle');
+    ui.elements.query.value = '';
+    ui.elements.query.dispatch('input');
+    ui.tick(300);
+    eq('empty content still submits a filename search', [searches().at(-1).options.query, searches().at(-1).options.fileNameQuery], ['', '^client.*\\.go$']);
+    assert('filename-only queries enable the shared clear button', !ui.elements['clear-query'].hidden);
+    ui.elements.scope.value = 'workspace';
+    ui.elements.scope.dispatch('change');
+    eq('scope changes also refresh filename-only searches', searches().at(-1).options.scope, 'workspace');
+    ui.elements['file-name-query'].dispatch('compositionstart');
+    ui.elements['file-name-query'].value = '客户端';
+    ui.elements['file-name-query'].dispatch('input', { isComposing: true });
+    const beforeComposition = searches().length;
+    ui.tick(500);
+    eq('filename IME input does not search before commit', searches().length, beforeComposition);
+    ui.elements['file-name-query'].dispatch('compositionend');
+    ui.elements['file-name-query'].dispatch('keydown', { key: 'Enter', preventDefault() {} });
+    eq('Enter searches filenames immediately after composition', searches().at(-1).options.fileNameQuery, '客户端');
+    ui.tick(500);
+    eq('Enter cancels the duplicate delayed filename search', searches().length, beforeComposition + 1);
+    ui.elements.query.value = 'needle';
+    ui.elements['file-name-query'].dispatch('input');
+    click('clear-query');
+    eq('shared clear resets both text conditions', [ui.elements.query.value, ui.elements['file-name-query'].value], ['', '']);
+    eq('clear preserves the selected scope and filename regex', [ui.elements.scope.value, ui.elements['file-name-regex'].getAttribute('aria-pressed')], ['workspace', 'true']);
+    const beforeClear = searches().length;
+    ui.tick(500);
+    eq('clearing cancels the pending filename debounce', searches().length, beforeClear);
+
+    console.log('\n== filename-only results use the source search view ==');
+    const entry = {
+        file: '/sdk/client.go', relativePath: 'client.go', scope: 'dependency', rootLabel: 'sdk@v1.2.0',
+        fileNameOnly: true, fileNameRanges: [{ start: 0, end: 6 }], matches: [],
+    };
+    let forwarded;
+    const provider = new SourceSearchViewProvider({ engine: { async search(options, progress) {
+        forwarded = options;
+        progress.onBatch([entry]);
+        return { totalFiles: 1, totalMatches: 1 };
+    } } });
+    provider._post = (message) => ui.window.dispatch('message', { data: message });
+    try {
+        await provider._startSearch({ query: '', fileNameQuery: '^client', fileNameRegex: true, scope: 'dependency' });
+        assert('host accepts a filename query when content is empty', forwarded?.fileNameQuery === '^client' && forwarded.fileNameRegex && forwarded.scope === 'dependency');
+        const file = ui.elements.results.querySelectorAll('.file')[0];
+        assert('filename-only results render in the existing tree', !!file);
+        assert('file name matches are highlighted', file.innerHTML.includes('<mark>client</mark>.go'));
+        eq('filename-only results have no empty content rows', file.querySelectorAll('.match').length, 0);
+        eq('file count is shown without a content result count', ui.elements.status.textContent, '1 file');
+        file.querySelector('.file-head').dispatch('click');
+        eq('clicking a filename-only result opens the file directly', ui.messages.at(-1), { type: 'openMatch', match: { file: entry.file } });
+        ui.elements['open-editor'].dispatch('click');
+        assert('export preserves filename-only result metadata', ui.messages.at(-1).results[0].fileNameOnly);
+    } finally {
+        provider.dispose();
+    }
+    const manifest = require('../package.json');
+    eq('only the original Source Search view is contributed', manifest.contributes.views['go-interface-lens'].map((view) => view.id), ['go-interface-lens.sourceSearch']);
+}
+
+testSearchFocus().then(testNativeSearchConfiguration).then(testNativeResultToolbar).then(testNativeSearchClear).then(testOverlappingSearches).then(testFileNameOptions).then(done).catch((error) => {
     console.error(error);
     process.exitCode = 1;
 });

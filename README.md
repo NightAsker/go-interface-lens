@@ -1,6 +1,6 @@
 # Go Interface Lens
 
-[![Version](https://img.shields.io/badge/version-2.1.18-blue.svg)](https://github.com/NightAsker/go-interface-lens)
+[![Version](https://img.shields.io/badge/version-2.1.20-blue.svg)](https://github.com/NightAsker/go-interface-lens)
 [![VSCode](https://img.shields.io/badge/VSCode-1.76+-green.svg)](https://code.visualstudio.com/)
 
 一个面向大型 Go 工程的 VS Code / Cursor 接口导航扩展。它在接口、接口方法和具体实现之间提供双向 CodeLens，同时使用按查询的声明搜索和按需 AST 校验兼顾响应速度与查找准确性。
@@ -129,6 +129,14 @@ WASM、Go grammar WASM 和 MIT 许可证；依赖包里的其他语言 grammar �
 
 查询完成后会释放依赖源码文本；多余 AST Worker 在空闲超时后收缩到一个，供后续查询复用。
 
+### 搜索工程和 SDK / 依赖包文件名
+
+在 `Source Search` 中点击搜索框左侧箭头，展开后在搜索范围下方的 `File name` 输入框填写文件名。源码内容、搜索范围和文件名三个条件是「与」的关系：结果必须同时满足所有已填写条件；文本框留空时不限制该项。箭头在展开时朝下，收起时朝右。
+
+文件名默认按普通文本匹配；点击文件名输入框右侧的 `.*` 可独立启用正则，例如 `^client.*\.go$`、`(_test|\.pb)\.go$`。正则匹配文件名本身，`Aa` 同时控制内容和文件名是否区分大小写，整词选项仅作用于内容。范围可选择工程、SDK / 依赖包或标准库；依赖范围沿用 `go.mod` 锁定版本和本地 `replace` 解析。
+
+内容留空、仅填写文件名时，只枚举文件路径，点击文件行可直接打开文件；同时填写内容时，显示满足文件名条件的内容匹配行。填写文件名时支持所有文件类型，并遵循 ripgrep 忽略规则及源码搜索专用排除配置。两个文本框都支持输入防抖、Enter 立即搜索和中文输入法；清空搜索会同时清空内容与文件名，保留范围和正则选项。文件数上限统一使用 `sourceSearchMaxFiles`。
+
 ## 环境要求
 
 - VS Code 1.76+，或兼容 VS Code 扩展的 Cursor 版本。
@@ -212,6 +220,7 @@ AST Worker 使用 `os.availableParallelism()` 感知宿主机或容器可用 CPU
 | `Go: Show Method Implementations` | 查看接口方法实现 |
 | `Go: Goto Interface` | 从接收者方法跳转到接口 |
 | `Go: Clear Implementation Lens Cache` | 清除 AST 和查询缓存 |
+| `Go: Search Source` | 打开源码内容搜索面板 |
 
 前三个命令通常由对应 CodeLens 携带上下文调用。清理缓存命令可以直接从 Command Palette 执行。
 

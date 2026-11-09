@@ -183,6 +183,8 @@ class SourceSearchViewProvider {
         this._searchAbort = controller;
         const normalized = {
             query: String(options.query || '').trim(),
+            fileNameQuery: String(options.fileNameQuery || '').trim(),
+            fileNameRegex: !!options.fileNameRegex,
             scope: options.scope || 'all',
             useRegex: !!(options.useRegex || options.regex),
             regex: !!(options.useRegex || options.regex),
@@ -199,7 +201,7 @@ class SourceSearchViewProvider {
         };
 
         this._post({ type: 'searchStarted', options: normalized });
-        if (!normalized.query) {
+        if (!normalized.query && !normalized.fileNameQuery) {
             this._searchAbort = null;
             this._post({ type: 'searchFinished', resultCount: 0, fileCount: 0 });
             return;
@@ -369,7 +371,8 @@ class SourceSearchViewProvider {
     .search-row { position: relative; display: flex; align-items: stretch; min-height: 26px; }
     .search-toggle { position: absolute; left: 0; top: 0; width: 16px; height: 26px; padding: 0; color: var(--muted); display: inline-flex; align-items: center; justify-content: center; border-radius: 3px; z-index: 1; }
     .search-toggle:hover { background: var(--hover); color: var(--vscode-foreground); }
-    .search-toggle .codicon { font-size: 16px; }
+    .search-toggle .codicon { font-size: 16px; transition: transform .12s ease; }
+    .search-toggle[aria-expanded="true"] .codicon { transform: rotate(90deg); }
     .search-box { position: relative; flex: 1; min-width: 0; display: block; height: 26px; margin-left: 18px; padding: 0 2px 0 0; background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 3px; }
     .search-box:focus-within { border-color: var(--vscode-focusBorder, #007fd4); }
     #query { display: block; width: 100%; min-width: 0; height: 24px; padding: 3px 68px 3px 6px; background: transparent; border: 0; outline: 0; color: var(--input-fg); font-size: var(--vscode-font-size, 13px); line-height: 18px; text-overflow: ellipsis; }
@@ -393,6 +396,12 @@ class SourceSearchViewProvider {
     .scope-row { display: none; align-items: center; gap: 6px; padding: 4px 0; }
     .query-details.expanded .scope-row { display: flex; }
     .scope-row[hidden] { display: none !important; }
+    .file-name-row { display: none; padding: 2px 0 4px; }
+    .query-details.expanded .file-name-row { display: flex; }
+    .file-name-row[hidden] { display: none !important; }
+    .file-name-box { margin-left: 0; }
+    #file-name-query { width: 100%; height: 24px; min-width: 0; padding: 3px 28px 3px 6px; background: transparent; border: 0; outline: 0; color: var(--input-fg); font-size: var(--vscode-font-size, 13px); line-height: 18px; text-overflow: ellipsis; }
+    #file-name-query::placeholder { color: var(--placeholder); opacity: 1; }
     .scope { flex: 1; min-width: 0; height: 24px; padding: 0 5px; border: 1px solid var(--input-border); border-radius: 3px; background: var(--input-bg); font-size: 12px; }
     .summary { display: block; min-height: 22px; margin-top: -5px; padding: 0 22px 8px; color: var(--vscode-search-resultsInfoForeground, var(--result-muted)); font-size: var(--vscode-font-size, 13px); line-height: 22px; }
     .summary strong { color: inherit; font-weight: 400; }
@@ -458,6 +467,14 @@ class SourceSearchViewProvider {
             <option value="stdlib">Standard library</option>
           </select>
         </div>
+        <div class="file-name-row" id="file-name-row" hidden>
+          <div class="search-box file-name-box" role="search">
+            <input id="file-name-query" type="text" aria-label="File name" placeholder="File name" title="Filter by file name; all filled search conditions must match" autocomplete="off" spellcheck="false" />
+            <span class="search-filter-controls">
+              <button class="search-filter-btn" id="file-name-regex" title="Use regular expression for file name" aria-label="Use regular expression for file name" aria-pressed="false"><span class="codicon codicon-regex" aria-hidden="true"></span></button>
+            </span>
+          </div>
+        </div>
       </div>
     </header>
     <div class="summary"><span id="status">Type to search source</span><a id="open-editor" hidden>Open in editor</a></div>
@@ -476,12 +493,14 @@ class SourceSearchViewProvider {
     const queryDetails = document.getElementById('query-details');
     const detailsToggle = document.getElementById('details-toggle');
     const scopeRow = document.getElementById('scope-row');
+    const fileNameQuery = document.getElementById('file-name-query');
+    const fileNameRow = document.getElementById('file-name-row');
     const results = document.getElementById('results');
     const status = document.getElementById('status');
     const progress = document.getElementById('progress');
     const openEditor = document.getElementById('open-editor');
     const empty = document.getElementById('empty');
-    const filters = { regex: false, matchCase: false, wholeWord: false };
+    const filters = { regex: false, matchCase: false, wholeWord: false, fileNameRegex: false };
     const files = new Map();
     let running = false;
     let latestOptions = {};
@@ -571,13 +590,14 @@ class SourceSearchViewProvider {
       searchTimer = null;
     }
     function updateClearButton() {
-      const hasQuery = query.value.length > 0;
+      const hasQuery = query.value.length > 0 || fileNameQuery.value.length > 0;
       clearQuery.hidden = !hasQuery;
       searchBox.classList.toggle('has-query', hasQuery);
     }
     function clearQueryValue() {
       cancelScheduledSearch();
       query.value = '';
+      fileNameQuery.value = '';
       updateClearButton();
       vscode.postMessage({ type: 'clearResults' });
       query.focus();
@@ -585,7 +605,7 @@ class SourceSearchViewProvider {
     function scheduleSearch() {
       cancelScheduledSearch();
       if (composing) return;
-      if (!query.value.trim()) { vscode.postMessage({ type: 'clearResults' }); return; }
+      if (!hasSearchQuery()) { vscode.postMessage({ type: 'clearResults' }); return; }
       if (!searchSettings.searchOnType) return;
       searchTimer = setTimeout(sendSearch, searchSettings.searchOnTypeDebouncePeriod);
     }
@@ -593,8 +613,8 @@ class SourceSearchViewProvider {
       cancelScheduledSearch();
       if (composing) return;
       const value = query.value.trim();
-      if (!value) { vscode.postMessage({ type: 'clearResults' }); return; }
-      latestOptions = { query: value, scope: scope.value, useRegex: filters.regex, regex: filters.regex, matchCase: filters.matchCase, caseSensitive: filters.matchCase, wholeWord: filters.wholeWord };
+      if (!hasSearchQuery()) { vscode.postMessage({ type: 'clearResults' }); return; }
+      latestOptions = { query: value, fileNameQuery: fileNameQuery.value.trim(), fileNameRegex: filters.fileNameRegex, scope: scope.value, useRegex: filters.regex, regex: filters.regex, matchCase: filters.matchCase, caseSensitive: filters.matchCase, wholeWord: filters.wholeWord };
       vscode.postMessage({ type: 'search', options: latestOptions });
     }
     function setFilter(id, key) {
@@ -602,13 +622,15 @@ class SourceSearchViewProvider {
       const button = document.getElementById(id);
       button.classList.toggle('active', filters[key]);
       button.setAttribute('aria-pressed', String(filters[key]));
-      if (query.value.trim()) sendSearch();
+      if (hasSearchQuery()) sendSearch();
     }
+    function hasSearchQuery() { return !!(query.value.trim() || fileNameQuery.value.trim()); }
     function syncFilterButtons(options) {
       filters.regex = !!(options && (options.useRegex || options.regex));
       filters.matchCase = !!(options && (options.matchCase || options.caseSensitive));
       filters.wholeWord = !!(options && options.wholeWord);
-      [['regex', 'regex'], ['case', 'matchCase'], ['word', 'wholeWord']].forEach(([id, key]) => {
+      filters.fileNameRegex = !!(options && options.fileNameRegex);
+      [['regex', 'regex'], ['case', 'matchCase'], ['word', 'wholeWord'], ['file-name-regex', 'fileNameRegex']].forEach(([id, key]) => {
         const button = document.getElementById(id);
         button.classList.toggle('active', filters[key]);
         button.setAttribute('aria-pressed', String(filters[key]));
@@ -618,19 +640,18 @@ class SourceSearchViewProvider {
       const expanded = !queryDetails.classList.contains('expanded');
       queryDetails.classList.toggle('expanded', expanded);
       scopeRow.hidden = !expanded;
+      fileNameRow.hidden = !expanded;
       detailsToggle.setAttribute('aria-expanded', String(expanded));
       searchToggle.setAttribute('aria-expanded', String(expanded));
     }
     searchToggle.addEventListener('click', toggleDetails);
     detailsToggle.addEventListener('click', toggleDetails);
-    query.addEventListener('input', (event) => {
+    function onQueryInput(event) {
       updateClearButton();
       if (event.isComposing) { cancelScheduledSearch(); return; }
       scheduleSearch();
-    });
-    query.addEventListener('compositionstart', () => { composing = true; cancelScheduledSearch(); });
-    query.addEventListener('compositionend', () => { composing = false; scheduleSearch(); });
-    query.addEventListener('keydown', (event) => {
+    }
+    function onQueryKeydown(event) {
       if (composing || event.isComposing || event.keyCode === 229) return;
       if (event.key === 'Enter') {
         event.preventDefault();
@@ -641,15 +662,22 @@ class SourceSearchViewProvider {
         if (running) vscode.postMessage({ type: 'cancel' });
         else clearQueryValue();
       }
+    }
+    [query, fileNameQuery].forEach((input) => {
+      input.addEventListener('input', onQueryInput);
+      input.addEventListener('compositionstart', () => { composing = true; cancelScheduledSearch(); });
+      input.addEventListener('compositionend', () => { composing = false; scheduleSearch(); });
+      input.addEventListener('keydown', onQueryKeydown);
     });
-    scope.addEventListener('change', () => { if (query.value.trim()) sendSearch(); });
+    scope.addEventListener('change', () => { if (hasSearchQuery()) sendSearch(); });
     document.getElementById('regex').addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); setFilter('regex', 'regex'); });
     document.getElementById('case').addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); setFilter('case', 'matchCase'); });
     document.getElementById('word').addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); setFilter('word', 'wholeWord'); });
+    document.getElementById('file-name-regex').addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); setFilter('file-name-regex', 'fileNameRegex'); });
     clearQuery.addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); clearQueryValue(); });
     openEditor.addEventListener('click', () => vscode.postMessage({ type: 'openInEditor', options: latestOptions, results: lastBatch }));
     function updateResultCollapseState() {
-      const entries = [...files.values()];
+      const entries = [...files.values()].filter((file) => !file.fileNameOnly);
       const hasResults = entries.length > 0;
       const collapsed = hasResults && entries.every((file) => file.collapsed);
       const state = hasResults ? (collapsed ? 'collapsed' : 'expanded') : 'empty';
@@ -666,7 +694,7 @@ class SourceSearchViewProvider {
     }
     function setResultsCollapsed(collapsed) {
       resultsCollapsed = !!collapsed;
-      files.forEach((file) => setFileCollapsed(file, resultsCollapsed));
+      files.forEach((file) => { if (!file.fileNameOnly) setFileCollapsed(file, resultsCollapsed); });
       updateResultCollapseState();
     }
 
@@ -684,7 +712,7 @@ class SourceSearchViewProvider {
       const text = String(raw.text == null ? (raw.preview == null ? '' : raw.preview) : raw.text);
       const ranges = findMatchRanges(text, raw.ranges);
       const preview = matchPreview(text, ranges);
-      return { file: String(file), relativePath: raw.relativePath || '', line: Number.isFinite(line) ? line : 1, column: Number.isFinite(column) ? column : 1, text, preview, scope: raw.scope || '', scopeLabel: raw.scopeLabel || '', rootLabel: raw.rootLabel || '', module: raw.module || '', version: raw.version || '', unsaved: !!raw.unsaved, ranges };
+      return { file: String(file), relativePath: raw.relativePath || '', line: Number.isFinite(line) ? line : 1, column: Number.isFinite(column) ? column : 1, text, preview, scope: raw.scope || '', scopeLabel: raw.scopeLabel || '', rootLabel: raw.rootLabel || '', module: raw.module || '', version: raw.version || '', unsaved: !!raw.unsaved, fileNameOnly: !!raw.fileNameOnly, fileNameRanges: raw.fileNameRanges || [], ranges };
     }
     function scopeRank(scope) {
       if (scope === 'workspace') return 0;
@@ -703,13 +731,14 @@ class SourceSearchViewProvider {
       const changedFiles = new Set();
       batch.forEach((entry) => {
         if (!entry) return;
-        if (entry.matches && Array.isArray(entry.matches)) {
+        if (entry.fileNameOnly) flat.push(entry);
+        else if (entry.matches && Array.isArray(entry.matches)) {
           entry.matches.forEach((item) => flat.push({ ...item, file: item.file || item.path || entry.file, relativePath: item.relativePath || entry.relativePath, scope: item.scope || entry.scope, scopeLabel: item.scopeLabel || entry.scopeLabel, rootLabel: item.rootLabel || entry.rootLabel, module: item.module || entry.module, version: item.version || entry.version }));
         } else flat.push(entry);
       });
       flat.map(normaliseMatch).filter(Boolean).forEach((match) => {
         let file = files.get(match.file);
-        if (!file) { file = { file: match.file, relativePath: match.relativePath, scope: match.scope, scopeLabel: match.scopeLabel, rootLabel: match.rootLabel, module: match.module, version: match.version, unsaved: match.unsaved, matches: [], collapsed: resultsCollapsed }; files.set(match.file, file); }
+        if (!file) { file = { file: match.file, relativePath: match.relativePath, scope: match.scope, scopeLabel: match.scopeLabel, rootLabel: match.rootLabel, module: match.module, version: match.version, unsaved: match.unsaved, fileNameOnly: match.fileNameOnly, fileNameRanges: match.fileNameRanges, matches: [], collapsed: !match.fileNameOnly && resultsCollapsed }; files.set(match.file, file); }
         file.relativePath = file.relativePath || match.relativePath; file.scope = file.scope || match.scope; file.scopeLabel = file.scopeLabel || match.scopeLabel; file.rootLabel = file.rootLabel || match.rootLabel; file.module = file.module || match.module; file.version = file.version || match.version; file.unsaved = file.unsaved || match.unsaved;
         const duplicate = file.matches.some((item) => item.line === match.line && item.column === match.column && item.text === match.text);
         if (!duplicate) { file.matches.push(match); resultCount++; lastBatch.push(match); changedFiles.add(file.file); }
@@ -734,15 +763,22 @@ class SourceSearchViewProvider {
         const file = ordered[index];
         if (!changedFiles.has(file.file)) continue;
         file.matches.sort((left, right) => left.line - right.line || left.column - right.column);
-        const wrap = document.createElement('section'); wrap.className = 'file' + (file.collapsed ? ' collapsed' : ''); wrap.setAttribute('role', 'treeitem'); wrap.setAttribute('aria-expanded', String(!file.collapsed));
+        const wrap = document.createElement('section'); wrap.className = 'file' + (file.collapsed ? ' collapsed' : ''); wrap.setAttribute('role', 'treeitem');
+        if (!file.fileNameOnly) wrap.setAttribute('aria-expanded', String(!file.collapsed));
         const shown = displayFile(file);
         const badge = sourceBadge(file);
         const badgeHtml = badge ? '<span class="scope-label ' + badge.className + '" title="' + esc(badge.title) + '">' + esc(badge.text) + '</span>' : '';
-        wrap.innerHTML = '<div class="file-head" tabindex="0"><span class="twisty">' + icon('down') + '</span><span class="file-icon" aria-hidden="true">' + icon('go') + '</span><span class="file-name" title="' + esc(file.file) + '">' + esc(shown.name) + '</span><span class="file-path" title="' + esc(shown.parent) + '">' + esc(shown.parent) + '</span>' + badgeHtml + '<span class="count">' + file.matches.length + '</span></div><div class="matches"></div>';
-        const toggle = () => { setFileCollapsed(file, !file.collapsed); updateResultCollapseState(); };
+        const nameHtml = file.fileNameOnly ? highlight({ text: shown.name, ranges: file.fileNameRanges }) : esc(shown.name);
+        wrap.innerHTML = '<div class="file-head" tabindex="0"><span class="twisty">' + (file.fileNameOnly ? '' : icon('down')) + '</span><span class="file-icon" aria-hidden="true">' + icon(file.fileNameOnly ? 'file' : 'go') + '</span><span class="file-name" title="' + esc(file.file) + '">' + nameHtml + '</span><span class="file-path" title="' + esc(shown.parent) + '">' + esc(shown.parent) + '</span>' + badgeHtml + (file.fileNameOnly ? '' : '<span class="count">' + file.matches.length + '</span>') + '</div>' + (file.fileNameOnly ? '' : '<div class="matches"></div>');
+        const toggle = () => {
+          if (file.fileNameOnly) { vscode.postMessage({ type: 'openMatch', match: { file: file.file } }); return; }
+          setFileCollapsed(file, !file.collapsed); updateResultCollapseState();
+        };
         const head = wrap.querySelector('.file-head'); head.addEventListener('click', toggle); head.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggle(); } });
-        const list = wrap.querySelector('.matches'); file.matches.slice(0, 300).forEach((match) => { const row = document.createElement('div'); row.className = 'match'; row.setAttribute('role', 'treeitem'); row.title = 'Open ' + file.file + ':' + match.line; row.innerHTML = '<span class="line-number">' + esc(match.line) + ':</span><span class="match-text">' + highlight(match.preview) + '</span>'; row.addEventListener('click', () => vscode.postMessage({ type: 'openMatch', match })); list.appendChild(row); });
-        if (file.matches.length > 300) { const more = document.createElement('div'); more.className = 'result-ellipsis'; more.textContent = '… ' + (file.matches.length - 300) + ' more matches'; list.appendChild(more); }
+        if (!file.fileNameOnly) {
+          const list = wrap.querySelector('.matches'); file.matches.slice(0, 300).forEach((match) => { const row = document.createElement('div'); row.className = 'match'; row.setAttribute('role', 'treeitem'); row.title = 'Open ' + file.file + ':' + match.line; row.innerHTML = '<span class="line-number">' + esc(match.line) + ':</span><span class="match-text">' + highlight(match.preview) + '</span>'; row.addEventListener('click', () => vscode.postMessage({ type: 'openMatch', match })); list.appendChild(row); });
+          if (file.matches.length > 300) { const more = document.createElement('div'); more.className = 'result-ellipsis'; more.textContent = '… ' + (file.matches.length - 300) + ' more matches'; list.appendChild(more); }
+        }
         if (file.element) file.element.replaceWith(wrap);
         else results.insertBefore(wrap, ordered[index + 1]?.element || null);
         file.element = wrap;
@@ -751,8 +787,14 @@ class SourceSearchViewProvider {
     }
     function updateStatus(cancelled) {
       progress.classList.toggle('busy', running);
-      if (running) { status.textContent = resultCount ? 'Searching… ' + resultCount + ' result' + (resultCount === 1 ? '' : 's') : 'Searching…'; return; }
-      if (!latestOptions.query) { status.textContent = 'Type to search source'; return; }
+      const fileNameOnly = !!latestOptions.fileNameQuery && !latestOptions.query;
+      if (running) { status.textContent = resultCount ? 'Searching… ' + resultCount + (fileNameOnly ? ' file' : ' result') + (resultCount === 1 ? '' : 's') : 'Searching…'; return; }
+      if (!latestOptions.query && !latestOptions.fileNameQuery) { status.textContent = 'Type to search source'; return; }
+      if (fileNameOnly) {
+        status.textContent = fileCount + ' file' + (fileCount === 1 ? '' : 's') + (cancelled ? ' (cancelled)' : (truncated ? ' (truncated)' : ''));
+        openEditor.hidden = fileCount === 0;
+        return;
+      }
       if (cancelled) { status.textContent = resultCount ? resultCount + ' result' + (resultCount === 1 ? '' : 's') + ' (cancelled)' : 'Search cancelled'; return; }
       status.innerHTML = '<strong>' + resultCount + '</strong> result' + (resultCount === 1 ? '' : 's') + ' in <strong>' + fileCount + '</strong> file' + (fileCount === 1 ? '' : 's') + (truncated ? ' <span title="Result limit reached">(truncated)</span>' : '');
       openEditor.hidden = resultCount === 0;

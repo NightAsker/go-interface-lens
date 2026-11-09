@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const { execFile, spawn } = require('child_process');
+const { runRipgrepFiles } = require('./file-search');
 
 const {
     findRipgrep,
@@ -361,6 +362,7 @@ class SourceSearchService {
         this.rg = options.rg || findRipgrep() || 'rg';
         this.parallelism = Math.min(8, resolveRipgrepProcessConcurrency(options.parallelism));
         this.runRipgrep = options.runRipgrep || runRipgrepJson;
+        this.runRipgrepFiles = options.runRipgrepFiles || runRipgrepFiles;
         this.searchControllers = new Set();
         this.disposed = false;
     }
@@ -383,7 +385,9 @@ class SourceSearchService {
         if (this.disposed || (progress.signal && progress.signal.aborted)) throw createCancellationError();
         const started = Date.now();
         const query = typeof options.query === 'string' ? options.query : '';
-        if (!query.trim()) return { query, results: [], totalMatches: 0, totalFiles: 0, truncated: false, roots: [] };
+        const fileNameQuery = typeof options.fileNameQuery === 'string' ? options.fileNameQuery : '';
+        const fileNameOnly = !query.trim() && !!fileNameQuery.trim();
+        if (!query.trim() && !fileNameQuery.trim()) return { query, results: [], totalMatches: 0, totalFiles: 0, truncated: false, roots: [] };
         const config = { ...this.getConfig(), ...(options.config || {}) };
         const normalizedOptions = {
             regex: !!options.regex,
@@ -392,6 +396,10 @@ class SourceSearchService {
         };
         // Validate before spawning any process so the UI gets a direct error.
         const overlayMatcher = createMatcher(query, normalizedOptions);
+        const fileNameMatcher = createMatcher(fileNameQuery, {
+            regex: !!options.fileNameRegex,
+            caseSensitive: normalizedOptions.caseSensitive,
+        });
         let stdlibRoot = options.stdlibRoot;
         if ((options.scope || 'all') === 'stdlib' && !stdlibRoot) stdlibRoot = await resolveGoRoot();
         const roots = this.resolveRoots({ ...options, config, stdlibRoot });
@@ -407,17 +415,22 @@ class SourceSearchService {
         const { excludedFolders } = pathPatternsFromConfig(config);
         const includeGlobs = Array.isArray(options.includeGlobs) && options.includeGlobs.length > 0
             ? options.includeGlobs
-            : DEFAULT_GLOBS;
-        const args = ['--json', '--line-buffered', '--color', 'never', '--line-number', '--column'];
-        if (!normalizedOptions.regex) args.push('--fixed-strings');
-        if (!normalizedOptions.caseSensitive) args.push('--ignore-case');
-        if (normalizedOptions.wholeWord) args.push('--word-regexp');
+            : (fileNameQuery ? [] : DEFAULT_GLOBS);
+        const args = fileNameOnly
+            ? ['--files', '--null', '--color', 'never']
+            : ['--json', '--line-buffered', '--color', 'never', '--line-number', '--column'];
+        if (!fileNameOnly) {
+            if (!normalizedOptions.regex) args.push('--fixed-strings');
+            if (!normalizedOptions.caseSensitive) args.push('--ignore-case');
+            if (normalizedOptions.wholeWord) args.push('--word-regexp');
+        }
         const fileArgs = [];
         for (const glob of includeGlobs) fileArgs.push('--glob', glob);
         for (const folder of excludedFolders) {
             if (/^[A-Za-z0-9_.*?@+-]+$/.test(folder)) fileArgs.push('--glob', `!**/${folder}/**`);
         }
-        args.push(...fileArgs, '-e', query);
+        args.push(...fileArgs);
+        if (!fileNameOnly) args.push('-e', query);
 
         const controller = new AbortController();
         this.searchControllers.add(controller);
@@ -463,7 +476,12 @@ class SourceSearchService {
             if (controller.signal.aborted) return;
             if (!unsaved && dirtyFiles.has(record.file)) return;
             let entry = byFile.get(record.file);
+            if (fileNameOnly && entry) return;
             if (!entry && (!fileMatchesConfig(record.file, config) || folderMatchesConfig(record.file, config))) return;
+            if (!entry && fileNameMatcher) {
+                fileNameMatcher.lastIndex = 0;
+                if (!fileNameMatcher.test(path.basename(record.file))) return;
+            }
             if (!entry && byFile.size >= maxFiles) {
                 truncated = true;
                 controller.abort();
@@ -475,29 +493,39 @@ class SourceSearchService {
                     file: record.file, relativePath: path.relative(root.root, record.file) || path.basename(record.file),
                     scope: root.scope, scopeLabel: scopeLabel(root.scope), root: root.root,
                     rootLabel: root.label, module: root.module, version: root.version,
+                    ...(fileNameOnly ? {
+                        fileNameOnly: true,
+                        name: path.basename(record.file),
+                        fileNameRanges: [...path.basename(record.file).matchAll(new RegExp(fileNameMatcher.source, fileNameMatcher.flags))]
+                            .map((match) => ({ start: match.index, end: match.index + match[0].length })),
+                    } : {}),
                     ...(unsaved ? { unsaved: true } : {}), matches: [],
                 };
                 byFile.set(record.file, entry);
                 seen.set(record.file, new Set());
             }
-            const key = `${record.line}:${record.column}`;
-            if (seen.get(record.file).has(key)) return;
-            seen.get(record.file).add(key);
-            const match = { line: record.line, column: record.column, text: record.text, ranges: record.ranges };
-            entry.matches.push(match);
+            if (fileNameOnly) {
+                pending.set(record.file, entry);
+            } else {
+                const key = `${record.line}:${record.column}`;
+                if (seen.get(record.file).has(key)) return;
+                seen.get(record.file).add(key);
+                const match = { line: record.line, column: record.column, text: record.text, ranges: record.ranges };
+                entry.matches.push(match);
+                let delta = pending.get(record.file);
+                if (!delta) { delta = { ...entry, matches: [] }; pending.set(record.file, delta); }
+                delta.matches.push(match);
+            }
             totalMatches++;
-            let delta = pending.get(record.file);
-            if (!delta) { delta = { ...entry, matches: [] }; pending.set(record.file, delta); }
-            delta.matches.push(match);
             pendingCount++;
-            if (totalMatches >= maxResults) { truncated = true; controller.abort(); }
+            if (fileNameOnly ? byFile.size >= maxFiles : totalMatches >= maxResults) { truncated = true; controller.abort(); }
             if (totalMatches === 1 || pendingCount >= RESULT_BATCH_SIZE) flush();
             else if (!timer) timer = setTimeout(flush, RESULT_BATCH_DELAY);
         };
         try {
             // Snapshot dirty documents first so disk results are never shown and
             // later retracted. Apply overlays within their scope's priority.
-            for (const document of this.getOpenDocuments() || []) {
+            for (const document of fileNameOnly ? [] : (this.getOpenDocuments() || [])) {
                 if (controller.signal.aborted) break;
                 const file = normalizeAbsolute(document && document.uri && document.uri.fsPath);
                 if (!file || !document.isDirty || typeof document.getText !== 'function') continue;
@@ -524,8 +552,13 @@ class SourceSearchService {
                 // stream before the rest of the tree has even been discovered.
                 await runSearchJobs(jobs, this.parallelism, controller, async (job, threads) => {
                     jobCount++;
-                    await this.runRipgrep(this.rg, [...args, '--threads', String(threads), '--', ...job.roots.map((root) => root.root)], job.roots[0], {
+                    const run = fileNameOnly ? this.runRipgrepFiles : this.runRipgrep;
+                    await run.call(this, this.rg, [...args, '--threads', String(threads), '--', ...job.roots.map((root) => root.root)], job.roots[0], {
                         signal: controller.signal,
+                        onFile: (file) => {
+                            const root = findRoot(file);
+                            if (root) onMatch({ file, root });
+                        },
                         onMatch: (record) => {
                             const root = findRoot(record.file);
                             if (root) onMatch({ ...record, root });

@@ -2,6 +2,20 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.1.20] - 2026-11-09
+
+### Added
+
+- Add a file name input beneath the scope selector in Source Search's expanded
+  options. Content, scope and file name conditions are combined with AND, with
+  an independent file name regex toggle and support for locked SDK dependencies.
+- Support file-name-only searches across all file types in the same result list,
+  preserving streaming, ignore rules, cancellation and the source-search file limit.
+
+### Fixed
+
+- Rotate the search-options arrow down when expanded and right when collapsed.
+
 ## [2.1.19] - 2026-11-02
 
 ### Added
