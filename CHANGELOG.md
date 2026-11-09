@@ -2,6 +2,15 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.1.23] - 2026-11-09
+
+### Fixed
+
+- Show a single centered ellipsis in the source scope selector to open its
+  source choices, keeping the left arrow for collapsing search options.
+- Share the same border, radius, height, input styling and focus highlight
+  across content search, file name search and the source scope selector.
+
 ## [2.1.22] - 2026-11-09
 
 ### Fixed

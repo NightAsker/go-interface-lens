@@ -376,9 +376,10 @@ class SourceSearchViewProvider {
     .search-toggle[aria-expanded="true"] .codicon { transform: rotate(90deg); }
     .search-box { position: relative; flex: 1; min-width: 0; display: block; height: 26px; margin-left: 18px; padding: 0 2px 0 0; background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 3px; }
     .search-box:focus-within { border-color: var(--vscode-focusBorder, #007fd4); }
-    #query { display: block; width: 100%; min-width: 0; height: 24px; padding: 3px 68px 3px var(--search-input-padding-left); background: transparent; border: 0; outline: 0; color: var(--input-fg); font-size: var(--vscode-font-size, 13px); line-height: 18px; text-overflow: ellipsis; }
+    #query, #file-name-query, #scope { display: block; width: 100%; min-width: 0; height: 24px; padding: 3px 28px 3px var(--search-input-padding-left); background: transparent; border: 0; outline: 0; color: var(--input-fg); font-size: var(--vscode-font-size, 13px); line-height: 18px; text-overflow: ellipsis; }
+    #query { padding-right: 68px; }
     .search-box.has-query #query { padding-right: 90px; }
-    #query::placeholder { color: var(--placeholder); opacity: 1; }
+    #query::placeholder, #file-name-query::placeholder { color: var(--placeholder); opacity: 1; }
     #query::-webkit-search-cancel-button,
     #query::-webkit-search-decoration { -webkit-appearance: none; appearance: none; display: none; }
     #query::-ms-clear { display: none; }
@@ -395,17 +396,16 @@ class SourceSearchViewProvider {
     .scope-options { min-height: 16px; position: relative; }
     .details-toggle { position: absolute; right: -2px; top: 0; width: 25px; height: 16px; padding: 0; color: var(--muted); font-size: 16px; line-height: 12px; border-radius: 3px; }
     .details-toggle:hover { background: var(--hover); color: var(--vscode-foreground); }
+    .query-details.expanded .details-toggle { display: none; }
     .scope-row { display: none; align-items: center; gap: 6px; padding: 4px 0; }
     .query-details.expanded .scope-row { display: flex; }
     .scope-row[hidden] { display: none !important; }
     .file-name-row { display: none; padding: 4px 0 2px; }
     .query-details.expanded .file-name-row { display: flex; }
     .file-name-row[hidden] { display: none !important; }
-    .file-name-box { margin-left: 0; }
-    #file-name-query { width: 100%; height: 24px; min-width: 0; padding: 3px 28px 3px var(--search-input-padding-left); background: transparent; border: 0; outline: 0; color: var(--input-fg); font-size: var(--vscode-font-size, 13px); line-height: 18px; text-overflow: ellipsis; }
-    #file-name-query::placeholder { color: var(--placeholder); opacity: 1; }
-    .scope { flex: 1; min-width: 0; height: 24px; padding: 0 24px 0 var(--search-input-padding-left); border: 1px solid var(--input-border); border-radius: 3px; background: var(--input-bg); font-size: var(--vscode-font-size, 13px); appearance: none; }
-    .scope-arrow { position: absolute; right: 1px; top: 8px; pointer-events: none; transform: rotate(90deg); }
+    .file-name-box, .scope-box { margin-left: 0; }
+    .scope { appearance: none; }
+    .scope-more { position: absolute; top: 3px; right: 2px; display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; color: var(--vscode-icon-foreground, var(--result-muted)); pointer-events: none; }
     .summary { display: block; min-height: 22px; margin-top: -5px; padding: 0 22px 8px; color: var(--vscode-search-resultsInfoForeground, var(--result-muted)); font-size: var(--vscode-font-size, 13px); line-height: 22px; }
     .summary strong { color: inherit; font-weight: 400; }
     .summary a { color: var(--accent); text-decoration: none; cursor: pointer; white-space: nowrap; margin-left: 4px; }
@@ -472,13 +472,15 @@ class SourceSearchViewProvider {
         <div class="scope-options">
           <button class="details-toggle" id="details-toggle" type="button" title="Search options" aria-label="Search options" aria-expanded="false"><span class="codicon codicon-more" aria-hidden="true"></span></button>
           <div class="scope-row" id="scope-row" hidden>
-            <select class="scope" id="scope" aria-label="Search scope">
-              <option value="all">All sources</option>
-              <option value="workspace">Workspace</option>
-              <option value="dependency">Dependencies</option>
-              <option value="stdlib">Standard library</option>
-            </select>
-            <span class="scope-arrow codicon codicon-chevron-right" aria-hidden="true"></span>
+            <div class="search-box scope-box">
+              <select class="scope" id="scope" aria-label="Search scope" title="Search scope">
+                <option value="all">All sources</option>
+                <option value="workspace">Workspace</option>
+                <option value="dependency">Dependencies</option>
+                <option value="stdlib">Standard library</option>
+              </select>
+              <span class="scope-more codicon codicon-more" aria-hidden="true"></span>
+            </div>
           </div>
         </div>
       </div>

@@ -802,8 +802,8 @@ async function testFileNameOptions() {
     eq('all three conditions are sent in one search', [searches().at(-1).options.query, searches().at(-1).options.scope, searches().at(-1).options.fileNameQuery], ['needle', 'dependency', '^client.*\\.go$']);
     click('file-name-regex');
     eq('filename regex can be enabled independently of content regex', [searches().at(-1).options.fileNameRegex, searches().at(-1).options.regex], [true, false]);
-    click('details-toggle');
-    eq('collapsing the details hides scope and filename together', [ui.elements['scope-row'].hidden, ui.elements['file-name-row'].hidden], [true, true]);
+    click('search-toggle');
+    eq('collapsing the arrow hides scope and filename together', [ui.elements['scope-row'].hidden, ui.elements['file-name-row'].hidden], [true, true]);
     eq('collapsing resets the arrow direction state', ui.elements['search-toggle'].getAttribute('aria-expanded'), 'false');
     eq('collapsing options retains the active filename condition', ui.elements['file-name-query'].value, '^client.*\\.go$');
     click('search-toggle');
