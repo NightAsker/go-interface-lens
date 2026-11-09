@@ -341,6 +341,7 @@ class SourceSearchViewProvider {
       --result-fg: var(--vscode-sideBar-foreground, var(--vscode-foreground));
       --result-muted: var(--result-fg);
       --workbench-font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
+      --search-input-padding-left: 6px;
     }
     * { box-sizing: border-box; }
     html, body { padding: 0; margin: 0; width: 100%; height: 100%; overflow: hidden; }
@@ -375,7 +376,7 @@ class SourceSearchViewProvider {
     .search-toggle[aria-expanded="true"] .codicon { transform: rotate(90deg); }
     .search-box { position: relative; flex: 1; min-width: 0; display: block; height: 26px; margin-left: 18px; padding: 0 2px 0 0; background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 3px; }
     .search-box:focus-within { border-color: var(--vscode-focusBorder, #007fd4); }
-    #query { display: block; width: 100%; min-width: 0; height: 24px; padding: 3px 68px 3px 6px; background: transparent; border: 0; outline: 0; color: var(--input-fg); font-size: var(--vscode-font-size, 13px); line-height: 18px; text-overflow: ellipsis; }
+    #query { display: block; width: 100%; min-width: 0; height: 24px; padding: 3px 68px 3px var(--search-input-padding-left); background: transparent; border: 0; outline: 0; color: var(--input-fg); font-size: var(--vscode-font-size, 13px); line-height: 18px; text-overflow: ellipsis; }
     .search-box.has-query #query { padding-right: 90px; }
     #query::placeholder { color: var(--placeholder); opacity: 1; }
     #query::-webkit-search-cancel-button,
@@ -401,9 +402,10 @@ class SourceSearchViewProvider {
     .query-details.expanded .file-name-row { display: flex; }
     .file-name-row[hidden] { display: none !important; }
     .file-name-box { margin-left: 0; }
-    #file-name-query { width: 100%; height: 24px; min-width: 0; padding: 3px 28px 3px 6px; background: transparent; border: 0; outline: 0; color: var(--input-fg); font-size: var(--vscode-font-size, 13px); line-height: 18px; text-overflow: ellipsis; }
+    #file-name-query { width: 100%; height: 24px; min-width: 0; padding: 3px 28px 3px var(--search-input-padding-left); background: transparent; border: 0; outline: 0; color: var(--input-fg); font-size: var(--vscode-font-size, 13px); line-height: 18px; text-overflow: ellipsis; }
     #file-name-query::placeholder { color: var(--placeholder); opacity: 1; }
-    .scope { flex: 1; min-width: 0; height: 24px; padding: 0 5px; border: 1px solid var(--input-border); border-radius: 3px; background: var(--input-bg); font-size: var(--vscode-font-size, 13px); }
+    .scope { flex: 1; min-width: 0; height: 24px; padding: 0 24px 0 var(--search-input-padding-left); border: 1px solid var(--input-border); border-radius: 3px; background: var(--input-bg); font-size: var(--vscode-font-size, 13px); appearance: none; }
+    .scope-arrow { position: absolute; right: 1px; top: 8px; pointer-events: none; transform: rotate(90deg); }
     .summary { display: block; min-height: 22px; margin-top: -5px; padding: 0 22px 8px; color: var(--vscode-search-resultsInfoForeground, var(--result-muted)); font-size: var(--vscode-font-size, 13px); line-height: 22px; }
     .summary strong { color: inherit; font-weight: 400; }
     .summary a { color: var(--accent); text-decoration: none; cursor: pointer; white-space: nowrap; margin-left: 4px; }
@@ -476,6 +478,7 @@ class SourceSearchViewProvider {
               <option value="dependency">Dependencies</option>
               <option value="stdlib">Standard library</option>
             </select>
+            <span class="scope-arrow codicon codicon-chevron-right" aria-hidden="true"></span>
           </div>
         </div>
       </div>

@@ -1,6 +1,6 @@
 # Go Interface Lens
 
-[![Version](https://img.shields.io/badge/version-2.1.21-blue.svg)](https://github.com/NightAsker/go-interface-lens)
+[![Version](https://img.shields.io/badge/version-2.1.22-blue.svg)](https://github.com/NightAsker/go-interface-lens)
 [![VSCode](https://img.shields.io/badge/VSCode-1.76+-green.svg)](https://code.visualstudio.com/)
 
 一个面向大型 Go 工程的 VS Code / Cursor 接口导航扩展。它在接口、接口方法和具体实现之间提供双向 CodeLens，同时使用按查询的声明搜索和按需 AST 校验兼顾响应速度与查找准确性。
@@ -131,7 +131,7 @@ WASM、Go grammar WASM 和 MIT 许可证；依赖包里的其他语言 grammar �
 
 ### 搜索工程和 SDK / 依赖包文件名
 
-在 `Source Search` 中点击搜索框左侧箭头，展开后第二行的 `File name` 输入框用于填写文件名，第三行选择搜索范围。内容搜索、文件名和范围使用相同的 VS Code 界面字号。源码内容、搜索范围和文件名三个条件是「与」的关系：结果必须同时满足所有已填写条件；文本框留空时不限制该项。箭头在展开时朝下，收起时朝右。
+在 `Source Search` 中点击搜索框左侧箭头，展开后第二行的 `File name` 输入框用于填写文件名，第三行选择搜索范围。内容搜索、文件名和范围使用相同的 VS Code 界面字号，文字距离左边框内侧均为 6px。源码内容、搜索范围和文件名三个条件是「与」的关系：结果必须同时满足所有已填写条件；文本框留空时不限制该项。箭头在展开时朝下，收起时朝右。
 
 文件名默认按普通文本匹配；点击文件名输入框右侧的 `.*` 可独立启用正则，例如 `^client.*\.go$`、`(_test|\.pb)\.go$`。正则匹配文件名本身，`Aa` 同时控制内容和文件名是否区分大小写，整词选项仅作用于内容。范围可选择工程、SDK / 依赖包或标准库；依赖范围沿用 `go.mod` 锁定版本和本地 `replace` 解析。
 

@@ -2,6 +2,14 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.1.22] - 2026-11-09
+
+### Fixed
+
+- Align text in content search, file name search and the source scope selector
+  using the same 6px left padding. Remove extra platform-native selector spacing
+  while retaining its dropdown arrow and keyboard controls.
+
 ## [2.1.21] - 2026-11-09
 
 ### Fixed
