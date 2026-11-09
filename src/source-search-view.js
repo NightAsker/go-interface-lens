@@ -391,18 +391,19 @@ class SourceSearchViewProvider {
     .search-clear:hover { background: var(--vscode-toolbar-hoverBackground, var(--hover)); color: var(--vscode-foreground); }
     .search-clear .codicon { font-size: 16px; }
     .query-details { min-height: 16px; position: relative; margin: 0 0 0 18px; }
+    .scope-options { min-height: 16px; position: relative; }
     .details-toggle { position: absolute; right: -2px; top: 0; width: 25px; height: 16px; padding: 0; color: var(--muted); font-size: 16px; line-height: 12px; border-radius: 3px; }
     .details-toggle:hover { background: var(--hover); color: var(--vscode-foreground); }
     .scope-row { display: none; align-items: center; gap: 6px; padding: 4px 0; }
     .query-details.expanded .scope-row { display: flex; }
     .scope-row[hidden] { display: none !important; }
-    .file-name-row { display: none; padding: 2px 0 4px; }
+    .file-name-row { display: none; padding: 4px 0 2px; }
     .query-details.expanded .file-name-row { display: flex; }
     .file-name-row[hidden] { display: none !important; }
     .file-name-box { margin-left: 0; }
     #file-name-query { width: 100%; height: 24px; min-width: 0; padding: 3px 28px 3px 6px; background: transparent; border: 0; outline: 0; color: var(--input-fg); font-size: var(--vscode-font-size, 13px); line-height: 18px; text-overflow: ellipsis; }
     #file-name-query::placeholder { color: var(--placeholder); opacity: 1; }
-    .scope { flex: 1; min-width: 0; height: 24px; padding: 0 5px; border: 1px solid var(--input-border); border-radius: 3px; background: var(--input-bg); font-size: 12px; }
+    .scope { flex: 1; min-width: 0; height: 24px; padding: 0 5px; border: 1px solid var(--input-border); border-radius: 3px; background: var(--input-bg); font-size: var(--vscode-font-size, 13px); }
     .summary { display: block; min-height: 22px; margin-top: -5px; padding: 0 22px 8px; color: var(--vscode-search-resultsInfoForeground, var(--result-muted)); font-size: var(--vscode-font-size, 13px); line-height: 22px; }
     .summary strong { color: inherit; font-weight: 400; }
     .summary a { color: var(--accent); text-decoration: none; cursor: pointer; white-space: nowrap; margin-left: 4px; }
@@ -458,21 +459,23 @@ class SourceSearchViewProvider {
         </div>
       </div>
       <div class="query-details" id="query-details">
-        <button class="details-toggle" id="details-toggle" type="button" title="Search options" aria-label="Search options" aria-expanded="false"><span class="codicon codicon-more" aria-hidden="true"></span></button>
-        <div class="scope-row" id="scope-row" hidden>
-          <select class="scope" id="scope" aria-label="Search scope">
-            <option value="all">All sources</option>
-            <option value="workspace">Workspace</option>
-            <option value="dependency">Dependencies</option>
-            <option value="stdlib">Standard library</option>
-          </select>
-        </div>
         <div class="file-name-row" id="file-name-row" hidden>
           <div class="search-box file-name-box" role="search">
             <input id="file-name-query" type="text" aria-label="File name" placeholder="File name" title="Filter by file name; all filled search conditions must match" autocomplete="off" spellcheck="false" />
             <span class="search-filter-controls">
               <button class="search-filter-btn" id="file-name-regex" title="Use regular expression for file name" aria-label="Use regular expression for file name" aria-pressed="false"><span class="codicon codicon-regex" aria-hidden="true"></span></button>
             </span>
+          </div>
+        </div>
+        <div class="scope-options">
+          <button class="details-toggle" id="details-toggle" type="button" title="Search options" aria-label="Search options" aria-expanded="false"><span class="codicon codicon-more" aria-hidden="true"></span></button>
+          <div class="scope-row" id="scope-row" hidden>
+            <select class="scope" id="scope" aria-label="Search scope">
+              <option value="all">All sources</option>
+              <option value="workspace">Workspace</option>
+              <option value="dependency">Dependencies</option>
+              <option value="stdlib">Standard library</option>
+            </select>
           </div>
         </div>
       </div>

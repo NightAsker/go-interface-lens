@@ -2,6 +2,15 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.1.21] - 2026-11-09
+
+### Fixed
+
+- Place the file name search on the second row, directly beneath content search,
+  with the source scope selector on the third row.
+- Use the VS Code UI font size for the scope selector, matching both search
+  inputs, and keep the search-options button alongside the scope row.
+
 ## [2.1.20] - 2026-11-09
 
 ### Added

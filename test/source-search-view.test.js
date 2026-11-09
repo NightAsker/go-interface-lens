@@ -791,7 +791,7 @@ async function testFileNameOptions() {
     eq('expanding the arrow reveals scope and file name together', [ui.elements['scope-row'].hidden, ui.elements['file-name-row'].hidden], [false, false]);
     eq('expanded arrow exposes its expanded state', ui.elements['search-toggle'].getAttribute('aria-expanded'), 'true');
     assert('expanded arrow rotates the right chevron down', /\.search-toggle\[aria-expanded="true"\] \.codicon\s*\{[^}]*transform:\s*rotate\(90deg\)/.test(ui.html));
-    assert('file name is placed beneath the scope selector', ui.html.indexOf('id="file-name-query"') > ui.html.indexOf('id="scope"'));
+    assert('file name is placed between content search and the scope selector', ui.html.indexOf('id="query"') < ui.html.indexOf('id="file-name-query"') && ui.html.indexOf('id="file-name-query"') < ui.html.indexOf('id="scope"'));
     ui.elements.query.value = 'needle';
     ui.elements.scope.value = 'dependency';
     ui.elements['file-name-query'].value = '^client.*\\.go$';
