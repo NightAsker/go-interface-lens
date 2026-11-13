@@ -3,7 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const { execFile, spawn } = require('child_process');
-const { runRipgrepFiles } = require('./file-search');
+const { runRipgrepFiles, parseFileNameQuery } = require('./file-search');
 
 const {
     findRipgrep,
@@ -385,7 +385,7 @@ class SourceSearchService {
         if (this.disposed || (progress.signal && progress.signal.aborted)) throw createCancellationError();
         const started = Date.now();
         const query = typeof options.query === 'string' ? options.query : '';
-        const fileNameQuery = typeof options.fileNameQuery === 'string' ? options.fileNameQuery : '';
+        const { query: fileNameQuery, targetLine } = parseFileNameQuery(options.fileNameQuery, options.fileNameRegex);
         const fileNameOnly = !query.trim() && !!fileNameQuery.trim();
         if (!query.trim() && !fileNameQuery.trim()) return { query, results: [], totalMatches: 0, totalFiles: 0, truncated: false, roots: [] };
         const config = { ...this.getConfig(), ...(options.config || {}) };
@@ -479,8 +479,10 @@ class SourceSearchService {
             if (fileNameOnly && entry) return;
             if (!entry && (!fileMatchesConfig(record.file, config) || folderMatchesConfig(record.file, config))) return;
             if (!entry && fileNameMatcher) {
+                const name = path.basename(record.file);
+                if (targetLine && (normalizedOptions.caseSensitive ? name !== fileNameQuery : name.toLowerCase() !== fileNameQuery.toLowerCase())) return;
                 fileNameMatcher.lastIndex = 0;
-                if (!fileNameMatcher.test(path.basename(record.file))) return;
+                if (!fileNameMatcher.test(name)) return;
             }
             if (!entry && byFile.size >= maxFiles) {
                 truncated = true;
@@ -493,6 +495,7 @@ class SourceSearchService {
                     file: record.file, relativePath: path.relative(root.root, record.file) || path.basename(record.file),
                     scope: root.scope, scopeLabel: scopeLabel(root.scope), root: root.root,
                     rootLabel: root.label, module: root.module, version: root.version,
+                    ...(targetLine ? { targetLine } : {}),
                     ...(fileNameOnly ? {
                         fileNameOnly: true,
                         name: path.basename(record.file),

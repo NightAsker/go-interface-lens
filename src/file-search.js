@@ -3,6 +3,16 @@
 const path = require('path');
 const { spawn } = require('child_process');
 
+function parseFileNameQuery(value, regex = false) {
+    const query = typeof value === 'string' ? value.trim() : '';
+    const match = !regex && /^([\s\S]+):(\d+)$/.exec(query);
+    const targetLine = match ? Number(match[2]) : 0;
+    if (match && match[1].trim() && Number.isSafeInteger(targetLine) && targetLine > 0) {
+        return { query: match[1].trim(), targetLine };
+    }
+    return { query };
+}
+
 function runRipgrepFiles(command, args, rootInfo, handlers = {}) {
     return new Promise((resolve, reject) => {
         const { signal } = handlers;
@@ -51,4 +61,4 @@ function runRipgrepFiles(command, args, rootInfo, handlers = {}) {
     });
 }
 
-module.exports = { runRipgrepFiles };
+module.exports = { runRipgrepFiles, parseFileNameQuery };

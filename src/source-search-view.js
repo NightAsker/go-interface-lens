@@ -275,6 +275,9 @@ class SourceSearchViewProvider {
     }
 
     async _openMatch(match) {
+        if (match && Number.isSafeInteger(match.targetLine) && match.targetLine > 0) {
+            match = { ...match, line: match.targetLine, column: 1 };
+        }
         if (typeof this.onOpenMatch === 'function') {
             await this.onOpenMatch(match);
             return;
@@ -463,7 +466,7 @@ class SourceSearchViewProvider {
       <div class="query-details" id="query-details">
         <div class="file-name-row" id="file-name-row" hidden>
           <div class="search-box file-name-box" role="search">
-            <input id="file-name-query" type="text" aria-label="File name" placeholder="File name" title="Filter by file name; all filled search conditions must match" autocomplete="off" spellcheck="false" />
+            <input id="file-name-query" type="text" aria-label="File name" placeholder="File name" title="File name or file.go:116 to open at a line; all filled search conditions must match" autocomplete="off" spellcheck="false" />
             <span class="search-filter-controls">
               <button class="search-filter-btn" id="file-name-regex" title="Use regular expression for file name" aria-label="Use regular expression for file name" aria-pressed="false"><span class="codicon codicon-regex" aria-hidden="true"></span></button>
             </span>
@@ -720,7 +723,7 @@ class SourceSearchViewProvider {
       const text = String(raw.text == null ? (raw.preview == null ? '' : raw.preview) : raw.text);
       const ranges = findMatchRanges(text, raw.ranges);
       const preview = matchPreview(text, ranges);
-      return { file: String(file), relativePath: raw.relativePath || '', line: Number.isFinite(line) ? line : 1, column: Number.isFinite(column) ? column : 1, text, preview, scope: raw.scope || '', scopeLabel: raw.scopeLabel || '', rootLabel: raw.rootLabel || '', module: raw.module || '', version: raw.version || '', unsaved: !!raw.unsaved, fileNameOnly: !!raw.fileNameOnly, fileNameRanges: raw.fileNameRanges || [], ranges };
+      return { file: String(file), relativePath: raw.relativePath || '', line: Number.isFinite(line) ? line : 1, column: Number.isFinite(column) ? column : 1, ...(Number.isSafeInteger(raw.targetLine) && raw.targetLine > 0 ? { targetLine: raw.targetLine } : {}), text, preview, scope: raw.scope || '', scopeLabel: raw.scopeLabel || '', rootLabel: raw.rootLabel || '', module: raw.module || '', version: raw.version || '', unsaved: !!raw.unsaved, fileNameOnly: !!raw.fileNameOnly, fileNameRanges: raw.fileNameRanges || [], ranges };
     }
     function scopeRank(scope) {
       if (scope === 'workspace') return 0;
@@ -741,12 +744,12 @@ class SourceSearchViewProvider {
         if (!entry) return;
         if (entry.fileNameOnly) flat.push(entry);
         else if (entry.matches && Array.isArray(entry.matches)) {
-          entry.matches.forEach((item) => flat.push({ ...item, file: item.file || item.path || entry.file, relativePath: item.relativePath || entry.relativePath, scope: item.scope || entry.scope, scopeLabel: item.scopeLabel || entry.scopeLabel, rootLabel: item.rootLabel || entry.rootLabel, module: item.module || entry.module, version: item.version || entry.version }));
+          entry.matches.forEach((item) => flat.push({ ...item, targetLine: item.targetLine || entry.targetLine, file: item.file || item.path || entry.file, relativePath: item.relativePath || entry.relativePath, scope: item.scope || entry.scope, scopeLabel: item.scopeLabel || entry.scopeLabel, rootLabel: item.rootLabel || entry.rootLabel, module: item.module || entry.module, version: item.version || entry.version }));
         } else flat.push(entry);
       });
       flat.map(normaliseMatch).filter(Boolean).forEach((match) => {
         let file = files.get(match.file);
-        if (!file) { file = { file: match.file, relativePath: match.relativePath, scope: match.scope, scopeLabel: match.scopeLabel, rootLabel: match.rootLabel, module: match.module, version: match.version, unsaved: match.unsaved, fileNameOnly: match.fileNameOnly, fileNameRanges: match.fileNameRanges, matches: [], collapsed: !match.fileNameOnly && resultsCollapsed }; files.set(match.file, file); }
+        if (!file) { file = { file: match.file, relativePath: match.relativePath, scope: match.scope, scopeLabel: match.scopeLabel, rootLabel: match.rootLabel, module: match.module, version: match.version, unsaved: match.unsaved, fileNameOnly: match.fileNameOnly, fileNameRanges: match.fileNameRanges, targetLine: match.targetLine, matches: [], collapsed: !match.fileNameOnly && resultsCollapsed }; files.set(match.file, file); }
         file.relativePath = file.relativePath || match.relativePath; file.scope = file.scope || match.scope; file.scopeLabel = file.scopeLabel || match.scopeLabel; file.rootLabel = file.rootLabel || match.rootLabel; file.module = file.module || match.module; file.version = file.version || match.version; file.unsaved = file.unsaved || match.unsaved;
         const duplicate = file.matches.some((item) => item.line === match.line && item.column === match.column && item.text === match.text);
         if (!duplicate) { file.matches.push(match); resultCount++; lastBatch.push(match); changedFiles.add(file.file); }
@@ -779,12 +782,12 @@ class SourceSearchViewProvider {
         const nameHtml = file.fileNameOnly ? highlight({ text: shown.name, ranges: file.fileNameRanges }) : esc(shown.name);
         wrap.innerHTML = '<div class="file-head" tabindex="0"><span class="twisty">' + (file.fileNameOnly ? '' : icon('down')) + '</span><span class="file-icon" aria-hidden="true">' + icon(file.fileNameOnly ? 'file' : 'go') + '</span><span class="file-name" title="' + esc(file.file) + '">' + nameHtml + '</span><span class="file-path" title="' + esc(shown.parent) + '">' + esc(shown.parent) + '</span>' + badgeHtml + (file.fileNameOnly ? '' : '<span class="count">' + file.matches.length + '</span>') + '</div>' + (file.fileNameOnly ? '' : '<div class="matches"></div>');
         const toggle = () => {
-          if (file.fileNameOnly) { vscode.postMessage({ type: 'openMatch', match: { file: file.file } }); return; }
+          if (file.fileNameOnly) { vscode.postMessage({ type: 'openMatch', match: { file: file.file, ...(file.targetLine ? { line: file.targetLine } : {}) } }); return; }
           setFileCollapsed(file, !file.collapsed); updateResultCollapseState();
         };
         const head = wrap.querySelector('.file-head'); head.addEventListener('click', toggle); head.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggle(); } });
         if (!file.fileNameOnly) {
-          const list = wrap.querySelector('.matches'); file.matches.slice(0, 300).forEach((match) => { const row = document.createElement('div'); row.className = 'match'; row.setAttribute('role', 'treeitem'); row.title = 'Open ' + file.file + ':' + match.line; row.innerHTML = '<span class="line-number">' + esc(match.line) + ':</span><span class="match-text">' + highlight(match.preview) + '</span>'; row.addEventListener('click', () => vscode.postMessage({ type: 'openMatch', match })); list.appendChild(row); });
+          const list = wrap.querySelector('.matches'); file.matches.slice(0, 300).forEach((match) => { const row = document.createElement('div'); row.className = 'match'; row.setAttribute('role', 'treeitem'); row.title = 'Open ' + file.file + ':' + (match.targetLine || match.line); row.innerHTML = '<span class="line-number">' + esc(match.line) + ':</span><span class="match-text">' + highlight(match.preview) + '</span>'; row.addEventListener('click', () => vscode.postMessage({ type: 'openMatch', match })); list.appendChild(row); });
           if (file.matches.length > 300) { const more = document.createElement('div'); more.className = 'result-ellipsis'; more.textContent = '… ' + (file.matches.length - 300) + ' more matches'; list.appendChild(more); }
         }
         if (file.element) file.element.replaceWith(wrap);

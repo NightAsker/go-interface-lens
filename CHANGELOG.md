@@ -2,6 +2,15 @@
 
 All notable changes to Go Interface Lens are documented here.
 
+## [2.1.24] - 2026-11-14
+
+### Added
+
+- Accept `producer.go:116` in literal file name searches to match the exact
+  file name and open it at the requested one-based line number.
+- Preserve the target line in streamed workspace and dependency results,
+  combined content searches, mouse and keyboard navigation, and file exports.
+
 ## [2.1.23] - 2026-11-09
 
 ### Fixed

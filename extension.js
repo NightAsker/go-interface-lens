@@ -215,7 +215,7 @@ async function openSourceSearchResultsInEditor(message) {
     for (const entry of entries) {
         if (!entry || !entry.file) continue;
         if (entry.fileNameOnly) {
-            lines.push(entry.file);
+            lines.push(entry.file + (entry.targetLine ? `:${entry.targetLine}` : ''));
             continue;
         }
         const matches = Array.isArray(entry.matches) ? entry.matches : [entry];

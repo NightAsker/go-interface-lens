@@ -1,6 +1,6 @@
 # Go Interface Lens
 
-[![Version](https://img.shields.io/badge/version-2.1.23-blue.svg)](https://github.com/NightAsker/go-interface-lens)
+[![Version](https://img.shields.io/badge/version-2.1.24-blue.svg)](https://github.com/NightAsker/go-interface-lens)
 [![VSCode](https://img.shields.io/badge/VSCode-1.76+-green.svg)](https://code.visualstudio.com/)
 
 一个面向大型 Go 工程的 VS Code / Cursor 接口导航扩展。它在接口、接口方法和具体实现之间提供双向 CodeLens，同时使用按查询的声明搜索和按需 AST 校验兼顾响应速度与查找准确性。
@@ -134,6 +134,8 @@ WASM、Go grammar WASM 和 MIT 许可证；依赖包里的其他语言 grammar �
 在 `Source Search` 中点击搜索框左侧箭头，展开后第二行的 `File name` 输入框用于填写文件名，第三行选择搜索范围。内容搜索、文件名和范围使用相同的字号、边框、圆角、高度和聚焦样式，文字距离左边框内侧均为 6px。源码内容、搜索范围和文件名三个条件是「与」的关系：结果必须同时满足所有已填写条件；文本框留空时不限制该项。左侧箭头在展开时朝下，收起时朝右；点击范围框或右侧的 `…` 选择搜索来源。
 
 文件名默认按普通文本匹配；点击文件名输入框右侧的 `.*` 可独立启用正则，例如 `^client.*\.go$`、`(_test|\.pb)\.go$`。正则匹配文件名本身，`Aa` 同时控制内容和文件名是否区分大小写，整词选项仅作用于内容。范围可选择工程、SDK / 依赖包或标准库；依赖范围沿用 `go.mod` 锁定版本和本地 `replace` 解析。
+
+普通文件名模式还支持 `producer.go:116`：按完整文件名 `producer.go` 匹配，排除 `producer.go.bak` 等文件，点击结果或按 Enter 打开时跳到第 116 行。行号从 1 开始，匹配结果继续流式展示；与内容关键词组合筛选时，打开位置仍以指定行号为准。文件名正则模式继续按正则表达式本身匹配。
 
 内容留空、仅填写文件名时，只枚举文件路径，点击文件行可直接打开文件；同时填写内容时，显示满足文件名条件的内容匹配行。填写文件名时支持所有文件类型，并遵循 ripgrep 忽略规则及源码搜索专用排除配置。两个文本框都支持输入防抖、Enter 立即搜索和中文输入法；清空搜索会同时清空内容与文件名，保留范围和正则选项。文件数上限统一使用 `sourceSearchMaxFiles`。
 

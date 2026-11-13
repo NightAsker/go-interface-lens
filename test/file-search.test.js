@@ -10,7 +10,7 @@ Module._resolveFilename = function (request, ...rest) {
     return request === 'vscode' ? path.join(__dirname, 'vscode-stub.js') : originalResolve.call(this, request, ...rest);
 };
 const { SourceSearchService } = require('../src/source-search');
-const { runRipgrepFiles } = require('../src/file-search');
+const { runRipgrepFiles, parseFileNameQuery } = require('../src/file-search');
 Module._resolveFilename = originalResolve;
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'go-file-search-'));
@@ -47,6 +47,12 @@ write(dependency, 'client.yaml', 'needle\n');
 write(oldDependency, 'old-client.go');
 const localClient = write(localDependency, 'client.go', 'needle\n');
 const standardClient = write(stdlib, 'net/http/client.go');
+const producer = write(workspace, 'pkg/producer.go', ['needle', ...Array.from({ length: 125 }, (_, line) => `// line ${line + 2}`)].join('\n'));
+const sdkProducer = write(dependency, 'api/producer.go', 'needle\n');
+write(workspace, 'pkg/producer.go.bak', 'needle\n');
+write(workspace, 'pkg/producer.go.yaml', 'needle\n');
+write(workspace, 'pkg/old-producer.go', 'needle\n');
+write(workspace, 'ignored/producer.go', 'needle\n');
 const service = new SourceSearchService({
     getWorkspaceRoots: () => [workspace, secondWorkspace],
     getConfig: () => ({ goModCache: modCache }),
@@ -63,6 +69,15 @@ async function rejectsCode(promise, code, label) {
 }
 
 async function run() {
+    console.log('== filename line suffix parsing ==');
+    eq('line suffix is separated from the filename', parseFileNameQuery('producer.go:116'), { query: 'producer.go', targetLine: 116 });
+    eq('spaces and leading zeros do not change the requested line', parseFileNameQuery(' producer.go:00116 '), { query: 'producer.go', targetLine: 116 });
+    eq('only the last colon separates the line', parseFileNameQuery('notes:producer.go:116'), { query: 'notes:producer.go', targetLine: 116 });
+    for (const query of ['producer.go', 'producer.go:0', 'producer.go:-1', 'producer.go:1.5', 'producer.go:', ':116', 'producer.go:9007199254740992']) {
+        eq(`invalid or absent line suffix stays literal: ${query}`, parseFileNameQuery(query), { query });
+    }
+    eq('filename regex keeps its original colon semantics', parseFileNameQuery('producer\\.go:116', true), { query: 'producer\\.go:116' });
+
     console.log('== file name search with real ripgrep ==');
     const batches = [];
     const result = await searchFiles({ query: 'client', scope: 'all' }, { onBatch: (batch) => batches.push(...batch) });
@@ -95,6 +110,23 @@ async function run() {
     eq('standard library supports a dedicated scope', (await searchFiles({ query: '^client\\.go$', regex: true, scope: 'stdlib', stdlibRoot: stdlib })).results.map((file) => file.file), [standardClient]);
     const overlap = await searchFiles({ query: 'client', scope: 'workspace', workspaceRoots: [workspace, path.join(workspace, 'pkg')] });
     eq('overlapping workspace roots are deduplicated', overlap.totalFiles, new Set(overlap.results.map((file) => file.file)).size);
+
+    console.log('\n== exact filename and target line with real ripgrep ==');
+    const lineBatches = [];
+    const lineResult = await searchFiles({ query: 'producer.go:116' }, { onBatch(batch) { lineBatches.push(...batch); } });
+    eq('line suffix searches the exact Go basename across workspace and SDK', lineResult.results.map((file) => file.file).sort(), [producer, sdkProducer].sort());
+    assert('all streamed filename results retain the requested line', lineBatches.length === 2 && lineBatches.every((file) => file.targetLine === 116));
+    assert('highlights cover the filename without the line suffix', lineResult.results.every((file) => JSON.stringify(file.fileNameRanges) === JSON.stringify([{ start: 0, end: 11 }])));
+    eq('line suffix still honors the selected scope', (await searchFiles({ query: 'producer.go:116', scope: 'dependency' })).results.map((file) => file.file), [sdkProducer]);
+    eq('exact filename matching remains case insensitive by default', (await searchFiles({ query: 'Producer.go:116' })).totalFiles, 2);
+    eq('match case also applies when a line is specified', (await searchFiles({ query: 'Producer.go:116', caseSensitive: true })).totalFiles, 0);
+    eq('literal punctuation in a full filename is preserved', (await searchFiles({ query: 'special[1].go:23', scope: 'workspace' })).results[0]?.targetLine, 23);
+    assert('ordinary filename queries retain their existing partial matching', (await searchFiles({ query: 'producer.go', scope: 'workspace' })).results.some((file) => file.name === 'producer.go.bak'));
+    const lineCombined = await service.search({ query: 'needle', fileNameQuery: 'producer.go:116' });
+    eq('content searches also apply the exact filename without its suffix', lineCombined.results.map((file) => file.file).sort(), [producer, sdkProducer].sort());
+    assert('navigation line is independent of the content match line', lineCombined.results.every((file) => file.targetLine === 116 && file.matches[0].line === 1));
+    eq('a line suffix does not bypass the content condition', (await service.search({ query: 'absent-content', fileNameQuery: 'producer.go:116' })).totalFiles, 0);
+    eq('exact filename filtering runs before the shared file limit', (await searchFiles({ query: 'producer.go:116', maxFiles: 1 })).results[0]?.file, producer);
 
     console.log('\n== content, scope and file name use AND semantics ==');
     const combined = await service.search({ query: 'needle', fileNameQuery: '^client\\.go$', fileNameRegex: true, scope: 'workspace' });
@@ -148,8 +180,10 @@ async function run() {
             await gate;
         },
     });
-    const search = streaming.search({ query: '', fileNameQuery: 'client', scope: 'workspace' }, { onBatch(batch) { notify(batch); } });
-    eq('first file streams before enumeration finishes', (await received)[0].file, client);
+    const search = streaming.search({ query: '', fileNameQuery: 'client.go:116', scope: 'workspace' }, { onBatch(batch) { notify(batch); } });
+    const firstBatch = await received;
+    eq('first file streams before enumeration finishes', firstBatch[0].file, client);
+    eq('streaming preserves line navigation metadata', firstBatch[0].targetLine, 116);
     finish();
     await search;
     streaming.dispose();

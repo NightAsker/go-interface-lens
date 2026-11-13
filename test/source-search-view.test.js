@@ -13,6 +13,7 @@ Module._resolveFilename = function (request, ...rest) {
 };
 
 const { SourceSearchViewProvider } = require('../src/source-search-view');
+const { SourceSearchService } = require('../src/source-search');
 Module._resolveFilename = originalResolve;
 
 class ClassList {
@@ -866,7 +867,90 @@ async function testFileNameOptions() {
     eq('only the original Source Search view is contributed', manifest.contributes.views['go-interface-lens'].map((view) => view.id), ['go-interface-lens.sourceSearch']);
 }
 
-testSearchFocus().then(testNativeSearchConfiguration).then(testNativeResultToolbar).then(testNativeSearchClear).then(testOverlappingSearches).then(testFileNameOptions).then(done).catch((error) => {
+async function testFileNameLineNavigation() {
+    console.log('\n== filename:line search and editor navigation ==');
+    const ui = createWebviewHarness();
+    const root = path.resolve(__dirname, '..');
+    const file = path.join(root, 'producer.go');
+    const engine = new SourceSearchService({
+        getWorkspaceRoots: () => [root],
+        runRipgrepFiles: async (_command, _args, _root, handlers) => {
+            handlers.onFile(file + '.bak');
+            handlers.onFile(file);
+        },
+        runRipgrep: async (_command, _args, _root, handlers) => {
+            for (const candidate of [file + '.bak', file]) {
+                handlers.onMatch({ file: candidate, line: 3, column: 7, text: 'prefix needle' });
+            }
+        },
+    });
+    const provider = new SourceSearchViewProvider({ engine });
+    provider._post = (message) => ui.window.dispatch('message', { data: message });
+    const vscode = require(stubPath);
+    const originalPosition = vscode.Position;
+    const originalSelection = vscode.Selection;
+    const originalOpen = vscode.workspace.openTextDocument;
+    const originalShow = vscode.window.showTextDocument;
+    let opened;
+    vscode.Position = class { constructor(line, character) { this.line = line; this.character = character; } };
+    vscode.Selection = class { constructor(anchor, active) { this.anchor = anchor; this.active = active; } };
+    vscode.workspace.openTextDocument = async (file) => ({ file });
+    vscode.window.showTextDocument = async (document, options) => { opened = { document, options }; };
+    const submit = async (fileNameQuery, query = '') => {
+        ui.elements.query.value = query;
+        ui.elements['file-name-query'].value = fileNameQuery;
+        ui.elements.scope.value = 'workspace';
+        ui.elements['file-name-query'].dispatch('keydown', { key: 'Enter', preventDefault() {} });
+        const request = ui.messages.at(-1);
+        eq('input sends the complete filename:line expression', request.options.fileNameQuery, fileNameQuery);
+        await provider._handleMessage(request);
+    };
+    const head = () => ui.elements.results.querySelectorAll('.file')[0].querySelector('.file-head');
+    try {
+        await submit('producer.go:116');
+        eq('only the exact filename is rendered', ui.elements.results.querySelectorAll('.file').length, 1);
+        head().dispatch('click');
+        eq('file click carries the requested line', ui.messages.at(-1), { type: 'openMatch', match: { file, line: 116 } });
+        await provider._handleMessage(ui.messages.at(-1));
+        eq('line 116 opens at the zero-based editor position 115:0', [opened.document.file, opened.options.selection.active.line, opened.options.selection.active.character], [file, 115, 0]);
+        head().dispatch('keydown', { key: 'Enter', preventDefault() {} });
+        await provider._handleMessage(ui.messages.at(-1));
+        eq('keyboard activation uses the same target line', opened.options.selection.active.line, 115);
+        ui.elements['open-editor'].dispatch('click');
+        eq('export preserves the requested line', ui.messages.at(-1).results[0].targetLine, 116);
+
+        await submit('producer.go:12');
+        head().dispatch('click');
+        await provider._handleMessage(ui.messages.at(-1));
+        eq('changing the suffix replaces the previous target line', opened.options.selection.active.line, 11);
+
+        await submit('producer.go:116', 'needle');
+        const row = ui.elements.results.querySelectorAll('.match')[0];
+        assert('content preview retains its actual matching line', row.innerHTML.includes('line-number">3:'));
+        row.dispatch('click');
+        await provider._handleMessage(ui.messages.at(-1));
+        eq('content result navigation honors the explicit filename line', [opened.options.selection.active.line, opened.options.selection.active.character], [115, 0]);
+        let forwarded;
+        provider.onOpenMatch = async (match) => { forwarded = match; };
+        await provider._handleMessage(ui.messages.at(-1));
+        eq('extension navigation callback also receives the explicit target', [forwarded.line, forwarded.column], [116, 1]);
+        provider.onOpenMatch = undefined;
+
+        await submit('producer.go');
+        head().dispatch('click');
+        await provider._handleMessage(ui.messages.at(-1));
+        eq('removing the suffix restores opening at the start of the file', [opened.options.selection.active.line, opened.options.selection.active.character], [0, 0]);
+    } finally {
+        provider.dispose();
+        engine.dispose();
+        vscode.Position = originalPosition;
+        vscode.Selection = originalSelection;
+        vscode.workspace.openTextDocument = originalOpen;
+        vscode.window.showTextDocument = originalShow;
+    }
+}
+
+testSearchFocus().then(testNativeSearchConfiguration).then(testNativeResultToolbar).then(testNativeSearchClear).then(testOverlappingSearches).then(testFileNameOptions).then(testFileNameLineNavigation).then(done).catch((error) => {
     console.error(error);
     process.exitCode = 1;
 });
